@@ -2,21 +2,20 @@
 
 A bb plugin that puts several agents on different providers into one group chat and drives them to a decision.
 
-- Rooms hold a shared transcript. Participants are ordinary bb threads, one per agent, in one shared workspace.
-- Tag a participant with a chip or `@handle`. It receives the room messages it has not seen yet and its reply is posted back.
-- Give the message a hop budget and the agents relay to each other when a reply addresses another participant.
-- Every reply ends with a `STANCE: agree | disagree | need-info | pass` line and an `OPEN:` list. `need-info` pauses a job until you answer.
-- Seats have roles (planner, reviewer, implementer, custom) with reply contracts.
-- Pin one working document per room. Only its owner edits it. A side tab shows it. A bar lists uncommitted workspace changes.
-- Rounds hand the turn to whoever was addressed and end once everyone agrees with nothing open. Ask-all fans a question out in parallel with an optional synthesis.
-- Add a participant later with a briefing written by an existing one. Compact, reset, or remove any seat.
+- Rooms hold a shared transcript. Seats are ordinary bb threads, one per agent, in one shared workspace.
+- Tag a seat with a chip or `@handle`. It receives the room messages it has not seen yet and its reply is posted back. Tag several and Send, and they answer in parallel.
+- **Turns** is the one knob. On Send it is how many times the tagged agents may relay to each other before you get the floor back. On Discuss it is the cap on a scheduled back-and-forth that ends once everyone agrees.
+- Every reply ends with a `STANCE: agree | disagree | need-info | pass` line and an `OPEN:` list. `need-info` pauses a discussion until you answer.
+- Each seat is read-only unless you mark it "may edit files". Pin one working document per room and pick its owner. A side tab shows it. A bar lists uncommitted workspace changes.
+- Templates fill the composer with an editable prompt for the two common phases: discuss an idea, implement the plan, review the changes. Nothing about behavior is hidden; the settings panel shows exactly what each seat is told.
+- Add a seat later with a briefing written by an existing one. Compact, reset, or remove any seat.
 - Any thread's side panel has a **Roundtable room** action that opens or creates the room for that workspace.
 
 ## Layout
 
-- `server.ts` — SQLite store; relay with hop budget; footer parsing; role contracts; jobs (rounds, ask-all) with pause and resume; briefings; document read and create; workspace diff; RPC; the `bb roundtable` CLI.
+- `server.ts` — SQLite store; relay with the turns allowance; footer parsing; the discussion job with pause and resume; briefings; document read and create; workspace diff; RPC; the `bb roundtable` CLI.
 - `app.tsx` — the **Roundtable** nav panel, the **Agent thread** and **Document** fixed tabs, and the thread panel action.
-- `skills/roundtable/SKILL.md` — the skill participants get.
+- `skills/roundtable/SKILL.md` — the skill seats get.
 
 ## Develop
 
@@ -35,17 +34,17 @@ Schema changes are append-only in `MIGRATIONS`. To start over, disable the plugi
 ```
 bb roundtable list
 bb roundtable show <room> [--since <seq>]
-bb roundtable create --title <title> [--project <id>] [--participants claude=claude-code:planner,codex=codex:reviewer] [--doc <path> --owner <handle>] [--hops N]
-bb roundtable say <room> [--to a,b] [--hops N] [--as <handle>] <message...>
-bb roundtable ask <room> --to a,b [--synth <handle>] <message...>
-bb roundtable rounds <room> --between a,b [--rounds N] <message...>
-bb roundtable add <room> <handle>=<provider>[:role] [--brief full|summary|none] [--summarizer <handle>]
+bb roundtable create --title <title> [--project <id>] [--participants claude=claude-code,codex=codex,devin=acp-devin:edit] [--doc <path> --owner <handle>] [--turns N]
+bb roundtable say <room> [--to a,b] [--turns N] [--as <handle>] <message...>
+bb roundtable discuss <room> --between a,b [--turns N] <message...>
+bb roundtable add <room> <handle>=<provider>[=model][:edit] [--brief full|summary|none] [--summarizer <handle>]
 bb roundtable doc <room> --path <path> [--owner <handle>]
+bb roundtable intro <room> <handle>
 bb roundtable compact|reset|remove <room> <handle>
 bb roundtable resume|cancel|archive <room>
 ```
 
-`<room>` is a room id or its exact title. Inside a participant thread, `say` posts as that participant and inherits what is left of its hop budget.
+`<room>` is a room id or its exact title. Inside a participant thread, `say` posts as that participant and inherits what is left of its turns allowance.
 
 ## Settings
 

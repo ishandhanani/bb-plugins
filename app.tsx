@@ -1,10 +1,13 @@
 // bb-plugin-roundtable — frontend entry.
 //
 // One nav panel ("Roundtable") with a room list, the shared transcript, and a
-// composer that tags participants, starts rounds, or asks everyone. Fixed side
-// tabs render bb's own ThreadChat for a participant thread and the room's
-// pinned document. A thread panel action opens (or creates) the room bound to
-// the current thread's workspace.
+// composer with a single knob, Turns. Send with one seat tagged and Turns is
+// how many times the agents may relay to each other before you get the floor
+// back. Tag two or more and press Discuss and Turns is the cap on a scheduled
+// back-and-forth that ends once everyone agrees. Fixed side tabs render bb's
+// own ThreadChat for a participant thread and the room's pinned document. A
+// thread panel action opens (or creates) the room bound to the current
+// thread's workspace.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent, ReactNode } from "react";
 import {
@@ -30,7 +33,6 @@ import type {
   Message,
   Participant,
   ParticipantInput,
-  Role,
   RoomDetail,
   RoomSummary,
   Stance,
@@ -46,15 +48,7 @@ type Contract = typeof rpcContract;
 const PANEL_ID = "rooms";
 const PANEL_PATH = "rooms";
 const ROOM_CHANGED = "room-changed";
-
-const ROLE_OPTIONS: readonly Role[] = ["none", "planner", "reviewer", "implementer", "custom"];
-const ROLE_HINTS: Record<Role, string> = {
-  none: "No role contract",
-  planner: "Owns the proposal; numbered decisions; answers findings by number",
-  reviewer: "Numbered findings with severity, target, why, fix",
-  implementer: "Edits only when asked; lists files first; reports verification",
-  custom: "Your own instructions",
-};
+const MAX_TURNS = 40;
 
 interface AgentTabTarget {
   threadId: string;
@@ -273,6 +267,10 @@ function durationLabel(ms: number): string {
   return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
 }
 
+function clampTurns(value: number): number {
+  return Math.min(MAX_TURNS, Math.max(0, Number.isFinite(value) ? Math.round(value) : 0));
+}
+
 interface ParticipantChipProps {
   participant: Participant;
   selected: boolean;
@@ -280,14 +278,15 @@ interface ParticipantChipProps {
   canSummarize: boolean;
   onToggle: () => void;
   onOpen: () => void;
+  onToggleEdit: () => void;
   onCompact: () => void;
   onReset: (brief: Brief) => void;
   onRemove: () => void;
 }
 
-function ParticipantChip({ participant, selected, isDocOwner, canSummarize, onToggle, onOpen, onCompact, onReset, onRemove }: ParticipantChipProps) {
+function ParticipantChip({ participant, selected, isDocOwner, canSummarize, onToggle, onOpen, onToggleEdit, onCompact, onReset, onRemove }: ParticipantChipProps) {
   const [menu, setMenu] = useState(false);
-  const stats = `${participant.turns} turn${participant.turns === 1 ? "" : "s"} · ~${formatChars(participant.relayedChars)} chars relayed${participant.role !== "none" ? ` · ${participant.role}` : ""}`;
+  const stats = `${participant.turns} turn${participant.turns === 1 ? "" : "s"} · ~${formatChars(participant.relayedChars)} chars relayed`;
   return (
     <span className="relative inline-flex items-stretch overflow-visible rounded-full border border-border text-xs">
       <button
@@ -302,9 +301,8 @@ function ParticipantChip({ participant, selected, isDocOwner, canSummarize, onTo
       >
         <StatusDot status={participant.status} />
         <span className="font-medium">@{participant.handle}</span>
-        <span className={cn("text-muted-foreground", selected && "text-background/70")}>
-          {participant.role !== "none" ? participant.role : participant.providerId}
-        </span>
+        <span className={cn("text-muted-foreground", selected && "text-background/70")}>{participant.providerId}</span>
+        {participant.canEdit ? <Icon name="Edit" className={cn("size-3 text-muted-foreground", selected && "text-background/70")} aria-label="May edit files" /> : null}
         {isDocOwner ? <Icon name="FileText" className={cn("size-3 text-muted-foreground", selected && "text-background/70")} aria-label="Document owner" /> : null}
         {participant.lastStance ? <StanceBadge stance={participant.lastStance} small /> : null}
       </button>
@@ -328,13 +326,14 @@ function ParticipantChip({ participant, selected, isDocOwner, canSummarize, onTo
         <Icon name="MoreHorizontal" className="size-3.5" />
       </button>
       {menu ? (
-        <div className="absolute right-0 top-full z-20 mt-1 w-56 rounded-md border border-border bg-card p-1 text-xs shadow-md">
+        <div className="absolute right-0 top-full z-20 mt-1 w-60 rounded-md border border-border bg-card p-1 text-xs shadow-md">
           <p className="px-2 py-1 text-muted-foreground">{stats}</p>
           <p className="px-2 pb-1 text-muted-foreground">
             {participant.providerId}
             {participant.model ? ` · ${participant.model}` : ""}
             {participant.reasoningLevel ? ` · ${participant.reasoningLevel}` : ""}
           </p>
+          <MenuItem icon="Edit" label={participant.canEdit ? "Make read-only" : "Allow editing files"} onClick={() => { setMenu(false); onToggleEdit(); }} />
           <MenuItem icon="Layers" label="Compact context" disabled={participant.threadId === null} onClick={() => { setMenu(false); onCompact(); }} />
           <MenuItem icon="RotateCcw" label="Reset with summary" disabled={!canSummarize} onClick={() => { setMenu(false); onReset("summary"); }} />
           <MenuItem icon="RotateCcw" label="Reset with full history" onClick={() => { setMenu(false); onReset("full"); }} />
@@ -345,7 +344,7 @@ function ParticipantChip({ participant, selected, isDocOwner, canSummarize, onTo
   );
 }
 
-function MenuItem({ icon, label, onClick, disabled, destructive }: { icon: "Layers" | "RotateCcw" | "Trash2"; label: string; onClick: () => void; disabled?: boolean; destructive?: boolean }) {
+function MenuItem({ icon, label, onClick, disabled, destructive }: { icon: "Edit" | "Layers" | "RotateCcw" | "Trash2"; label: string; onClick: () => void; disabled?: boolean; destructive?: boolean }) {
   return (
     <button
       type="button"
@@ -377,9 +376,9 @@ function MessageRow({ message, providerOf }: { message: Message; providerOf: (ha
           <span className="text-muted-foreground">to {message.tags.map((t) => `@${t}`).join(", ")}</span>
         ) : null}
         {message.stance ? <StanceBadge stance={message.stance} /> : null}
-        {message.hopsLeft > 0 ? (
-          <span className="text-muted-foreground" title="Agent-to-agent hops this message may still trigger">
-            hops {message.hopsLeft}
+        {message.turnsLeft > 0 ? (
+          <span className="text-muted-foreground" title="Relays this message may still trigger between agents">
+            {message.turnsLeft} turn{message.turnsLeft === 1 ? "" : "s"} left
           </span>
         ) : null}
         <span className="text-muted-foreground">
@@ -406,17 +405,9 @@ function MessageRow({ message, providerOf }: { message: Message; providerOf: (ha
 
 function JobBanner({ job, onCancel, onResume, disabled }: { job: NonNullable<Job>; onCancel: () => void; onResume: () => void; disabled: boolean }) {
   const roster = job.participants.map((h) => `@${h}`).join(", ");
-  let text: string;
-  if (job.paused) {
-    text = `Paused. @${job.paused.handle} needs input: ${job.paused.question}`;
-  } else if (job.kind === "rounds") {
-    const perRound = job.participants.length;
-    const round = Math.max(1, Math.ceil(Math.max(job.turn, 1) / perRound));
-    text = `Rounds · turn ${job.turn}/${job.totalTurns} (round ${round}) · ${roster}${job.current ? ` · @${job.current} is responding` : ""}`;
-  } else {
-    const waiting = job.inFlight.map((h) => `@${h}`).join(", ");
-    text = `Asking ${roster}${waiting ? ` · waiting on ${waiting}` : ""}${job.synthesizer ? ` · then @${job.synthesizer} synthesizes` : ""}`;
-  }
+  const text = job.paused
+    ? `Paused. @${job.paused.handle} needs input: ${job.paused.question}`
+    : `Discussion · turn ${job.turn}/${job.totalTurns} · ${roster}${job.current ? ` · @${job.current} is responding` : ""}`;
   return (
     <div className="flex flex-wrap items-center gap-3 border-t border-border bg-card px-4 py-2 text-xs">
       {job.paused ? (
@@ -477,18 +468,48 @@ function ChangesBar({ roomId, environmentId }: { roomId: string; environmentId: 
 }
 
 // ---------------------------------------------------------------------------
-// Room settings and add-participant forms
+// Room settings, intro preview, and add-participant forms
 // ---------------------------------------------------------------------------
 
 const selectClass =
   "h-8 rounded-md border border-input bg-background px-2 text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
+
+function IntroPreview({ roomId, handles }: { roomId: string; handles: string[] }) {
+  const rpc = useRpc<Contract>();
+  const [handle, setHandle] = useState(handles[0] ?? "");
+  const [text, setText] = useState<string | null>(null);
+  useEffect(() => {
+    if (handle === "") return;
+    rpc.call("rooms_intro_preview", { roomId, handle }).then(
+      (result) => setText(result.text),
+      (cause: unknown) => setText(describeError(cause)),
+    );
+  }, [rpc, roomId, handle]);
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center gap-2 text-muted-foreground">
+        <span>What a seat is told on first contact</span>
+        <select value={handle} onChange={(e) => setHandle(e.target.value)} className={selectClass} aria-label="Seat">
+          {handles.map((h) => (
+            <option key={h} value={h}>@{h}</option>
+          ))}
+        </select>
+        <span className="text-[11px]">Later turns get only the new messages plus one instruction line. Everything else about behavior comes from your messages.</span>
+      </div>
+      <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-background p-2 font-mono text-[11px] leading-relaxed">
+        {text ?? "Loading…"}
+      </pre>
+    </div>
+  );
+}
 
 function RoomSettings({ detail, onDone }: { detail: RoomDetail; onDone: () => void }) {
   const rpc = useRpc<Contract>();
   const [title, setTitle] = useState(detail.room.title);
   const [docPath, setDocPath] = useState(detail.room.docPath ?? "");
   const [docOwner, setDocOwner] = useState(detail.room.docOwner ?? "");
-  const [hops, setHops] = useState(detail.room.defaultHops);
+  const [turns, setTurns] = useState(detail.room.defaultTurns);
+  const [showIntro, setShowIntro] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const handles = detail.participants.filter((p) => !p.removed).map((p) => p.handle);
@@ -502,7 +523,7 @@ function RoomSettings({ detail, onDone }: { detail: RoomDetail; onDone: () => vo
         title: title.trim(),
         docPath: docPath.trim() === "" ? null : docPath.trim(),
         docOwner: docOwner === "" ? null : docOwner,
-        defaultHops: hops,
+        defaultTurns: turns,
       });
       onDone();
     } catch (cause) {
@@ -512,31 +533,38 @@ function RoomSettings({ detail, onDone }: { detail: RoomDetail; onDone: () => vo
     }
   };
   return (
-    <form onSubmit={submit} className="flex flex-wrap items-end gap-2 border-b border-border bg-card px-4 py-2 text-xs">
-      <label className="flex flex-col gap-1 text-muted-foreground">
-        Title
-        <Input value={title} onChange={(e) => setTitle(e.target.value)} className="h-8 w-56 text-xs" required />
-      </label>
-      <label className="flex flex-col gap-1 text-muted-foreground">
-        Pinned document (workspace path)
-        <Input value={docPath} onChange={(e) => setDocPath(e.target.value)} placeholder=".roundtable/plan.md" className="h-8 w-56 text-xs" />
-      </label>
-      <label className="flex flex-col gap-1 text-muted-foreground">
-        Document owner
-        <select value={docOwner} onChange={(e) => setDocOwner(e.target.value)} className={selectClass} disabled={docPath.trim() === ""}>
-          <option value="">you</option>
-          {handles.map((h) => (
-            <option key={h} value={h}>@{h}</option>
-          ))}
-        </select>
-      </label>
-      <label className="flex flex-col gap-1 text-muted-foreground">
-        Default hops
-        <Input type="number" min={0} max={8} value={hops} onChange={(e) => setHops(Math.min(8, Math.max(0, Number(e.target.value) || 0)))} className="h-8 w-16 text-xs" />
-      </label>
-      <Button type="submit" size="sm" disabled={pending || title.trim() === ""}>Save</Button>
-      <Button type="button" size="sm" variant="ghost" onClick={onDone}>Cancel</Button>
-      {error ? <span role="alert" className="text-destructive">{error}</span> : null}
+    <form onSubmit={submit} className="space-y-2 border-b border-border bg-card px-4 py-2 text-xs">
+      <div className="flex flex-wrap items-end gap-2">
+        <label className="flex flex-col gap-1 text-muted-foreground">
+          Title
+          <Input value={title} onChange={(e) => setTitle(e.target.value)} className="h-8 w-56 text-xs" required />
+        </label>
+        <label className="flex flex-col gap-1 text-muted-foreground">
+          Pinned document (workspace path)
+          <Input value={docPath} onChange={(e) => setDocPath(e.target.value)} placeholder=".roundtable/plan.md" className="h-8 w-56 text-xs" />
+        </label>
+        <label className="flex flex-col gap-1 text-muted-foreground">
+          Document owner
+          <select value={docOwner} onChange={(e) => setDocOwner(e.target.value)} className={selectClass} disabled={docPath.trim() === ""}>
+            <option value="">you</option>
+            {handles.map((h) => (
+              <option key={h} value={h}>@{h}</option>
+            ))}
+          </select>
+        </label>
+        <label className="flex flex-col gap-1 text-muted-foreground">
+          Default turns
+          <Input type="number" min={0} max={MAX_TURNS} value={turns} onChange={(e) => setTurns(clampTurns(Number(e.target.value)))} className="h-8 w-16 text-xs" />
+        </label>
+        <Button type="submit" size="sm" disabled={pending || title.trim() === ""}>Save</Button>
+        <Button type="button" size="sm" variant="ghost" onClick={onDone}>Cancel</Button>
+        <Button type="button" size="sm" variant="ghost" onClick={() => setShowIntro((v) => !v)} aria-pressed={showIntro}>
+          <Icon name="Eye" className="size-3.5" />
+          {showIntro ? "Hide agent instructions" : "Show what agents are told"}
+        </Button>
+        {error ? <span role="alert" className="text-destructive">{error}</span> : null}
+      </div>
+      {showIntro && handles.length > 0 ? <IntroPreview roomId={detail.room.id} handles={handles} /> : null}
     </form>
   );
 }
@@ -546,8 +574,7 @@ interface SeatDraft {
   providerId: string;
   model: string;
   reasoningLevel: string;
-  role: Role;
-  roleInstructions: string;
+  canEdit: boolean;
 }
 
 function toParticipantInput(seat: SeatDraft): ParticipantInput {
@@ -556,70 +583,56 @@ function toParticipantInput(seat: SeatDraft): ParticipantInput {
     providerId: seat.providerId,
     ...(seat.model ? { model: seat.model } : {}),
     ...(seat.reasoningLevel ? { reasoningLevel: seat.reasoningLevel as ParticipantInput["reasoningLevel"] } : {}),
-    role: seat.role,
-    roleInstructions: seat.role === "custom" ? seat.roleInstructions : null,
+    canEdit: seat.canEdit,
   };
 }
 
 function SeatEditor({ seat, options, onChange, onRemove }: { seat: SeatDraft; options: ContextOptions; onChange: (patch: Partial<SeatDraft>) => void; onRemove?: () => void }) {
   const provider = options.providers.find((p) => p.id === seat.providerId);
   return (
-    <div className="space-y-2 rounded-lg border border-border bg-card p-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-xs text-muted-foreground">@</span>
-        <Input
-          value={seat.handle}
-          onChange={(e) => onChange({ handle: e.target.value })}
-          placeholder="handle"
-          pattern="[a-z][a-z0-9-]{0,23}"
-          title="lowercase letters, digits, dashes"
-          required
-          className="h-8 w-28 text-xs"
-          aria-label="Handle"
-        />
-        <select value={seat.providerId} onChange={(e) => onChange({ providerId: e.target.value, model: "", reasoningLevel: "" })} className={selectClass} aria-label="Provider">
-          {options.providers.map((p) => (
-            <option key={p.id} value={p.id} disabled={!p.available}>
-              {p.displayName}{p.available ? "" : " (unavailable)"}
-            </option>
-          ))}
+    <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-card p-2">
+      <span className="text-xs text-muted-foreground">@</span>
+      <Input
+        value={seat.handle}
+        onChange={(e) => onChange({ handle: e.target.value })}
+        placeholder="handle"
+        pattern="[a-z][a-z0-9-]{0,23}"
+        title="lowercase letters, digits, dashes"
+        required
+        className="h-8 w-28 text-xs"
+        aria-label="Handle"
+      />
+      <select value={seat.providerId} onChange={(e) => onChange({ providerId: e.target.value, model: "", reasoningLevel: "" })} className={selectClass} aria-label="Provider">
+        {options.providers.map((p) => (
+          <option key={p.id} value={p.id} disabled={!p.available}>
+            {p.displayName}{p.available ? "" : " (unavailable)"}
+          </option>
+        ))}
+      </select>
+      <select value={seat.model} onChange={(e) => onChange({ model: e.target.value })} className={selectClass} aria-label="Model">
+        <option value="">default model</option>
+        {(provider?.models ?? []).map((m) => (
+          <option key={m.model} value={m.model}>{m.displayName}{m.isDefault ? " (default)" : ""}</option>
+        ))}
+      </select>
+      {(provider?.reasoningLevels.length ?? 0) > 0 ? (
+        <select value={seat.reasoningLevel} onChange={(e) => onChange({ reasoningLevel: e.target.value })} className={selectClass} aria-label="Reasoning">
+          <option value="">default reasoning</option>
+          {(provider?.reasoningLevels ?? [])
+            .filter((level) => ["low", "medium", "high", "xhigh", "max"].includes(level))
+            .map((level) => (
+              <option key={level} value={level}>{level}</option>
+            ))}
         </select>
-        <select value={seat.model} onChange={(e) => onChange({ model: e.target.value })} className={selectClass} aria-label="Model">
-          <option value="">default model</option>
-          {(provider?.models ?? []).map((m) => (
-            <option key={m.model} value={m.model}>{m.displayName}{m.isDefault ? " (default)" : ""}</option>
-          ))}
-        </select>
-        {(provider?.reasoningLevels.length ?? 0) > 0 ? (
-          <select value={seat.reasoningLevel} onChange={(e) => onChange({ reasoningLevel: e.target.value })} className={selectClass} aria-label="Reasoning">
-            <option value="">default reasoning</option>
-            {(provider?.reasoningLevels ?? [])
-              .filter((level) => ["low", "medium", "high", "xhigh", "max"].includes(level))
-              .map((level) => (
-                <option key={level} value={level}>{level}</option>
-              ))}
-          </select>
-        ) : null}
-        <select value={seat.role} onChange={(e) => onChange({ role: e.target.value as Role })} className={selectClass} aria-label="Role" title={ROLE_HINTS[seat.role]}>
-          {ROLE_OPTIONS.map((role) => (
-            <option key={role} value={role}>{role === "none" ? "no role" : role}</option>
-          ))}
-        </select>
-        {onRemove ? (
-          <Button type="button" variant="ghost" size="icon" className="ml-auto size-7 text-muted-foreground hover:text-foreground" aria-label="Remove seat" onClick={onRemove}>
-            <Icon name="Trash2" className="size-4" />
-          </Button>
-        ) : null}
-      </div>
-      <p className="text-[11px] text-muted-foreground">{ROLE_HINTS[seat.role]}</p>
-      {seat.role === "custom" ? (
-        <textarea
-          value={seat.roleInstructions}
-          onChange={(e) => onChange({ roleInstructions: e.target.value })}
-          rows={2}
-          placeholder="What this participant is responsible for and how it must reply"
-          className="w-full resize-none rounded-md border border-input bg-transparent px-2 py-1.5 text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-        />
+      ) : null}
+      <label className="inline-flex items-center gap-1.5 text-xs text-muted-foreground" title="Read-only seats may inspect the workspace but not change it">
+        <input type="checkbox" checked={seat.canEdit} onChange={(e) => onChange({ canEdit: e.target.checked })} className="size-3.5" />
+        may edit files
+      </label>
+      {onRemove ? (
+        <Button type="button" variant="ghost" size="icon" className="ml-auto size-7 text-muted-foreground hover:text-foreground" aria-label="Remove seat" onClick={onRemove}>
+          <Icon name="Trash2" className="size-4" />
+        </Button>
       ) : null}
     </div>
   );
@@ -628,7 +641,7 @@ function SeatEditor({ seat, options, onChange, onRemove }: { seat: SeatDraft; op
 function AddParticipantForm({ detail, options, onDone }: { detail: RoomDetail; options: ContextOptions; onDone: () => void }) {
   const rpc = useRpc<Contract>();
   const first = options.providers.find((p) => p.available) ?? options.providers[0];
-  const [seat, setSeat] = useState<SeatDraft>({ handle: "", providerId: first?.id ?? "", model: "", reasoningLevel: "", role: "none", roleInstructions: "" });
+  const [seat, setSeat] = useState<SeatDraft>({ handle: "", providerId: first?.id ?? "", model: "", reasoningLevel: "", canEdit: false });
   const speakers = detail.participants.filter((p) => !p.removed && p.threadId !== null);
   const [brief, setBrief] = useState<Brief>(speakers.length > 0 ? "summary" : "full");
   const [summarizer, setSummarizer] = useState(speakers[0]?.handle ?? "");
@@ -683,6 +696,82 @@ function AddParticipantForm({ detail, options, onDone }: { detail: RoomDetail; o
 }
 
 // ---------------------------------------------------------------------------
+// Templates: prompts you can edit, not hidden behavior
+// ---------------------------------------------------------------------------
+
+interface Template {
+  id: string;
+  label: string;
+  /** Which button the template expects you to press afterwards. */
+  mode: "send" | "discuss";
+  turns: number;
+  build(seats: Participant[], docPath: string | null): { text: string; tags: string[] } | null;
+}
+
+const TEMPLATES: Template[] = [
+  {
+    id: "discuss",
+    label: "Discuss an idea",
+    mode: "discuss",
+    turns: 6,
+    build(seats, docPath) {
+      const [a, b] = seats;
+      if (!a || !b) return null;
+      const doc = docPath ?? "the pinned document";
+      return {
+        tags: [a.handle, b.handle],
+        text: [
+          "Debate and converge on: <topic>",
+          "",
+          `@${a.handle} drafts the proposal into ${doc} as numbered decisions, each with a one-line rationale, and answers every finding by number: accept (and apply), reject (with the reason), or defer (with what would settle it).`,
+          `@${b.handle} reviews critically with numbered findings: severity (blocker, major, minor, nit), the exact target, why it is wrong, and a concrete fix. Verify claims against the workspace. Do not restate the proposal.`,
+        ].join("\n"),
+      };
+    },
+  },
+  {
+    id: "implement",
+    label: "Implement the plan",
+    mode: "send",
+    turns: 2,
+    build(seats, docPath) {
+      const editor = seats.find((s) => s.canEdit) ?? seats[seats.length - 1];
+      const other = seats.find((s) => s.handle !== editor?.handle);
+      if (!editor) return null;
+      const doc = docPath ?? "the pinned document";
+      return {
+        tags: [editor.handle],
+        text: [
+          `@${editor.handle} implement the decisions in ${doc}.`,
+          "Before editing, list the files you will touch. Afterwards report what changed, how you verified it (commands and results), and what you did not do.",
+          other ? `If a decision is ambiguous, ask @${other.handle} instead of guessing.` : "",
+        ].filter(Boolean).join(" "),
+      };
+    },
+  },
+  {
+    id: "review",
+    label: "Review the changes",
+    mode: "discuss",
+    turns: 6,
+    build(seats, docPath) {
+      const editor = seats.find((s) => s.canEdit) ?? seats[seats.length - 1];
+      const reviewer = seats.find((s) => s.handle !== editor?.handle);
+      if (!editor || !reviewer) return null;
+      const doc = docPath ?? "the pinned document";
+      return {
+        tags: [reviewer.handle, editor.handle],
+        text: [
+          `Review the uncommitted changes in this workspace against ${doc}.`,
+          `@${reviewer.handle}: numbered findings with severity, file:line, why, and a concrete fix. Run the tests or commands needed to check a claim.`,
+          `@${editor.handle}: fix the accepted findings, answer each by number, and report how you verified the fix.`,
+        ].join("\n"),
+      };
+    },
+  },
+];
+
+// ---------------------------------------------------------------------------
 // Room view
 // ---------------------------------------------------------------------------
 
@@ -695,7 +784,7 @@ function parseMentions(text: string, handles: readonly string[]): string[] {
   return [...found];
 }
 
-type PendingAction = "send" | "rounds" | "askall" | "cancel" | "resume" | "archive" | "participant" | null;
+type PendingAction = "send" | "discuss" | "cancel" | "resume" | "archive" | "participant" | null;
 
 function RoomView({ roomId, compact = false }: { roomId: string; compact?: boolean }) {
   const { rpc, detail, error, refetch } = useRoom(roomId);
@@ -703,11 +792,10 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
   const panel = useAppPanel();
   const [text, setText] = useState("");
   const [tagged, setTagged] = useState<string[]>([]);
-  const [roundCount, setRoundCount] = useState(3);
-  const [hops, setHops] = useState<number | null>(null);
-  const [synthesizer, setSynthesizer] = useState("");
+  const [turns, setTurns] = useState<number | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [hint, setHint] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [options, setOptions] = useState<ContextOptions | null>(null);
@@ -722,7 +810,7 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
     (handle: string) => detail?.participants.find((p) => p.handle === handle)?.providerId ?? null,
     [detail],
   );
-  const effectiveHops = hops ?? detail?.room.defaultHops ?? 0;
+  const effectiveTurns = turns ?? detail?.room.defaultTurns ?? 4;
 
   useEffect(() => {
     if (showAdd && options === null) {
@@ -759,6 +847,7 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
   const afterSend = () => {
     setText("");
     setTagged([]);
+    setHint(null);
     stickToBottom.current = true;
     refetch();
   };
@@ -767,23 +856,15 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
     run("send", async () => {
       const body = text.trim();
       if (body === "") return;
-      await rpc.call("rooms_post", { roomId, text: body, tags, hops: effectiveHops });
+      await rpc.call("rooms_post", { roomId, text: body, tags, turns: effectiveTurns });
       afterSend();
     });
 
-  const startRounds = () =>
-    run("rounds", async () => {
+  const discuss = () =>
+    run("discuss", async () => {
       const body = text.trim();
       if (body === "" || tags.length < 2) return;
-      await rpc.call("rooms_start_rounds", { roomId, text: body, participants: tags, rounds: roundCount });
-      afterSend();
-    });
-
-  const askAll = () =>
-    run("askall", async () => {
-      const body = text.trim();
-      if (body === "" || tags.length < 1) return;
-      await rpc.call("rooms_ask_all", { roomId, text: body, participants: tags, synthesizer: synthesizer || null });
+      await rpc.call("rooms_discuss", { roomId, text: body, participants: tags, turns: Math.max(2, effectiveTurns) });
       afterSend();
     });
 
@@ -798,6 +879,20 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
     });
 
   const participantAction = (fn: () => Promise<unknown>) => run("participant", async () => { await fn(); refetch(); });
+
+  const applyTemplate = (id: string) => {
+    const template = TEMPLATES.find((t) => t.id === id);
+    if (!template || detail === null) return;
+    const built = template.build(active, detail.room.docPath);
+    if (built === null) {
+      setActionError("This template needs more seats in the room.");
+      return;
+    }
+    setText(built.text);
+    setTagged(built.tags);
+    setTurns(template.turns);
+    setHint(template.mode === "discuss" ? "Edit the prompt, then press Discuss." : "Edit the prompt, then press Send.");
+  };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
@@ -840,6 +935,9 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
   const docTarget = detail.room.docPath !== null && detail.room.environmentId !== null
     ? { kind: "workspace" as const, environmentId: detail.room.environmentId, path: detail.room.docPath }
     : null;
+  const turnsHelp = tags.length >= 2
+    ? "With Discuss: the turn cap. With Send: how many relays each answer may trigger."
+    : "How many times the tagged agent may relay to others before you get the floor back.";
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -896,6 +994,7 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
               )
             }
             onOpen={() => openThread(participant)}
+            onToggleEdit={() => participantAction(() => rpc.call("rooms_participant_update", { roomId, handle: participant.handle, canEdit: !participant.canEdit }))}
             onCompact={() => participantAction(() => rpc.call("rooms_participant_compact", { roomId, handle: participant.handle }))}
             onReset={(brief) =>
               participantAction(() =>
@@ -933,7 +1032,7 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
         {detail.messages.length === 0 ? (
           <div className="py-6">
             <EmptyState>
-              Empty room. Tag a participant and say something, for example <code>@{handles[0] ?? "claude"} draft a plan for …</code>
+              Empty room. Tag a seat and say something, or pick a template below.
             </EmptyState>
           </div>
         ) : (
@@ -958,83 +1057,59 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
           value={text}
           onChange={(event) => setText(event.target.value)}
           onKeyDown={onKeyDown}
-          rows={3}
+          rows={4}
           placeholder={
             job?.paused
-              ? `Answer @${job.paused.handle}; sending resumes the job…`
+              ? `Answer @${job.paused.handle}; sending resumes the discussion…`
               : tags.length === 0
                 ? "Post a note to the room, or tag someone with @handle to get a reply…"
-                : `Message to ${tags.map((t) => `@${t}`).join(", ")}…`
+                : tags.length === 1
+                  ? `Message to @${tags[0]}…`
+                  : `Message to ${tags.map((t) => `@${t}`).join(", ")}. Send asks each in parallel; Discuss makes them take turns…`
           }
           aria-label="Message"
           className="w-full resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
         />
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <span className="text-xs text-muted-foreground">
-            {tags.length === 0 ? "No one tagged: posts a note only." : `Tagged: ${tags.map((t) => `@${t}`).join(", ")}`}
+            {hint ?? (tags.length === 0 ? "No one tagged: posts a note only." : `Tagged: ${tags.map((t) => `@${t}`).join(", ")}`)}
           </span>
           <div className="ml-auto flex flex-wrap items-center gap-2">
-            <label className="flex items-center gap-1.5 text-xs text-muted-foreground" title="How many agent-to-agent relays this message may trigger after the tagged replies">
-              Hops
+            <select
+              value=""
+              onChange={(event) => applyTemplate(event.target.value)}
+              className={selectClass}
+              aria-label="Templates"
+              title="Fill the composer with an editable prompt"
+            >
+              <option value="">Templates…</option>
+              {TEMPLATES.map((t) => (
+                <option key={t.id} value={t.id}>{t.label}</option>
+              ))}
+            </select>
+            <label className="flex items-center gap-1.5 text-xs text-muted-foreground" title={turnsHelp}>
+              Turns
               <Input
                 type="number"
                 min={0}
-                max={8}
-                value={effectiveHops}
-                onChange={(event) => setHops(Math.min(8, Math.max(0, Number(event.target.value) || 0)))}
+                max={MAX_TURNS}
+                value={effectiveTurns}
+                onChange={(event) => setTurns(clampTurns(Number(event.target.value)))}
                 className="h-8 w-14 text-xs"
-                aria-label="Hop budget"
-              />
-            </label>
-            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              Rounds
-              <Input
-                type="number"
-                min={1}
-                max={20}
-                value={roundCount}
-                onChange={(event) => setRoundCount(Math.min(20, Math.max(1, Number(event.target.value) || 1)))}
-                className="h-8 w-14 text-xs"
-                aria-label="Number of rounds"
+                aria-label="Turns"
               />
             </label>
             <Button
               type="button"
               variant="outline"
               size="sm"
-              onClick={startRounds}
+              onClick={discuss}
               disabled={!canSend || tags.length < 2 || job !== null}
-              aria-label={tags.length < 2 ? "Tag at least two participants to run rounds" : "Kick off rounds between the tagged participants"}
+              aria-label={tags.length < 2 ? "Tag at least two seats to start a discussion" : "Let the tagged seats take turns until they agree or the turn cap"}
             >
               <Icon name="Repeat" className="size-3.5" />
-              Rounds
+              Discuss
             </Button>
-            <span className="inline-flex items-stretch overflow-hidden rounded-md border border-input">
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="rounded-none"
-                onClick={askAll}
-                disabled={!canSend || tags.length < 1 || job !== null}
-                aria-label="Ask every tagged participant in parallel"
-              >
-                <Icon name="Layers" className="size-3.5" />
-                Ask all
-              </Button>
-              <select
-                value={synthesizer}
-                onChange={(event) => setSynthesizer(event.target.value)}
-                className="h-8 border-l border-input bg-transparent px-1.5 text-xs text-muted-foreground focus-visible:outline-none"
-                aria-label="Synthesizer"
-                title="Who synthesizes the answers"
-              >
-                <option value="">no synthesis</option>
-                {handles.map((h) => (
-                  <option key={h} value={h}>then @{h}</option>
-                ))}
-              </select>
-            </span>
             <Button type="submit" size="sm" disabled={!canSend}>
               <Icon name="Sent" className="size-3.5" />
               Send
@@ -1061,12 +1136,12 @@ function defaultSeats(options: ContextOptions): SeatDraft[] {
   const available = options.providers.filter((p) => p.available);
   const has = (id: string) => available.some((p) => p.id === id);
   const seats: SeatDraft[] = [];
-  const seat = (handle: string, providerId: string, role: Role): SeatDraft => ({ handle, providerId, model: "", reasoningLevel: "", role, roleInstructions: "" });
-  if (has("claude-code")) seats.push(seat("claude", "claude-code", "planner"));
-  if (has("codex")) seats.push(seat("codex", "codex", "reviewer"));
+  const seat = (handle: string, providerId: string, canEdit: boolean): SeatDraft => ({ handle, providerId, model: "", reasoningLevel: "", canEdit });
+  if (has("claude-code")) seats.push(seat("claude", "claude-code", false));
+  if (has("codex")) seats.push(seat("codex", "codex", false));
   const acp = available.find((p) => p.id.startsWith("acp-") && p.models.length > 0) ?? available.find((p) => p.id.startsWith("acp-"));
-  if (acp) seats.push(seat(acp.id.replace(/^acp-/, ""), acp.id, "implementer"));
-  if (seats.length === 0 && available[0]) seats.push(seat(available[0].id.replace(/[^a-z0-9-]/g, ""), available[0].id, "none"));
+  if (acp) seats.push(seat(acp.id.replace(/^acp-/, ""), acp.id, true));
+  if (seats.length === 0 && available[0]) seats.push(seat(available[0].id.replace(/[^a-z0-9-]/g, ""), available[0].id, false));
   return seats;
 }
 
@@ -1077,9 +1152,9 @@ function CreateRoomForm({ preset, onCreated }: { preset?: CreatePreset; onCreate
   const [title, setTitle] = useState(preset?.title ?? "");
   const [projectId, setProjectId] = useState(preset?.projectId ?? "");
   const [seats, setSeats] = useState<SeatDraft[]>([]);
-  const [docPath, setDocPath] = useState("");
+  const [docPath, setDocPath] = useState(".roundtable/plan.md");
   const [docOwner, setDocOwner] = useState("");
-  const [hops, setHops] = useState(1);
+  const [turns, setTurns] = useState(4);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
@@ -1087,7 +1162,9 @@ function CreateRoomForm({ preset, onCreated }: { preset?: CreatePreset; onCreate
     rpc.call("context_options").then(
       (result) => {
         setOptions(result);
-        setSeats(defaultSeats(result));
+        const defaults = defaultSeats(result);
+        setSeats(defaults);
+        setDocOwner(defaults[0]?.handle ?? "");
         const personal = result.projects.find((p) => p.kind !== "standard");
         setProjectId((current) => current || personal?.id || result.projects[0]?.id || "");
       },
@@ -1110,7 +1187,7 @@ function CreateRoomForm({ preset, onCreated }: { preset?: CreatePreset; onCreate
         participants: seats.map(toParticipantInput),
         docPath: docPath.trim() === "" ? null : docPath.trim(),
         docOwner: docPath.trim() === "" || docOwner === "" ? null : docOwner,
-        defaultHops: hops,
+        defaultTurns: turns,
       });
       if (onCreated) onCreated(room.id);
       else navigate.toPluginPanel(PANEL_PATH, { subPath: room.id, replace: true });
@@ -1139,7 +1216,8 @@ function CreateRoomForm({ preset, onCreated }: { preset?: CreatePreset; onCreate
           <p className="text-xs text-muted-foreground">
             {preset?.environmentId
               ? "The room shares this thread's workspace. Participant threads are created the first time each is tagged."
-              : "Every participant gets its own thread in one shared workspace. Threads are created the first time each participant is tagged."}
+              : "Every seat gets its own thread in one shared workspace. Threads are created the first time each seat is tagged."}
+            {" "}What each agent should do goes in your messages; the room only tells them how the relay, the footer, and file access work.
           </p>
         </div>
         <label className="block space-y-1 text-xs text-muted-foreground">
@@ -1161,7 +1239,7 @@ function CreateRoomForm({ preset, onCreated }: { preset?: CreatePreset; onCreate
 
         <div className="space-y-2">
           <div className="flex items-center justify-between">
-            <span className="text-xs text-muted-foreground">Participants and roles</span>
+            <span className="text-xs text-muted-foreground">Seats</span>
             <Button
               type="button"
               variant="ghost"
@@ -1169,7 +1247,7 @@ function CreateRoomForm({ preset, onCreated }: { preset?: CreatePreset; onCreate
               onClick={() => {
                 const first = options.providers.find((p) => p.available) ?? options.providers[0];
                 if (!first) return;
-                setSeats((current) => [...current, { handle: "", providerId: first.id, model: "", reasoningLevel: "", role: "none", roleInstructions: "" }]);
+                setSeats((current) => [...current, { handle: "", providerId: first.id, model: "", reasoningLevel: "", canEdit: false }]);
               }}
             >
               <Icon name="Plus" className="size-4" />
@@ -1199,9 +1277,9 @@ function CreateRoomForm({ preset, onCreated }: { preset?: CreatePreset; onCreate
           </label>
         </div>
         <label className="flex items-center gap-2 text-xs text-muted-foreground">
-          Default hops
-          <Input type="number" min={0} max={8} value={hops} onChange={(event) => setHops(Math.min(8, Math.max(0, Number(event.target.value) || 0)))} className="h-8 w-16 text-xs" />
-          <span>agent-to-agent relays a tagged reply may trigger when it addresses another participant</span>
+          Default turns
+          <Input type="number" min={0} max={MAX_TURNS} value={turns} onChange={(event) => setTurns(clampTurns(Number(event.target.value)))} className="h-8 w-16 text-xs" />
+          <span>how long the agents may keep talking among themselves before you get the floor back</span>
         </label>
 
         {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
@@ -1235,7 +1313,7 @@ function RoomListItem({ room, active, onSelect }: { room: RoomSummary; active: b
         className={cn("w-full rounded-md px-2.5 py-2 text-left hover:bg-state-hover", active && "bg-state-active")}
       >
         <div className="flex items-center gap-1.5 truncate text-sm font-medium">
-          {room.jobKind ? <Icon name="Loading" className="size-3 animate-spin text-muted-foreground" /> : null}
+          {room.discussing ? <Icon name="Loading" className="size-3 animate-spin text-muted-foreground" /> : null}
           {room.title}
         </div>
         <div className="truncate text-xs text-muted-foreground">
@@ -1288,7 +1366,7 @@ function RoundtablePage({ subPath }: { subPath: string }) {
         ) : (
           <div className="p-6">
             <EmptyState>
-              Pick a room or create one. Each room is a shared transcript where you tag agents in, let them relay to each other for a few hops, ask everyone at once, or run bounded rounds until they agree.
+              Pick a room or create one. Tag one seat and Send to ask it something. Tag two or more and Discuss to let them take turns until they agree. Turns bounds how long they keep talking before you get the floor back.
             </EmptyState>
           </div>
         )}

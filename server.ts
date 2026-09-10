@@ -3,12 +3,15 @@
 // A room is a shared transcript owned by this plugin. Each participant is an
 // ordinary bb thread (one per agent provider) that shares the room's
 // environment. When a participant is addressed, the plugin relays every room
-// message it has not seen yet, plus an instruction, into that thread. The
-// participant's final reply is captured on `thread.idle`, parsed for its
-// STANCE / OPEN footer, and posted back to the room. Replies that mention other
-// participants can relay onward while the message's hop budget lasts. Jobs
-// (rounds, ask-all) drive multi-turn exchanges with a turn cap and end on
-// consensus.
+// message it has not seen yet, plus a one-line instruction, into that thread.
+// The participant's final reply is captured on `thread.idle`, parsed for its
+// STANCE / OPEN footer, and posted back to the room.
+//
+// One knob, "turns", bounds how long agents may keep talking before the user
+// gets the floor back. On a plain message it is a relay allowance: a reply
+// that addresses another participant is passed on while turns remain. On a
+// discussion it is the turn cap: the plugin schedules the speakers itself and
+// stops early once everyone is at agree with nothing open.
 import { randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
@@ -26,10 +29,6 @@ const REASONING_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 const reasoningSchema = z.enum(REASONING_LEVELS);
 type ReasoningLevel = z.infer<typeof reasoningSchema>;
 
-export const ROLES = ["none", "planner", "reviewer", "implementer", "custom"] as const;
-const roleSchema = z.enum(ROLES);
-export type Role = z.infer<typeof roleSchema>;
-
 export const STANCES = ["agree", "disagree", "need-info", "pass"] as const;
 const stanceSchema = z.enum(STANCES);
 export type Stance = z.infer<typeof stanceSchema>;
@@ -37,15 +36,15 @@ export type Stance = z.infer<typeof stanceSchema>;
 const briefSchema = z.enum(["full", "summary", "none"]);
 export type Brief = z.infer<typeof briefSchema>;
 
-const hopsSchema = z.number().int().min(0).max(8);
+export const MAX_TURNS = 40;
+const turnsSchema = z.number().int().min(0).max(MAX_TURNS);
 
 const participantInputSchema = z.object({
   handle: handleSchema,
   providerId: z.string().min(1),
   model: z.string().min(1).nullable().optional(),
   reasoningLevel: reasoningSchema.nullable().optional(),
-  role: roleSchema.optional(),
-  roleInstructions: z.string().max(4000).nullable().optional(),
+  canEdit: z.boolean().optional(),
 });
 export type ParticipantInput = z.infer<typeof participantInputSchema>;
 
@@ -54,8 +53,7 @@ const participantSchema = z.object({
   providerId: z.string(),
   model: z.string().nullable(),
   reasoningLevel: z.string().nullable(),
-  role: roleSchema,
-  roleInstructions: z.string().nullable(),
+  canEdit: z.boolean(),
   threadId: z.string().nullable(),
   lastSeenSeq: z.number(),
   status: z.string().nullable(),
@@ -74,7 +72,7 @@ const messageSchema = z.object({
   tags: z.array(z.string()),
   stance: stanceSchema.nullable(),
   openPoints: z.array(z.string()),
-  hopsLeft: z.number(),
+  turnsLeft: z.number(),
   durationMs: z.number().nullable(),
   createdAt: z.number(),
 });
@@ -87,7 +85,7 @@ const roomSchema = z.object({
   environmentId: z.string().nullable(),
   docPath: z.string().nullable(),
   docOwner: z.string().nullable(),
-  defaultHops: z.number(),
+  defaultTurns: z.number(),
   createdAt: z.number(),
   updatedAt: z.number(),
 });
@@ -97,20 +95,17 @@ const roomSummarySchema = roomSchema.extend({
   handles: z.array(z.string()),
   messageCount: z.number(),
   lastAuthor: z.string().nullable(),
-  jobKind: z.string().nullable(),
+  discussing: z.boolean(),
 });
 export type RoomSummary = z.infer<typeof roomSummarySchema>;
 
 const jobSchema = z
   .object({
-    kind: z.enum(["rounds", "askall"]),
     participants: z.array(z.string()),
     totalTurns: z.number(),
     turn: z.number(),
     current: z.string().nullable(),
-    inFlight: z.array(z.string()),
     paused: z.object({ handle: z.string(), question: z.string() }).nullable(),
-    synthesizer: z.string().nullable(),
     startedAt: z.number(),
   })
   .nullable();
@@ -192,7 +187,7 @@ export const rpcContract = defineRpcContract({
       participants: z.array(participantInputSchema).min(1).max(8),
       docPath: z.string().trim().max(400).nullable().optional(),
       docOwner: handleSchema.nullable().optional(),
-      defaultHops: hopsSchema.optional(),
+      defaultTurns: turnsSchema.optional(),
     }),
     output: z.object({ room: roomSchema }),
   },
@@ -202,7 +197,7 @@ export const rpcContract = defineRpcContract({
       title: z.string().trim().min(1).max(120).optional(),
       docPath: z.string().trim().max(400).nullable().optional(),
       docOwner: handleSchema.nullable().optional(),
-      defaultHops: hopsSchema.optional(),
+      defaultTurns: turnsSchema.optional(),
     }),
     output: z.object({ room: roomSchema }),
   },
@@ -211,30 +206,23 @@ export const rpcContract = defineRpcContract({
     input: roomIdSchema,
     output: z.object({ files: z.array(changedFileSchema), note: z.string().nullable() }),
   },
+  /** Plain message. Tagged seats answer (in parallel when several); `turns` is the relay allowance. */
   rooms_post: {
     input: z.object({
       roomId: z.string(),
       text: textSchema,
       tags: z.array(handleSchema).max(8),
-      hops: hopsSchema.optional(),
+      turns: turnsSchema.optional(),
     }),
     output: z.object({ seq: z.number(), dispatched: z.array(z.string()) }),
   },
-  rooms_start_rounds: {
+  /** Scheduled back-and-forth between two or more seats; `turns` is the cap. */
+  rooms_discuss: {
     input: z.object({
       roomId: z.string(),
       text: textSchema,
       participants: z.array(handleSchema).min(2).max(8),
-      rounds: z.number().int().min(1).max(20),
-    }),
-    output: okSchema,
-  },
-  rooms_ask_all: {
-    input: z.object({
-      roomId: z.string(),
-      text: textSchema,
-      participants: z.array(handleSchema).min(1).max(8),
-      synthesizer: handleSchema.nullable().optional(),
+      turns: z.number().int().min(2).max(MAX_TURNS),
     }),
     output: okSchema,
   },
@@ -256,8 +244,14 @@ export const rpcContract = defineRpcContract({
     output: okSchema,
   },
   rooms_participant_remove: { input: roomHandleSchema, output: okSchema },
+  rooms_participant_update: {
+    input: roomHandleSchema.extend({ canEdit: z.boolean() }),
+    output: okSchema,
+  },
   rooms_doc_read: { input: roomIdSchema, output: docReadSchema },
   rooms_doc_create: { input: roomIdSchema, output: docReadSchema },
+  /** Exactly what a seat is told on first contact, for the settings view. */
+  rooms_intro_preview: { input: roomHandleSchema, output: z.object({ text: z.string() }) },
   rooms_for_thread: { input: z.object({ threadId: z.string() }), output: roomForThreadSchema },
   context_options: { input: z.null(), output: contextOptionsSchema },
 });
@@ -269,7 +263,8 @@ export const ROOM_CHANGED = "room-changed";
 // Storage
 // ---------------------------------------------------------------------------
 
-// Append-only from here on: the host records each statement's hash.
+// Append-only: the host records each statement's hash. Never edit shipped rows.
+// The role columns from an earlier revision stay in place and are ignored.
 const MIGRATIONS = [
   `CREATE TABLE IF NOT EXISTS rooms (
      id TEXT PRIMARY KEY,
@@ -313,6 +308,8 @@ const MIGRATIONS = [
      PRIMARY KEY (room_id, seq)
    )`,
   `CREATE INDEX IF NOT EXISTS participants_thread_idx ON participants(thread_id)`,
+  `ALTER TABLE participants ADD COLUMN can_edit INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE rooms ADD COLUMN default_turns INTEGER NOT NULL DEFAULT 4`,
 ];
 
 interface RoomRow {
@@ -325,7 +322,7 @@ interface RoomRow {
   archived_at: number | null;
   doc_path: string | null;
   doc_owner: string | null;
-  default_hops: number;
+  default_turns: number;
 }
 interface ParticipantRow {
   room_id: string;
@@ -336,11 +333,10 @@ interface ParticipantRow {
   thread_id: string | null;
   last_seen_seq: number;
   created_at: number;
-  role: string;
-  role_instructions: string | null;
   turns: number;
   relayed_chars: number;
   removed_at: number | null;
+  can_edit: number;
 }
 interface MessageRow {
   room_id: string;
@@ -357,7 +353,7 @@ interface MessageRow {
 interface MessageMeta {
   stance?: Stance | null;
   openPoints?: string[];
-  hopsLeft?: number;
+  turnsLeft?: number;
   durationMs?: number | null;
 }
 
@@ -376,10 +372,10 @@ function createStore(db: Database.Database) {
       `SELECT * FROM rooms WHERE archived_at IS NULL ORDER BY updated_at DESC`,
     ),
     insertRoom: db.prepare<[string, string, string, string | null, string | null, string | null, number, number, number]>(
-      `INSERT INTO rooms (id, title, project_id, environment_id, doc_path, doc_owner, default_hops, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO rooms (id, title, project_id, environment_id, doc_path, doc_owner, default_turns, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ),
     updateRoom: db.prepare<[string, string | null, string | null, number, number, string]>(
-      `UPDATE rooms SET title = ?, doc_path = ?, doc_owner = ?, default_hops = ?, updated_at = ? WHERE id = ?`,
+      `UPDATE rooms SET title = ?, doc_path = ?, doc_owner = ?, default_turns = ?, updated_at = ? WHERE id = ?`,
     ),
     touchRoom: db.prepare<[number, string]>(`UPDATE rooms SET updated_at = ? WHERE id = ?`),
     setRoomEnvironment: db.prepare<[string, string]>(
@@ -398,13 +394,14 @@ function createStore(db: Database.Database) {
     participantByThread: db.prepare<[string], ParticipantRow>(
       `SELECT * FROM participants WHERE thread_id = ?`,
     ),
-    insertParticipant: db.prepare<
-      [string, string, string, string | null, string | null, string, string | null, number, number]
-    >(
-      `INSERT INTO participants (room_id, handle, provider_id, model, reasoning_level, role, role_instructions, last_seen_seq, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    insertParticipant: db.prepare<[string, string, string, string | null, string | null, number, number, number]>(
+      `INSERT INTO participants (room_id, handle, provider_id, model, reasoning_level, can_edit, last_seen_seq, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ),
     setParticipantThread: db.prepare<[string | null, string, string]>(
       `UPDATE participants SET thread_id = ? WHERE room_id = ? AND handle = ?`,
+    ),
+    setCanEdit: db.prepare<[number, string, string]>(
+      `UPDATE participants SET can_edit = ? WHERE room_id = ? AND handle = ?`,
     ),
     setLastSeen: db.prepare<[number, string, string]>(
       `UPDATE participants SET last_seen_seq = ? WHERE room_id = ? AND handle = ?`,
@@ -456,7 +453,7 @@ function createStore(db: Database.Database) {
         created_at: createdAt,
         stance: meta.stance ?? null,
         open_points: JSON.stringify(meta.openPoints ?? []),
-        hops_left: meta.hopsLeft ?? 0,
+        hops_left: meta.turnsLeft ?? 0,
         duration_ms: meta.durationMs ?? null,
       };
       q.insertMessage.run(
@@ -475,8 +472,7 @@ function createStore(db: Database.Database) {
       p.providerId,
       p.model ?? null,
       p.reasoningLevel ?? null,
-      p.role ?? "none",
-      p.role === "custom" ? (p.roleInstructions ?? null) : null,
+      p.canEdit ? 1 : 0,
       lastSeenSeq,
       Date.now(),
     );
@@ -490,11 +486,11 @@ function createStore(db: Database.Database) {
       participants: ParticipantInput[];
       docPath: string | null;
       docOwner: string | null;
-      defaultHops: number;
+      defaultTurns: number;
     }): RoomRow => {
       const id = randomBytes(5).toString("hex");
       const now = Date.now();
-      q.insertRoom.run(id, input.title, input.projectId, input.environmentId, input.docPath, input.docOwner, input.defaultHops, now, now);
+      q.insertRoom.run(id, input.title, input.projectId, input.environmentId, input.docPath, input.docOwner, input.defaultTurns, now, now);
       for (const p of input.participants) insertParticipant(id, p, 0);
       return {
         id,
@@ -506,7 +502,7 @@ function createStore(db: Database.Database) {
         archived_at: null,
         doc_path: input.docPath,
         doc_owner: input.docOwner,
-        default_hops: input.defaultHops,
+        default_turns: input.defaultTurns,
       };
     },
   );
@@ -623,7 +619,7 @@ function toRoom(row: RoomRow): Room {
     environmentId: row.environment_id,
     docPath: row.doc_path,
     docOwner: row.doc_owner,
-    defaultHops: row.default_hops,
+    defaultTurns: row.default_turns,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -642,10 +638,6 @@ function isStance(value: string | null): value is Stance {
   return value !== null && (STANCES as readonly string[]).includes(value);
 }
 
-function isRole(value: string): value is Role {
-  return (ROLES as readonly string[]).includes(value);
-}
-
 function toMessage(row: MessageRow): Message {
   const isAgent = row.author !== "user" && row.author !== "system";
   const body = isAgent ? parseReply(row.text).body : row.text;
@@ -657,7 +649,7 @@ function toMessage(row: MessageRow): Message {
     tags: parseJsonStrings(row.tags),
     stance: isStance(row.stance) ? row.stance : null,
     openPoints: parseJsonStrings(row.open_points),
-    hopsLeft: row.hops_left,
+    turnsLeft: row.hops_left,
     durationMs: row.duration_ms,
     createdAt: row.created_at,
   };
@@ -701,36 +693,8 @@ function joinPath(root: string, relative: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Role contracts and instructions
+// What agents are told
 // ---------------------------------------------------------------------------
-
-const ROLE_CONTRACTS: Record<Exclude<Role, "custom" | "none">, string> = {
-  planner: [
-    "Role: planner. You own the proposal.",
-    "Write or revise it as numbered decisions, each with a one-line rationale.",
-    "When revising, start with a \"Changes since last version\" list.",
-    "Answer every reviewer finding by its number: accept (and apply it), reject (with the reason), or defer (with what would settle it).",
-    "Keep the proposal self-contained so a newcomer can read only the latest version.",
-  ].join(" "),
-  reviewer: [
-    "Role: reviewer. Review critically and independently.",
-    "Return numbered findings. Each finding has: severity (blocker, major, minor, nit), the exact claim or file:line it targets, why it is wrong or risky, and a concrete fix.",
-    "Verify claims against the workspace before asserting them. Do not restate the proposal. Say what is missing.",
-    "If nothing is wrong, say so plainly and stop.",
-  ].join(" "),
-  implementer: [
-    "Role: implementer. You turn accepted decisions into changes, only when the user asks for implementation in this room.",
-    "Before editing, list the files you will touch. Afterwards report what changed, how you verified it (commands and results), and what you did not do.",
-    "Do not redesign. Raise design objections as numbered findings addressed to the planner.",
-  ].join(" "),
-};
-
-function roleContract(row: ParticipantRow): string | null {
-  const role = isRole(row.role) ? row.role : "none";
-  if (role === "none") return null;
-  if (role === "custom") return row.role_instructions ? `Role: ${row.role_instructions.trim()}` : null;
-  return ROLE_CONTRACTS[role];
-}
 
 const REPLY_FORMAT = [
   "Reply format. End every reply with exactly these two lines, in this order:",
@@ -741,6 +705,49 @@ const REPLY_FORMAT = [
 ].join("\n");
 
 const FOOTER_REMINDER = "End with the two footer lines: STANCE and OPEN.";
+
+function editAuthority(room: RoomRow, participant: ParticipantRow): string {
+  const ownsDoc = room.doc_path !== null && room.doc_owner === participant.handle;
+  if (participant.can_edit === 1) {
+    return `You may modify files in this workspace when the user asks for it in this room${ownsDoc ? `, and you own the pinned document ${room.doc_path}` : ""}. Say which files you touched.`;
+  }
+  if (ownsDoc) {
+    return `You may edit the pinned document ${room.doc_path}. Do not modify other files.`;
+  }
+  return "Do not modify files. Reading files and running read-only commands to check claims is encouraged.";
+}
+
+function docNotice(room: RoomRow, participant: ParticipantRow): string | null {
+  if (room.doc_path === null) return null;
+  const owner = room.doc_owner === null ? "the user" : `@${room.doc_owner}`;
+  const you = room.doc_owner === participant.handle;
+  return `Pinned document: ${room.doc_path} (relative to the workspace). Read it before replying. ${
+    you
+      ? "You own it: apply accepted changes to it and list what changed."
+      : `Only ${owner} edits it; propose changes as numbered findings.`
+  }`;
+}
+
+function introFor(room: RoomRow, participant: ParticipantRow, others: readonly ParticipantRow[]): string {
+  const roster = others.length === 0
+    ? "no other agents yet"
+    : others.map((other) => `@${other.handle} (${other.provider_id})`).join(", ");
+  const sections = [
+    `You are @${participant.handle} in "${room.title}", a Roundtable room shared by the user and other agents: ${roster}.`,
+    [
+      "How the room works:",
+      "- Room messages are relayed to you in order with their author. \"user\" is the human. \"@name\" is another agent.",
+      `- Your final reply is posted to the room verbatim as @${participant.handle}. Write for the room. Do not restate the relayed messages or narrate the relay.`,
+      "- Be concrete. Disagree with specifics. Agree briefly. Keep it short unless the user asks for detail.",
+      `- ${editAuthority(room, participant)} All participants share this workspace.`,
+      `- To read the room: bb roundtable show ${room.id}. To pull another agent in mid-turn: bb roundtable say ${room.id} --to <handle> "<message>". Your final reply is still posted.`,
+    ].join("\n"),
+  ];
+  const doc = docNotice(room, participant);
+  if (doc !== null) sections.push(doc);
+  sections.push(REPLY_FORMAT);
+  return sections.join("\n\n");
+}
 
 // ---------------------------------------------------------------------------
 // Plugin
@@ -760,22 +767,18 @@ interface PendingTurn {
 }
 
 interface Awaiting {
-  hopsLeft: number;
+  turnsLeft: number;
   deliveredAt: number;
   job: boolean;
-  triggeredBy: string;
 }
 
 interface JobState {
-  kind: "rounds" | "askall";
   roomId: string;
   participants: string[];
   totalTurns: number;
   turn: number;
   current: string | null;
-  inFlight: Set<string>;
   paused: { handle: string; question: string } | null;
-  synthesizer: string | null;
   startedAt: number;
   startSeq: number;
   controller: AbortController;
@@ -798,7 +801,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.storage.migrate(db, MIGRATIONS);
   const store: Store = createStore(db);
 
-  /** Promises awaiting a reply, keyed by `${roomId}/${handle}` (jobs and briefings). */
+  /** Promises awaiting a reply, keyed by `${roomId}/${handle}` (discussions and briefings). */
   const pending = new Map<string, PendingTurn[]>();
   /** Participants the room expects a reply from; set by every delivery. */
   const awaiting = new Map<string, Awaiting>();
@@ -880,53 +883,6 @@ export default async function plugin(bb: BbPluginApi) {
     return undefined;
   }
 
-  function editAuthority(room: RoomRow, participant: ParticipantRow): string {
-    const owner = room.doc_path !== null && room.doc_owner === participant.handle;
-    if (owner) {
-      return `You may edit the pinned document ${room.doc_path}. Do not modify other files unless the user explicitly asks you to in this room.`;
-    }
-    if (participant.role === "implementer") {
-      return "Modify files only when the user asks for implementation in this room. Otherwise read-only.";
-    }
-    return "Do not modify files unless the user explicitly asks you to in this room. Reading files and running read-only commands to check claims is encouraged.";
-  }
-
-  function docNotice(room: RoomRow, participant: ParticipantRow): string | null {
-    if (room.doc_path === null) return null;
-    const owner = room.doc_owner === null ? "the user" : `@${room.doc_owner}`;
-    const you = room.doc_owner === participant.handle;
-    return `Pinned document: ${room.doc_path} (relative to the workspace). Read it before replying. ${
-      you
-        ? "You own it: apply accepted changes to it and list what changed."
-        : `Only ${owner} edits it; propose changes as numbered findings.`
-    }`;
-  }
-
-  function introFor(room: RoomRow, participant: ParticipantRow, others: readonly ParticipantRow[]): string {
-    const roster = others.length === 0
-      ? "no other agents yet"
-      : others
-          .map((other) => `@${other.handle} (${other.provider_id}${other.role !== "none" ? `, ${other.role}` : ""})`)
-          .join(", ");
-    const sections = [
-      `You are @${participant.handle} in "${room.title}", a Roundtable room shared by the user and other agents: ${roster}.`,
-      [
-        "How the room works:",
-        "- Room messages are relayed to you in order with their author. \"user\" is the human. \"@name\" is another agent.",
-        `- Your final reply is posted to the room verbatim as @${participant.handle}. Write for the room. Do not restate the relayed messages or narrate the relay.`,
-        "- Be concrete. Disagree with specifics. Agree briefly. Keep it short unless the user asks for detail.",
-        `- ${editAuthority(room, participant)} All participants share this workspace.`,
-        `- To read the room: bb roundtable show ${room.id}. To pull another agent in mid-turn: bb roundtable say ${room.id} --to <handle> "<message>". Your final reply is still posted.`,
-      ].join("\n"),
-    ];
-    const contract = roleContract(participant);
-    if (contract !== null) sections.push(contract);
-    const doc = docNotice(room, participant);
-    if (doc !== null) sections.push(doc);
-    sections.push(REPLY_FORMAT);
-    return sections.join("\n\n");
-  }
-
   function sendText(threadId: string, text: string) {
     return bb.sdk.threads.send({
       threadId,
@@ -978,9 +934,8 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   interface DeliverOptions {
-    hopsLeft: number;
+    turnsLeft: number;
     job: boolean;
-    triggeredBy: string;
   }
 
   /**
@@ -1007,7 +962,7 @@ export default async function plugin(bb: BbPluginApi) {
     const text = sections.join("\n\n");
 
     const key = pendingKey(room.id, handle);
-    awaiting.set(key, { hopsLeft: options.hopsLeft, deliveredAt: Date.now(), job: options.job, triggeredBy: options.triggeredBy });
+    awaiting.set(key, { turnsLeft: options.turnsLeft, deliveredAt: Date.now(), job: options.job });
     try {
       await sendOrSpawn(room, participant, text);
     } catch (cause) {
@@ -1035,7 +990,7 @@ export default async function plugin(bb: BbPluginApi) {
     return dispatched;
   }
 
-  function postFrom(roomId: string, author: string, text: string, explicitTags: readonly string[], hopsLeft: number): { seq: number; tags: string[] } {
+  function postFrom(roomId: string, author: string, text: string, explicitTags: readonly string[], turnsLeft: number): { seq: number; tags: string[] } {
     const room = store.room(roomId);
     if (room === undefined) throw new Error(`room ${roomId} not found`);
     const handles = store.handles(room.id);
@@ -1043,88 +998,70 @@ export default async function plugin(bb: BbPluginApi) {
       ...explicitTags.filter((tag) => handles.includes(tag) && tag !== author),
       ...mentionsIn(text, handles, author),
     ]);
-    const row = store.appendMessage(room.id, author, text, tags, { hopsLeft });
+    const row = store.appendMessage(room.id, author, text, tags, { turnsLeft });
     publish(room.id);
     return { seq: row.seq, tags };
   }
 
   const USER_TAG_INSTRUCTION = "You were tagged by the user. Reply to the room.";
+  const PARALLEL_INSTRUCTION = "You were tagged by the user together with others, who are answering in parallel. Answer independently; do not wait for them.";
   const addressedInstruction = (by: string) => `You were addressed by @${by}. Reply to the room.`;
 
-  // -- jobs: rounds and ask-all --------------------------------------------
+  // -- discussion job -------------------------------------------------------
 
   function jobView(roomId: string): Job {
     const state = jobs.get(roomId);
     if (state === undefined) return null;
     return {
-      kind: state.kind,
       participants: state.participants,
       totalTurns: state.totalTurns,
       turn: state.turn,
       current: state.current,
-      inFlight: [...state.inFlight],
       paused: state.paused,
-      synthesizer: state.synthesizer,
       startedAt: state.startedAt,
     };
   }
 
-  function requireJobFree(room: RoomRow, participants: readonly string[]): string[] {
-    if (jobs.has(room.id)) throw new Error("a job is already running in this room");
+  function startDiscussion(roomId: string, text: string, participants: string[], turns: number, author: string): void {
+    const room = store.room(roomId);
+    if (room === undefined) throw new Error(`room ${roomId} not found`);
+    if (jobs.has(room.id)) throw new Error("a discussion is already running in this room");
     const handles = store.handles(room.id);
     const missing = participants.filter((handle) => !handles.includes(handle));
     if (missing.length > 0) throw new Error(`not in room: ${missing.map((h) => `@${h}`).join(", ")}`);
-    return uniq(participants);
-  }
-
-  function newJob(kind: JobState["kind"], room: RoomRow, participants: string[], totalTurns: number, synthesizer: string | null): JobState {
+    const order = uniq(participants);
+    if (order.length < 2) throw new Error("a discussion needs at least two participants");
+    store.appendMessage(room.id, author, text, order, { turnsLeft: 0 });
     const state: JobState = {
-      kind,
       roomId: room.id,
-      participants,
-      totalTurns,
+      participants: order,
+      totalTurns: turns,
       turn: 0,
       current: null,
-      inFlight: new Set(),
       paused: null,
-      synthesizer,
       startedAt: Date.now(),
       startSeq: store.maxSeq(room.id),
       controller: new AbortController(),
       resume: null,
     };
     jobs.set(room.id, state);
-    return state;
-  }
-
-  function startRounds(roomId: string, text: string, participants: string[], rounds: number, author: string): void {
-    const room = store.room(roomId);
-    if (room === undefined) throw new Error(`room ${roomId} not found`);
-    const order = requireJobFree(room, participants);
-    if (order.length < 2) throw new Error("rounds need at least two participants");
-    store.appendMessage(room.id, author, text, order, { hopsLeft: 0 });
-    const state = newJob("rounds", room, order, rounds * order.length, null);
     postSystem(
       room.id,
-      `Rounds started: ${order.map((h) => `@${h}`).join(", ")} for up to ${rounds} round(s) (${state.totalTurns} turns). The next speaker is whoever the last reply addressed, else the next in order. Rounds end early once everyone is at STANCE agree with nothing OPEN.`,
+      `Discussion started between ${order.map((h) => `@${h}`).join(", ")} for up to ${turns} turns. The next speaker is whoever the last reply addressed, else the next in order. It ends early once everyone is at STANCE agree with nothing OPEN.`,
     );
-    void runRounds(state);
+    void runDiscussion(state);
   }
 
-  /** Latest stance and open points per participant since the job began. */
-  function consensus(state: JobState): { settled: boolean; missing: string[] } {
-    const missing: string[] = [];
+  /** True when every participant's latest stance since the job began is agree or pass with nothing open. */
+  function consensus(state: JobState): boolean {
     for (const handle of state.participants) {
       const last = store.q.lastMessageBy.get(state.roomId, handle, state.startSeq);
-      if (last === undefined) {
-        missing.push(handle);
-        continue;
-      }
+      if (last === undefined) return false;
       const stance = isStance(last.stance) ? last.stance : null;
-      const open = parseJsonStrings(last.open_points);
-      if (!(stance === "agree" || stance === "pass") || open.length > 0) missing.push(handle);
+      if (!(stance === "agree" || stance === "pass")) return false;
+      if (parseJsonStrings(last.open_points).length > 0) return false;
     }
-    return { settled: missing.length === 0, missing };
+    return true;
   }
 
   async function pauseForUser(state: JobState, handle: string, question: string): Promise<void> {
@@ -1145,23 +1082,18 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function takeTurn(state: JobState, handle: string, instruction: string): Promise<ReplyEvent> {
     state.current = handle;
-    state.inFlight.add(handle);
     publish(state.roomId);
     const reply = waitForReply(state.roomId, handle, state.controller.signal);
     try {
-      await deliver(state.roomId, handle, instruction, { hopsLeft: 0, job: true, triggeredBy: "job" });
+      await deliver(state.roomId, handle, instruction, { turnsLeft: 0, job: true });
     } catch (cause) {
       settlePending(state.roomId, handle, { error: new Error(errorMessage(cause)) });
       throw cause;
     }
-    try {
-      return await reply;
-    } finally {
-      state.inFlight.delete(handle);
-    }
+    return reply;
   }
 
-  async function runRounds(state: JobState): Promise<void> {
+  async function runDiscussion(state: JobState): Promise<void> {
     const { roomId, controller, participants } = state;
     const signal = controller.signal;
     const n = participants.length;
@@ -1172,11 +1104,10 @@ export default async function plugin(bb: BbPluginApi) {
         if (signal.aborted) throw new Error("cancelled");
         const handle = next;
         state.turn++;
-        const round = Math.ceil(state.turn / n);
         const others = participants.filter((h) => h !== handle).map((h) => `@${h}`).join(", ");
         const instruction = [
-          `Turn ${state.turn} of ${state.totalTurns} (round ${round}). It is your turn, @${handle}.`,
-          `Respond to the latest points from ${others} by number where they numbered them. Resolve disagreements with specifics.`,
+          `Turn ${state.turn} of ${state.totalTurns}. It is your turn, @${handle}.`,
+          `Respond to the latest points from ${others}, by number where they numbered them. Resolve disagreements with specifics.`,
           "If you fully agree and have nothing to add, reply briefly with STANCE: agree and OPEN: none. If you have nothing new this turn, use STANCE: pass.",
         ].join(" ");
         const reply = await takeTurn(state, handle, instruction);
@@ -1186,12 +1117,9 @@ export default async function plugin(bb: BbPluginApi) {
           continue;
         }
         const spoken = new Set(store.messages(roomId, state.startSeq).map((m) => m.author));
-        if (participants.every((h) => spoken.has(h))) {
-          const { settled } = consensus(state);
-          if (settled) {
-            outcome = `settled after ${state.turn} turns (round ${round}): everyone is at agree with nothing open.`;
-            break;
-          }
+        if (participants.every((h) => spoken.has(h)) && consensus(state)) {
+          outcome = `settled after ${state.turn} turns: everyone is at agree with nothing open.`;
+          break;
         }
         const addressed = reply.mentions.filter((h) => participants.includes(h) && h !== handle);
         next = addressed[0] ?? participants[(participants.indexOf(handle) + 1) % n];
@@ -1201,86 +1129,23 @@ export default async function plugin(bb: BbPluginApi) {
     } finally {
       jobs.delete(roomId);
       state.current = null;
-      if (store.room(roomId) !== undefined) postSystem(roomId, `Rounds ${outcome}`);
-    }
-  }
-
-  function startAskAll(roomId: string, text: string, participants: string[], synthesizer: string | null, author: string): void {
-    const room = store.room(roomId);
-    if (room === undefined) throw new Error(`room ${roomId} not found`);
-    const targets = requireJobFree(room, participants);
-    if (synthesizer !== null && !store.handles(room.id).includes(synthesizer)) throw new Error(`@${synthesizer} is not in room`);
-    store.appendMessage(room.id, author, text, targets, { hopsLeft: 0 });
-    const state = newJob("askall", room, targets, targets.length + (synthesizer === null ? 0 : 1), synthesizer);
-    postSystem(
-      room.id,
-      `Asking ${targets.map((h) => `@${h}`).join(", ")} independently${synthesizer === null ? "." : `, then @${synthesizer} synthesizes.`}`,
-    );
-    void runAskAll(state);
-  }
-
-  async function runAskAll(state: JobState): Promise<void> {
-    const { roomId, controller, participants, synthesizer } = state;
-    const signal = controller.signal;
-    let outcome = "finished.";
-    try {
-      const instruction = "Answer the question above independently. Do not wait for or defer to the other participants; they are answering in parallel.";
-      const results = await Promise.allSettled(
-        participants.map(async (handle) => {
-          state.inFlight.add(handle);
-          publish(roomId);
-          const reply = waitForReply(roomId, handle, signal);
-          try {
-            await deliver(roomId, handle, instruction, { hopsLeft: 0, job: true, triggeredBy: "job" });
-          } catch (cause) {
-            settlePending(roomId, handle, { error: new Error(errorMessage(cause)) });
-            throw cause;
-          }
-          try {
-            return await reply;
-          } finally {
-            state.inFlight.delete(handle);
-            state.turn++;
-            publish(roomId);
-          }
-        }),
-      );
-      if (signal.aborted) throw new Error("cancelled");
-      const answered = participants.filter((_, i) => results[i].status === "fulfilled");
-      const failed = participants.filter((_, i) => results[i].status === "rejected");
-      if (failed.length > 0) postSystem(roomId, `No answer from ${failed.map((h) => `@${h}`).join(", ")}.`);
-      if (synthesizer !== null && answered.length > 0) {
-        state.turn++;
-        const synthInstruction = [
-          `Synthesize the independent answers from ${answered.map((h) => `@${h}`).join(", ")} above.`,
-          "List the agreements, then each disagreement with who holds which view and why, then one recommendation with its rationale.",
-          "Do not add a new answer of your own beyond the recommendation.",
-        ].join(" ");
-        await takeTurn(state, synthesizer, synthInstruction);
-      }
-      outcome = `finished: ${answered.length} of ${participants.length} answered${synthesizer === null ? "." : `, synthesized by @${synthesizer}.`}`;
-    } catch (cause) {
-      outcome = signal.aborted ? "cancelled by the user." : `stopped: ${errorMessage(cause)}`;
-    } finally {
-      jobs.delete(roomId);
-      state.current = null;
-      if (store.room(roomId) !== undefined) postSystem(roomId, `Ask-all ${outcome}`);
+      if (store.room(roomId) !== undefined) postSystem(roomId, `Discussion ${outcome}`);
     }
   }
 
   async function cancelJob(roomId: string): Promise<void> {
     const state = jobs.get(roomId);
     if (state === undefined) return;
-    const running = [...state.inFlight, ...(state.current === null ? [] : [state.current])];
+    const current = state.current;
     state.controller.abort();
-    for (const handle of uniq(running)) {
+    if (current !== null) {
       // Drop the pending wait first so the stop's idle transition is not
       // mistaken for a reply, then release the participant's runtime.
-      settlePending(roomId, handle, { error: new Error("cancelled") });
-      const participant = store.participant(roomId, handle);
+      settlePending(roomId, current, { error: new Error("cancelled") });
+      const participant = store.participant(roomId, current);
       if (participant?.thread_id) {
         await bb.sdk.threads.stop({ threadId: participant.thread_id }).catch((cause: unknown) => {
-          bb.log.warn(`stop @${handle} failed: ${errorMessage(cause)}`);
+          bb.log.warn(`stop @${current} failed: ${errorMessage(cause)}`);
         });
       }
     }
@@ -1320,7 +1185,7 @@ export default async function plugin(bb: BbPluginApi) {
     const row = store.appendMessage(roomId, participant.handle, text, mentions, {
       stance: parsed.stance,
       openPoints: parsed.openPoints,
-      hopsLeft: expectation.hopsLeft,
+      turnsLeft: expectation.turnsLeft,
       durationMs: Date.now() - expectation.deliveredAt,
     });
     store.q.bumpTurns.run(roomId, participant.handle);
@@ -1328,13 +1193,12 @@ export default async function plugin(bb: BbPluginApi) {
     const reply: ReplyEvent = { text, stance: parsed.stance, openPoints: parsed.openPoints, mentions, seq: row.seq };
     settlePending(roomId, participant.handle, { reply });
 
-    // Hop relay: an addressed participant answers while the budget lasts.
-    // Job-driven turns never relay on their own; the job owns turn order.
-    if (!expectation.job && expectation.hopsLeft > 0 && mentions.length > 0 && !jobs.has(roomId)) {
+    // Relay: an addressed participant answers while turns remain. Discussion
+    // turns never relay on their own; the discussion owns the turn order.
+    if (!expectation.job && expectation.turnsLeft > 0 && mentions.length > 0 && !jobs.has(roomId)) {
       void dispatch(roomId, mentions, addressedInstruction(participant.handle), {
-        hopsLeft: expectation.hopsLeft - 1,
+        turnsLeft: expectation.turnsLeft - 1,
         job: false,
-        triggeredBy: participant.handle,
       });
     }
   });
@@ -1355,9 +1219,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   // -- participants: add, brief, compact, reset, remove --------------------
 
-  const BRIEFING_INSTRUCTION = (handle: string, role: string) =>
+  const BRIEFING_INSTRUCTION = (handle: string) =>
     [
-      `Write a briefing for @${handle}, who is joining this room${role === "none" ? "" : ` as ${role}`}.`,
+      `Write a briefing for @${handle}, who is joining this room.`,
       "Cover, in under 300 words: what the room is deciding, the decisions made so far with who agreed, the open points, and the current state of any pinned document.",
       "Write it so the newcomer needs nothing else. Do not address the other participants.",
     ].join(" ");
@@ -1374,10 +1238,9 @@ export default async function plugin(bb: BbPluginApi) {
     const writer = store.participant(room.id, summarizer);
     if (writer === undefined) throw new Error(`@${summarizer} is not in room`);
     if (writer.thread_id === null) throw new Error(`@${summarizer} has not spoken yet and cannot summarize`);
-    const joiner = store.participant(room.id, handle);
     // The newcomer's last_seen_seq stays at `max`, so the summary that lands
     // after it is the first thing relayed to them.
-    await deliver(room.id, summarizer, BRIEFING_INSTRUCTION(handle, joiner?.role ?? "none"), { hopsLeft: 0, job: false, triggeredBy: "briefing" });
+    await deliver(room.id, summarizer, BRIEFING_INSTRUCTION(handle), { turnsLeft: 0, job: false });
   }
 
   async function addParticipant(roomId: string, input: ParticipantInput, brief: Brief, summarizer: string | null): Promise<void> {
@@ -1388,7 +1251,7 @@ export default async function plugin(bb: BbPluginApi) {
     const providers = await providerDirectory();
     if (!providers.has(input.providerId)) throw new Error(`unknown provider ${input.providerId}`);
     store.insertParticipant(room.id, input, 0);
-    postSystem(room.id, `@${input.handle} joined (${input.providerId}${input.role && input.role !== "none" ? `, ${input.role}` : ""}).`);
+    postSystem(room.id, `@${input.handle} joined (${input.providerId}${input.canEdit ? ", may edit files" : ""}).`);
     await briefNewcomer(room, input.handle, brief, summarizer);
   }
 
@@ -1427,12 +1290,20 @@ export default async function plugin(bb: BbPluginApi) {
     const participant = store.participant(room.id, handle);
     if (participant === undefined) throw new Error(`@${handle} is not in room`);
     const job = jobs.get(room.id);
-    if (job !== undefined && job.participants.includes(handle)) throw new Error("cancel the running job first");
+    if (job !== undefined && job.participants.includes(handle)) throw new Error("cancel the running discussion first");
     settlePending(room.id, handle, { error: new Error("participant removed") });
     if (participant.thread_id !== null) await releaseThread(participant.thread_id, `@${handle}`);
     store.q.removeParticipant.run(Date.now(), room.id, handle);
-    if (room.doc_owner === handle) store.q.updateRoom.run(room.title, room.doc_path, null, room.default_hops, Date.now(), room.id);
+    if (room.doc_owner === handle) store.q.updateRoom.run(room.title, room.doc_path, null, room.default_turns, Date.now(), room.id);
     postSystem(room.id, `@${handle} left the room.`);
+  }
+
+  function setCanEdit(roomId: string, handle: string, canEdit: boolean): void {
+    const room = store.room(roomId);
+    if (room === undefined) throw new Error(`room ${roomId} not found`);
+    if (store.participant(room.id, handle) === undefined) throw new Error(`@${handle} is not in room`);
+    store.q.setCanEdit.run(canEdit ? 1 : 0, room.id, handle);
+    postSystem(room.id, canEdit ? `@${handle} may now edit files.` : `@${handle} is read-only now.`);
   }
 
   // -- read models ----------------------------------------------------------
@@ -1467,8 +1338,7 @@ export default async function plugin(bb: BbPluginApi) {
           providerId: row.provider_id,
           model: row.model,
           reasoningLevel: row.reasoning_level,
-          role: isRole(row.role) ? row.role : "none",
-          roleInstructions: row.role_instructions,
+          canEdit: row.can_edit === 1,
           threadId: row.thread_id,
           lastSeenSeq: row.last_seen_seq,
           status,
@@ -1568,13 +1438,26 @@ export default async function plugin(bb: BbPluginApi) {
     return docRead(room.id);
   }
 
+  function introPreview(roomId: string, handle: string): string {
+    const room = store.room(roomId);
+    if (room === undefined) throw new Error(`room ${roomId} not found`);
+    const participant = store.participant(room.id, handle);
+    if (participant === undefined) throw new Error(`@${handle} is not in room`);
+    const others = store.participants(room.id).filter((other) => other.handle !== handle);
+    return [
+      introFor(room, participant, others),
+      "New messages in the room:\n\n### user (#N)\n<your message>",
+      `${USER_TAG_INSTRUCTION} ${FOOTER_REMINDER}`,
+    ].join("\n\n");
+  }
+
   function roomSummaries(): RoomSummary[] {
     return store.rooms().map((row) => ({
       ...toRoom(row),
       handles: store.handles(row.id),
       messageCount: store.q.messageCount.get(row.id)?.n ?? 0,
       lastAuthor: store.q.lastMessage.get(row.id)?.author ?? null,
-      jobKind: jobs.get(row.id)?.kind ?? null,
+      discussing: jobs.has(row.id),
     }));
   }
 
@@ -1630,7 +1513,7 @@ export default async function plugin(bb: BbPluginApi) {
     participants: ParticipantInput[];
     docPath?: string | null;
     docOwner?: string | null;
-    defaultHops?: number;
+    defaultTurns?: number;
   }
 
   async function createRoom(input: CreateRoomInput): Promise<Room> {
@@ -1653,13 +1536,13 @@ export default async function plugin(bb: BbPluginApi) {
       participants: input.participants,
       docPath,
       docOwner: docPath === null ? null : docOwner,
-      defaultHops: input.defaultHops ?? 0,
+      defaultTurns: input.defaultTurns ?? 4,
     });
     publish(row.id);
     return toRoom(row);
   }
 
-  function updateRoom(input: { roomId: string; title?: string; docPath?: string | null; docOwner?: string | null; defaultHops?: number }): Room {
+  function updateRoom(input: { roomId: string; title?: string; docPath?: string | null; docOwner?: string | null; defaultTurns?: number }): Room {
     const room = store.room(input.roomId);
     if (room === undefined) throw new Error(`room ${input.roomId} not found`);
     const title = input.title ?? room.title;
@@ -1667,8 +1550,8 @@ export default async function plugin(bb: BbPluginApi) {
     let docOwner = input.docOwner === undefined ? room.doc_owner : input.docOwner;
     if (docOwner !== null && !store.handles(room.id).includes(docOwner)) throw new Error(`@${docOwner} is not a participant`);
     if (docPath === null) docOwner = null;
-    const defaultHops = input.defaultHops ?? room.default_hops;
-    store.q.updateRoom.run(title, docPath, docOwner, defaultHops, Date.now(), room.id);
+    const defaultTurns = input.defaultTurns ?? room.default_turns;
+    store.q.updateRoom.run(title, docPath, docOwner, defaultTurns, Date.now(), room.id);
     if (docPath !== room.doc_path || docOwner !== room.doc_owner) {
       postSystem(room.id, docPath === null ? "Pinned document removed." : `Pinned document: ${docPath}${docOwner === null ? "" : `, owned by @${docOwner}`}.`);
     }
@@ -1689,17 +1572,21 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  async function postAndDispatch(roomId: string, author: string, text: string, tags: readonly string[], hops: number): Promise<{ seq: number; dispatched: string[] }> {
+  async function postAndDispatch(roomId: string, author: string, text: string, tags: readonly string[], turns: number): Promise<{ seq: number; dispatched: string[] }> {
     const job = jobs.get(roomId);
     if (job !== undefined && job.paused !== null) {
-      // The user's answer resumes the paused job; the asker gets it in its delta.
-      const posted = postFrom(roomId, author, text, [job.paused.handle], hops);
+      // The user's answer resumes the paused discussion; the asker gets it in its delta.
+      const posted = postFrom(roomId, author, text, [job.paused.handle], turns);
       resumeJob(roomId);
       return { seq: posted.seq, dispatched: [] };
     }
-    const posted = postFrom(roomId, author, text, tags, hops);
-    const instruction = author === "user" ? USER_TAG_INSTRUCTION : addressedInstruction(author);
-    const dispatched = await dispatch(roomId, posted.tags, instruction, { hopsLeft: hops, job: false, triggeredBy: author });
+    const posted = postFrom(roomId, author, text, tags, turns);
+    const instruction = author !== "user"
+      ? addressedInstruction(author)
+      : posted.tags.length > 1
+        ? PARALLEL_INSTRUCTION
+        : USER_TAG_INSTRUCTION;
+    const dispatched = await dispatch(roomId, posted.tags, instruction, { turnsLeft: turns, job: false });
     return { seq: posted.seq, dispatched };
   }
 
@@ -1709,17 +1596,13 @@ export default async function plugin(bb: BbPluginApi) {
     rooms_update: (input) => ({ room: updateRoom(input) }),
     rooms_get: ({ roomId }) => roomDetail(roomId),
     rooms_changes: ({ roomId }) => roomChanges(roomId),
-    rooms_post: async ({ roomId, text, tags, hops }) => {
+    rooms_post: async ({ roomId, text, tags, turns }) => {
       const room = store.room(roomId);
       if (room === undefined) throw new Error(`room ${roomId} not found`);
-      return postAndDispatch(room.id, "user", text, tags, hops ?? room.default_hops);
+      return postAndDispatch(room.id, "user", text, tags, turns ?? room.default_turns);
     },
-    rooms_start_rounds: ({ roomId, text, participants, rounds }) => {
-      startRounds(roomId, text, participants, rounds, "user");
-      return { ok: true as const };
-    },
-    rooms_ask_all: ({ roomId, text, participants, synthesizer }) => {
-      startAskAll(roomId, text, participants, synthesizer ?? null, "user");
+    rooms_discuss: ({ roomId, text, participants, turns }) => {
+      startDiscussion(roomId, text, participants, turns, "user");
       return { ok: true as const };
     },
     rooms_cancel_job: async ({ roomId }) => {
@@ -1727,7 +1610,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: true as const };
     },
     rooms_resume_job: ({ roomId }) => {
-      if (!resumeJob(roomId)) throw new Error("no paused job in this room");
+      if (!resumeJob(roomId)) throw new Error("no paused discussion in this room");
       return { ok: true as const };
     },
     rooms_archive: async ({ roomId }) => {
@@ -1750,8 +1633,13 @@ export default async function plugin(bb: BbPluginApi) {
       await removeParticipant(roomId, handle);
       return { ok: true as const };
     },
+    rooms_participant_update: ({ roomId, handle, canEdit }) => {
+      setCanEdit(roomId, handle, canEdit);
+      return { ok: true as const };
+    },
     rooms_doc_read: ({ roomId }) => docRead(roomId),
     rooms_doc_create: ({ roomId }) => docCreate(roomId),
+    rooms_intro_preview: ({ roomId, handle }) => ({ text: introPreview(roomId, handle) }),
     rooms_for_thread: ({ threadId }) => roomForThread(threadId),
     context_options: () => contextOptions(),
   });
@@ -1762,25 +1650,26 @@ export default async function plugin(bb: BbPluginApi) {
     "Usage:",
     "  bb roundtable list [--json]",
     "  bb roundtable show <room> [--since <seq>] [--json]",
-    "  bb roundtable create --title <title> [--project <id>] [--participants claude=claude-code:planner,codex=codex:reviewer] [--doc <path> --owner <handle>] [--hops N]",
-    "  bb roundtable say <room> [--to a,b] [--hops N] [--as <handle>] <message...>",
-    "  bb roundtable ask <room> --to a,b [--synth <handle>] <message...>",
-    "  bb roundtable rounds <room> --between a,b [--rounds N] <message...>",
-    "  bb roundtable add <room> <handle>=<provider>[:role] [--brief full|summary|none] [--summarizer <handle>]",
+    "  bb roundtable create --title <title> [--project <id>] [--participants claude=claude-code,codex=codex,devin=acp-devin:edit] [--doc <path> --owner <handle>] [--turns N]",
+    "  bb roundtable say <room> [--to a,b] [--turns N] [--as <handle>] <message...>",
+    "  bb roundtable discuss <room> --between a,b [--turns N] <message...>",
+    "  bb roundtable add <room> <handle>=<provider>[=model][:edit] [--brief full|summary|none] [--summarizer <handle>]",
     "  bb roundtable doc <room> --path <path> [--owner <handle>]",
+    "  bb roundtable intro <room> <handle>",
     "  bb roundtable compact|reset|remove <room> <handle>",
     "  bb roundtable resume|cancel|archive <room>",
     "",
     "<room> is a room id or its exact title. Inside a participant thread, `say`",
     "posts as that participant. @handle mentions tag participants even without",
-    "--to. --hops lets the addressed agents relay to each other that many times.",
+    "--to. --turns bounds how long the agents may keep talking among themselves:",
+    "a relay allowance on `say`, the turn cap on `discuss`.",
   ].join("\n");
 
   interface ParsedArgs {
     positional: string[];
     flags: Map<string, string | true>;
   }
-  const VALUE_FLAGS = new Set(["to", "as", "since", "title", "project", "participants", "between", "rounds", "hops", "synth", "brief", "summarizer", "path", "owner", "doc", "role"]);
+  const VALUE_FLAGS = new Set(["to", "as", "since", "title", "project", "participants", "between", "turns", "brief", "summarizer", "path", "owner", "doc"]);
   function parseArgs(argv: readonly string[]): ParsedArgs {
     const positional: string[] = [];
     const flags = new Map<string, string | true>();
@@ -1806,34 +1695,41 @@ export default async function plugin(bb: BbPluginApi) {
     value === undefined ? [] : value.split(",").map((v) => v.trim()).filter((v) => v !== "");
 
   function parseParticipantSpec(entry: string): ParticipantInput | null {
-    // handle=provider[=model][:role]
-    const [head, role] = entry.split(":");
+    // handle=provider[=model][:edit]
+    const [head, flag] = entry.split(":");
     const [handle, providerId, model] = head.split("=");
     if (!handle || !providerId || !HANDLE_RE.test(handle)) return null;
-    if (role !== undefined && !isRole(role)) return null;
-    return { handle, providerId, ...(model ? { model } : {}), ...(role ? { role: role as Role } : {}) };
+    if (flag !== undefined && flag !== "edit") return null;
+    return { handle, providerId, ...(model ? { model } : {}), canEdit: flag === "edit" };
+  }
+
+  function parseTurns(value: string | undefined, fallback: number): number {
+    if (value === undefined) return fallback;
+    const turns = Number(value);
+    if (!Number.isInteger(turns) || turns < 0 || turns > MAX_TURNS) throw new Error(`--turns must be 0..${MAX_TURNS}`);
+    return turns;
   }
 
   const formatRoomLine = (room: RoomSummary): string =>
-    `${room.id}  ${room.title}  [${room.handles.map((h) => `@${h}`).join(" ")}]  ${room.messageCount} msg${room.jobKind ? `  (${room.jobKind} running)` : ""}`;
+    `${room.id}  ${room.title}  [${room.handles.map((h) => `@${h}`).join(" ")}]  ${room.messageCount} msg${room.discussing ? "  (discussing)" : ""}`;
 
   bb.cli.register({
     name: "roundtable",
-    summary: "Group chat rooms shared by several agents: read the room, post, tag participants, ask all, run rounds",
+    summary: "Group chat rooms shared by several agents: read the room, post, tag participants, run a discussion",
     commands: [
       { name: "list", summary: "List rooms", usage: "bb roundtable list [--json]" },
       { name: "show", summary: "Print a room transcript", usage: "bb roundtable show <room> [--since <seq>] [--json]" },
-      { name: "create", summary: "Create a room", usage: "bb roundtable create --title <title> [--project <id>] [--participants claude=claude-code:planner,codex=codex:reviewer] [--doc <path> --owner <handle>] [--hops N]" },
-      { name: "say", summary: "Post to a room and optionally tag participants", usage: "bb roundtable say <room> [--to a,b] [--hops N] [--as <handle>] <message...>" },
-      { name: "ask", summary: "Ask several participants in parallel, optionally synthesize", usage: "bb roundtable ask <room> --to a,b [--synth <handle>] <message...>" },
-      { name: "rounds", summary: "Run bounded back-and-forth rounds", usage: "bb roundtable rounds <room> --between a,b [--rounds N] <message...>" },
-      { name: "add", summary: "Add a participant with a briefing", usage: "bb roundtable add <room> <handle>=<provider>[:role] [--brief full|summary|none] [--summarizer <handle>]" },
+      { name: "create", summary: "Create a room", usage: "bb roundtable create --title <title> [--project <id>] [--participants claude=claude-code,codex=codex,devin=acp-devin:edit] [--doc <path> --owner <handle>] [--turns N]" },
+      { name: "say", summary: "Post to a room and optionally tag participants", usage: "bb roundtable say <room> [--to a,b] [--turns N] [--as <handle>] <message...>" },
+      { name: "discuss", summary: "Scheduled back-and-forth between participants until they agree or the cap", usage: "bb roundtable discuss <room> --between a,b [--turns N] <message...>" },
+      { name: "add", summary: "Add a participant with a briefing", usage: "bb roundtable add <room> <handle>=<provider>[=model][:edit] [--brief full|summary|none] [--summarizer <handle>]" },
       { name: "doc", summary: "Pin the room's working document", usage: "bb roundtable doc <room> --path <path> [--owner <handle>]" },
+      { name: "intro", summary: "Print exactly what a participant is told on first contact", usage: "bb roundtable intro <room> <handle>" },
       { name: "compact", summary: "Compact a participant's context", usage: "bb roundtable compact <room> <handle>" },
       { name: "reset", summary: "Give a participant a fresh thread", usage: "bb roundtable reset <room> <handle> [--brief full|summary|none] [--summarizer <handle>]" },
       { name: "remove", summary: "Remove a participant", usage: "bb roundtable remove <room> <handle>" },
-      { name: "resume", summary: "Resume a job paused on need-info", usage: "bb roundtable resume <room>" },
-      { name: "cancel", summary: "Cancel the running job", usage: "bb roundtable cancel <room>" },
+      { name: "resume", summary: "Resume a discussion paused on need-info", usage: "bb roundtable resume <room>" },
+      { name: "cancel", summary: "Cancel the running discussion", usage: "bb roundtable cancel <room>" },
       { name: "archive", summary: "Archive a room and stop its participant threads", usage: "bb roundtable archive <room>" },
     ],
     async run(argv, ctx) {
@@ -1873,12 +1769,12 @@ export default async function plugin(bb: BbPluginApi) {
             const messages = detail.messages.filter((m) => m.seq > (Number.isFinite(since) ? since : 0));
             const roster = detail.participants
               .filter((p) => !p.removed)
-              .map((p) => `@${p.handle}=${p.providerId}${p.role !== "none" ? `/${p.role}` : ""}${p.status ? `:${p.status}` : ""}`)
+              .map((p) => `@${p.handle}=${p.providerId}${p.canEdit ? "/edit" : ""}${p.status ? `:${p.status}` : ""}`)
               .join(", ");
             const header = [
               `${room.title} (${room.id}) — ${roster}`,
               room.doc_path ? `Pinned document: ${room.doc_path}${room.doc_owner ? ` (owner @${room.doc_owner})` : ""}` : null,
-              detail.job ? `Job: ${detail.job.kind} turn ${detail.job.turn}/${detail.job.totalTurns}${detail.job.paused ? ` paused on @${detail.job.paused.handle}` : ""}` : null,
+              detail.job ? `Discussion: turn ${detail.job.turn}/${detail.job.totalTurns}${detail.job.paused ? ` paused on @${detail.job.paused.handle}` : ""}` : null,
             ].filter((line): line is string => line !== null).join("\n");
             const body = messages.length === 0
               ? "(no messages)"
@@ -1898,17 +1794,16 @@ export default async function plugin(bb: BbPluginApi) {
             const participants: ParticipantInput[] = [];
             for (const entry of splitList(spec)) {
               const parsed = parseParticipantSpec(entry);
-              if (parsed === null) return fail(`bad participant "${entry}"; use handle=provider[=model][:role]`);
+              if (parsed === null) return fail(`bad participant "${entry}"; use handle=provider[=model][:edit]`);
               participants.push(parsed);
             }
-            const hops = flagString(flags, "hops");
             const room = await createRoom({
               title,
               projectId,
               participants,
               docPath: flagString(flags, "doc") ?? null,
               docOwner: flagString(flags, "owner") ?? null,
-              defaultHops: hops === undefined ? 0 : Number(hops),
+              defaultTurns: parseTurns(flagString(flags, "turns"), 4),
             });
             return ok(room, `Created room ${room.id} "${room.title}" with ${participants.map((p) => `@${p.handle}`).join(", ")}`);
           }
@@ -1918,43 +1813,32 @@ export default async function plugin(bb: BbPluginApi) {
             const text = rest.slice(1).join(" ").trim();
             if (text === "") return fail("say needs a message");
             const author = speakerFor(room);
-            const hopsFlag = flagString(flags, "hops");
-            let hops = hopsFlag === undefined ? room.default_hops : Number(hopsFlag);
-            if (author !== "user" && hopsFlag === undefined) {
-              // An agent relaying mid-turn inherits what is left of its own budget.
-              hops = Math.max(0, (awaiting.get(pendingKey(room.id, author))?.hopsLeft ?? 0) - 1);
+            const turnsFlag = flagString(flags, "turns");
+            let turns = parseTurns(turnsFlag, room.default_turns);
+            if (author !== "user" && turnsFlag === undefined) {
+              // An agent relaying mid-turn inherits what is left of its own allowance.
+              turns = Math.max(0, (awaiting.get(pendingKey(room.id, author))?.turnsLeft ?? 0) - 1);
             }
-            if (!Number.isInteger(hops) || hops < 0 || hops > 8) return fail("--hops must be 0..8");
-            const result = await postAndDispatch(room.id, author, text, splitList(flagString(flags, "to")), hops);
+            const result = await postAndDispatch(room.id, author, text, splitList(flagString(flags, "to")), turns);
             return ok({ ...result, author }, `Posted #${result.seq} as ${authorLabel(author)}${result.dispatched.length ? `; tagged ${result.dispatched.map((h) => `@${h}`).join(", ")}` : ""}`);
           }
-          case "ask": {
-            const room = resolveRoom(rest[0]);
-            if (room === undefined) return fail(`Unknown room "${rest[0] ?? ""}".`);
-            const targets = splitList(flagString(flags, "to"));
-            const text = rest.slice(1).join(" ").trim();
-            if (targets.length === 0) return fail("ask needs --to a,b");
-            if (text === "") return fail("ask needs a question");
-            startAskAll(room.id, text, targets, flagString(flags, "synth") ?? null, speakerFor(room));
-            return ok({ ok: true }, `Asking ${targets.map((h) => `@${h}`).join(", ")}`);
-          }
-          case "rounds": {
+          case "discuss": {
             const room = resolveRoom(rest[0]);
             if (room === undefined) return fail(`Unknown room "${rest[0] ?? ""}".`);
             const between = splitList(flagString(flags, "between"));
-            const total = Number(flagString(flags, "rounds") ?? "3");
+            const turns = parseTurns(flagString(flags, "turns"), Math.max(2, room.default_turns));
             const text = rest.slice(1).join(" ").trim();
-            if (between.length < 2) return fail("rounds needs --between a,b");
-            if (!Number.isInteger(total) || total < 1 || total > 20) return fail("--rounds must be 1..20");
-            if (text === "") return fail("rounds needs a kickoff message");
-            startRounds(room.id, text, between, total, speakerFor(room));
-            return ok({ ok: true }, `Started ${total} round(s) between ${between.map((h) => `@${h}`).join(", ")}`);
+            if (between.length < 2) return fail("discuss needs --between a,b");
+            if (turns < 2) return fail("--turns must be at least 2 for a discussion");
+            if (text === "") return fail("discuss needs a kickoff message");
+            startDiscussion(room.id, text, between, turns, speakerFor(room));
+            return ok({ ok: true }, `Started a discussion between ${between.map((h) => `@${h}`).join(", ")} for up to ${turns} turns`);
           }
           case "add": {
             const room = resolveRoom(rest[0]);
             if (room === undefined) return fail(`Unknown room "${rest[0] ?? ""}".`);
             const parsed = rest[1] === undefined ? null : parseParticipantSpec(rest[1]);
-            if (parsed === null) return fail("add needs <handle>=<provider>[:role]");
+            if (parsed === null) return fail("add needs <handle>=<provider>[=model][:edit]");
             const brief = briefFor();
             let summarizer = flagString(flags, "summarizer") ?? null;
             if (brief === "summary" && summarizer === null) {
@@ -1971,6 +1855,13 @@ export default async function plugin(bb: BbPluginApi) {
             if (path === undefined) return fail("doc needs --path <path>");
             const updated = updateRoom({ roomId: room.id, docPath: path, docOwner: flagString(flags, "owner") ?? null });
             return ok(updated, `Pinned ${updated.docPath}${updated.docOwner ? ` (owner @${updated.docOwner})` : ""}.`);
+          }
+          case "intro": {
+            const room = resolveRoom(rest[0]);
+            if (room === undefined) return fail(`Unknown room "${rest[0] ?? ""}".`);
+            if (rest[1] === undefined) return fail("intro needs <handle>");
+            const text = introPreview(room.id, rest[1]);
+            return ok({ text }, text);
           }
           case "compact":
           case "reset":
@@ -1995,7 +1886,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "resume": {
             const room = resolveRoom(rest[0]);
             if (room === undefined) return fail(`Unknown room "${rest[0] ?? ""}".`);
-            return resumeJob(room.id) ? ok({ ok: true }, "Resumed.") : fail("no paused job in this room");
+            return resumeJob(room.id) ? ok({ ok: true }, "Resumed.") : fail("no paused discussion in this room");
           }
           case "cancel": {
             const room = resolveRoom(rest[0]);
