@@ -36,6 +36,10 @@ export const ghPrSchema = z.object({
   updatedAt: z.string(),
   checks: z.array(z.object({ name: z.string(), status: z.string(), conclusion: z.string().nullable(), url: z.string().nullable() })),
   labels: z.array(z.string()),
+  reviewers: z.array(z.object({ login: z.string(), state: z.string() })),
+  assignees: z.array(z.string()),
+  commits: z.array(z.object({ sha: z.string(), title: z.string(), author: z.string(), date: z.string() })),
+  createdAt: z.string(),
 });
 export type GhPr = z.infer<typeof ghPrSchema>;
 

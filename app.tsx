@@ -1,15 +1,18 @@
 // bb-plugin-review-desk — frontend entry.
 //
-// The Reviews nav panel: a review list, the PR header, a file rail with a
-// codemap view, and the diff column rendered with Pierre diffs so lines can be
-// selected and annotated inline with GitHub threads, pending comments and AI
-// notes. Fixed side tabs: Conversation (PR body, checks, threads, submit),
-// AI notes (passes and findings), Codemap (reading order, hotspots).
+// A PR review page in the shape of a document: state, title, author and
+// branches, then Description / Discussion / Commits tabs, then Changes as
+// file cards rendered with Pierre diffs (line selection, inline GitHub
+// threads, pending comments). The side panel holds Info (checks, reviewers,
+// labels, submit review), Chat (bb's own ThreadChat on an analyst thread that
+// lives in the PR worktree), and Codemap.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
+import { toast } from "sonner";
 import {
   definePluginApp,
   Markdown,
+  ThreadChat,
   UrlLink,
   useBbNavigate,
   useRealtime,
@@ -23,7 +26,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { FileDiff, type DiffLineAnnotation, type FileDiffMetadata, type SelectedLineRange } from "@pierre/diffs/react";
 import { parsePatchFiles } from "@pierre/diffs";
-import type { AiKind, AiRequest, CodemapState, FileEntry, Note, PendingComment, ProviderOption, Review, ReviewSummary, Severity, Side, rpcContract } from "./server";
+import type { CodemapState, FileEntry, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, rpcContract } from "./server";
 import type { Codemap, GhThread } from "./host-contract";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
@@ -35,6 +38,8 @@ type Contract = typeof rpcContract;
 const PANEL_ID = "reviews";
 const PANEL_PATH = "reviews";
 const REVIEW_CHANGED = "review-changed";
+const PROVIDER_KEY = "review-desk:provider";
+const selectionKey = (reviewId: string) => `review-desk:selection:${reviewId}`;
 
 interface ReviewTarget {
   reviewId: string;
@@ -43,11 +48,10 @@ interface ReviewTarget {
 function isReviewTarget(value: JsonValue): value is ReviewTarget {
   return typeof value === "object" && value !== null && !Array.isArray(value) && typeof (value as Record<string, unknown>).reviewId === "string";
 }
-const CONVERSATION_TAB: ExperimentalPluginFixedTabReference<ReviewTarget> = { panelId: PANEL_ID, id: "conversation", experimental_target: { validate: isReviewTarget } };
-const NOTES_TAB: ExperimentalPluginFixedTabReference<ReviewTarget> = { panelId: PANEL_ID, id: "ai-notes", experimental_target: { validate: isReviewTarget } };
+const INFO_TAB: ExperimentalPluginFixedTabReference<ReviewTarget> = { panelId: PANEL_ID, id: "info", experimental_target: { validate: isReviewTarget } };
+const CHAT_TAB: ExperimentalPluginFixedTabReference<ReviewTarget> = { panelId: PANEL_ID, id: "chat", experimental_target: { validate: isReviewTarget } };
 const CODEMAP_TAB: ExperimentalPluginFixedTabReference<ReviewTarget> = { panelId: PANEL_ID, id: "codemap", experimental_target: { validate: isReviewTarget } };
 
-// Shiki bundled theme names Pierre can resolve. Anything else falls back.
 const SHIKI_THEMES = new Set([
   "andromeeda", "aurora-x", "ayu-dark", "catppuccin-frappe", "catppuccin-latte", "catppuccin-macchiato", "catppuccin-mocha", "dark-plus", "dracula", "dracula-soft",
   "everforest-dark", "everforest-light", "github-dark", "github-dark-default", "github-dark-dimmed", "github-dark-high-contrast", "github-light", "github-light-default",
@@ -58,7 +62,7 @@ const SHIKI_THEMES = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// Data hooks
+// Shared helpers
 // ---------------------------------------------------------------------------
 
 function describeError(cause: unknown): string {
@@ -71,14 +75,63 @@ function payloadReview(payload: unknown): { reviewId: string; what: string } | n
   return typeof p.reviewId === "string" ? { reviewId: p.reviewId, what: typeof p.what === "string" ? p.what : "" } : null;
 }
 
+function readStorage<T>(key: string): T | null {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw === null ? null : (JSON.parse(raw) as T);
+  } catch {
+    return null;
+  }
+}
+function writeStorage(key: string, value: unknown): void {
+  try {
+    if (value === null) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // storage unavailable; the feature degrades to per-surface defaults
+  }
+}
+
+function timeAgo(iso: string | number): string {
+  const ms = typeof iso === "number" ? iso : Date.parse(iso);
+  if (!Number.isFinite(ms)) return "";
+  const diff = Math.max(0, Date.now() - ms);
+  const m = Math.round(diff / 60_000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m} minute${m === 1 ? "" : "s"} ago`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h} hour${h === 1 ? "" : "s"} ago`;
+  const d = Math.round(h / 24);
+  return `${d} day${d === 1 ? "" : "s"} ago`;
+}
+
+function shortSha(sha: string): string {
+  return sha.slice(0, 7);
+}
+
+function fileAnchorId(path: string): string {
+  return `rd-file-${path.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+}
+function scrollToFile(path: string): void {
+  document.getElementById(fileAnchorId(path))?.scrollIntoView({ block: "start", behavior: "smooth" });
+}
+
+function splitPath(path: string): { name: string; dir: string } {
+  const idx = path.lastIndexOf("/");
+  return idx === -1 ? { name: path, dir: "" } : { name: path.slice(idx + 1), dir: path.slice(0, idx) };
+}
+
 interface ReviewDetail {
   review: Review;
   files: FileEntry[];
   pending: PendingComment[];
-  notes: Note[];
-  requests: AiRequest[];
   threads: GhThread[];
+  seats: Seat[];
 }
+
+// ---------------------------------------------------------------------------
+// Data hooks
+// ---------------------------------------------------------------------------
 
 function useReviews() {
   const rpc = useRpc<Contract>();
@@ -121,12 +174,6 @@ function useReview(reviewId: string | null) {
     const p = payloadReview(payload);
     if (p === null || p.reviewId === reviewId) refetch();
   });
-  const running = detail?.requests.some((r) => r.status === "running") ?? false;
-  useEffect(() => {
-    if (!running) return;
-    const timer = setInterval(refetch, 5000);
-    return () => clearInterval(timer);
-  }, [running, refetch]);
   return { rpc, detail, error, refetch };
 }
 
@@ -165,10 +212,32 @@ function useCodemap(reviewId: string | null, enabled: boolean) {
 function useProviders() {
   const rpc = useRpc<Contract>();
   const [providers, setProviders] = useState<ProviderOption[]>([]);
+  const [defaultProvider, setDefaultProvider] = useState<string>("");
   useEffect(() => {
-    rpc.call("context_providers").then((r) => setProviders(r.providers.filter((p) => p.available)), () => setProviders([]));
+    rpc.call("context_providers").then(
+      (r) => {
+        setProviders(r.providers.filter((p) => p.available));
+        setDefaultProvider(r.defaultProvider);
+      },
+      () => setProviders([]),
+    );
   }, [rpc]);
-  return providers;
+  return { providers, defaultProvider };
+}
+
+/** The provider used for "Ask" from the diff and preselected in Chat; shared through storage. */
+function useChatProvider(providers: ProviderOption[], fallback: string): [string, (id: string) => void] {
+  const [providerId, setProviderId] = useState<string>(() => readStorage<string>(PROVIDER_KEY) ?? "");
+  useEffect(() => {
+    if (providerId !== "" && providers.some((p) => p.id === providerId)) return;
+    const next = providers.find((p) => p.id === fallback)?.id ?? providers[0]?.id ?? "";
+    if (next !== "") setProviderId(next);
+  }, [providers, fallback, providerId]);
+  const set = (id: string) => {
+    setProviderId(id);
+    writeStorage(PROVIDER_KEY, id);
+  };
+  return [providerId, set];
 }
 
 // ---------------------------------------------------------------------------
@@ -179,86 +248,66 @@ function EmptyState({ children }: { children: ReactNode }) {
   return <div role="status" className="rounded-lg border border-dashed border-border px-4 py-6 text-center text-sm text-muted-foreground">{children}</div>;
 }
 
-const SEVERITY_STYLE: Record<Severity, string> = {
-  blocker: "border-destructive text-destructive",
-  major: "border-destructive/60 text-destructive",
-  minor: "border-foreground/40 text-foreground",
-  nit: "border-border text-muted-foreground",
-  info: "border-border text-muted-foreground",
-};
-
-function SeverityBadge({ severity }: { severity: Severity }) {
-  return <span className={cn("rounded-full border px-1.5 py-0 text-[10px] font-medium uppercase", SEVERITY_STYLE[severity])}>{severity}</span>;
+function StatePill({ state, isDraft }: { state: string; isDraft: boolean }) {
+  const label = isDraft ? "Draft" : state === "OPEN" ? "Open" : state === "MERGED" ? "Merged" : state === "CLOSED" ? "Closed" : state.toLowerCase();
+  const tone = isDraft ? "border-border text-muted-foreground" : state === "OPEN" ? "border-primary/40 bg-primary/10 text-primary" : state === "MERGED" ? "border-foreground/30 bg-foreground/10 text-foreground" : "border-destructive/40 bg-destructive/10 text-destructive";
+  return <span className={cn("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium", tone)}><Icon name="GitPullRequest" className="size-3" />{label}</span>;
 }
 
-function timeAgo(iso: string | number): string {
-  const ms = typeof iso === "number" ? iso : Date.parse(iso);
-  const diff = Math.max(0, Date.now() - ms);
-  const m = Math.round(diff / 60_000);
-  if (m < 1) return "just now";
-  if (m < 60) return `${m}m ago`;
-  const h = Math.round(m / 60);
-  if (h < 48) return `${h}h ago`;
-  return `${Math.round(h / 24)}d ago`;
-}
-
-function shortSha(sha: string): string {
-  return sha.slice(0, 8);
-}
-
-function fileAnchorId(path: string): string {
-  return `rd-file-${path.replace(/[^A-Za-z0-9_-]/g, "_")}`;
-}
-
-function scrollToFile(path: string): void {
-  document.getElementById(fileAnchorId(path))?.scrollIntoView({ block: "start", behavior: "smooth" });
-}
-
-const KIND_LABELS: Record<AiKind, string> = {
-  explain: "Explain",
-  why: "Why changed",
-  risks: "Risks",
-  fix: "Suggest fix",
-  ask: "Ask",
-  pass_summary: "Summary",
-  pass_risk: "Risk review",
-  pass_perf: "Perf review",
-  pass_slop: "Slop review",
-  pass_tests: "Test gaps",
-  file_summary: "File summary",
-};
-
-function ProviderSelect({ providers, value, onChange, className }: { providers: ProviderOption[]; value: string; onChange: (id: string) => void; className?: string }) {
+function Progress({ value, total, className }: { value: number; total: number; className?: string }) {
+  const pct = total === 0 ? 0 : Math.round((value / total) * 100);
   return (
-    <select value={value} onChange={(e) => onChange(e.target.value)} className={cn("h-7 rounded-md border border-input bg-background px-1.5 text-xs", className)} aria-label="AI provider" title="Which agent answers">
-      {providers.map((p) => (
-        <option key={p.id} value={p.id}>{p.displayName}</option>
-      ))}
-    </select>
+    <div className={cn("h-1 w-full overflow-hidden rounded-full bg-border", className)} role="progressbar" aria-valuenow={value} aria-valuemin={0} aria-valuemax={total}>
+      <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
+    </div>
   );
 }
 
+function reviewStateTone(state: string): string {
+  switch (state) {
+    case "APPROVED": return "text-primary";
+    case "CHANGES_REQUESTED": return "text-destructive";
+    default: return "text-muted-foreground";
+  }
+}
+function reviewStateIcon(state: string): "Check" | "CircleX" | "MessageSquare" | "Clock" {
+  switch (state) {
+    case "APPROVED": return "Check";
+    case "CHANGES_REQUESTED": return "CircleX";
+    case "REQUESTED": case "PENDING": return "Clock";
+    default: return "MessageSquare";
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Annotations rendered inside the diff
+// Annotations inside the diff
 // ---------------------------------------------------------------------------
 
 type Anno =
   | { kind: "thread"; thread: GhThread }
   | { kind: "pending"; pending: PendingComment }
-  | { kind: "note"; note: Note }
-  | { kind: "composer"; path: string; line: number; startLine: number | null; side: "LEFT" | "RIGHT"; initial: string; noteId: string | null };
+  | { kind: "composer"; path: string; line: number; startLine: number | null; side: "LEFT" | "RIGHT"; initial: string };
 
 interface AnnoActions {
-  reviewId: string;
   reply(commentId: number, body: string): Promise<void>;
   resolve(threadId: string, resolve: boolean): Promise<void>;
-  savePending(input: { path: string; line: number; startLine: number | null; side: "LEFT" | "RIGHT"; body: string; noteId: string | null }): Promise<void>;
+  savePending(input: { path: string; line: number; startLine: number | null; side: "LEFT" | "RIGHT"; body: string }): Promise<void>;
   updatePending(id: string, body: string): Promise<void>;
   deletePending(id: string): Promise<void>;
-  dismissNote(id: string): Promise<void>;
-  noteToComment(note: Note): void;
-  sendToRoom(text: string): void;
   closeComposer(): void;
+}
+
+function TextArea({ value, onChange, rows, placeholder, autoFocus }: { value: string; onChange: (v: string) => void; rows: number; placeholder?: string; autoFocus?: boolean }) {
+  return (
+    <textarea
+      autoFocus={autoFocus}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      rows={rows}
+      placeholder={placeholder}
+      className="w-full resize-none rounded-md border border-input bg-transparent px-2.5 py-1.5 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+    />
+  );
 }
 
 function ThreadCard({ thread, actions }: { thread: GhThread; actions: AnnoActions }) {
@@ -266,11 +315,11 @@ function ThreadCard({ thread, actions }: { thread: GhThread; actions: AnnoAction
   const [busy, setBusy] = useState(false);
   const first = thread.comments[0];
   return (
-    <div className={cn("my-1 rounded-md border bg-card text-xs", thread.isResolved ? "border-border/60 opacity-70" : "border-border")}>
-      <div className="flex flex-wrap items-center gap-2 border-b border-border/60 px-2.5 py-1.5">
+    <div className={cn("my-1.5 rounded-lg border bg-card text-xs shadow-sm", thread.isResolved ? "border-border/60 opacity-70" : "border-border")}>
+      <div className="flex flex-wrap items-center gap-2 border-b border-border/60 px-3 py-1.5">
         <Icon name="Github" className="size-3.5 text-muted-foreground" />
         <span className="font-medium">{first?.author ?? "thread"}</span>
-        <span className="text-muted-foreground">{thread.comments.length} comment{thread.comments.length === 1 ? "" : "s"}</span>
+        {thread.comments.length > 1 ? <span className="text-muted-foreground">+{thread.comments.length - 1}</span> : null}
         {thread.isResolved ? <span className="rounded-full border border-border px-1.5 text-[10px]">resolved</span> : null}
         {thread.isOutdated ? <span className="rounded-full border border-border px-1.5 text-[10px]">outdated</span> : null}
         <span className="ml-auto flex items-center gap-1">
@@ -283,29 +332,15 @@ function ThreadCard({ thread, actions }: { thread: GhThread; actions: AnnoAction
       </div>
       <div className="divide-y divide-border/60">
         {thread.comments.map((c) => (
-          <div key={c.id} className="px-2.5 py-2">
+          <div key={c.id} className="px-3 py-2">
             <div className="mb-1 text-muted-foreground"><span className="font-medium text-foreground">{c.author}</span> · {timeAgo(c.createdAt)}</div>
             <div className="text-sm"><Markdown content={c.body} /></div>
           </div>
         ))}
       </div>
       {reply !== null ? (
-        <form
-          className="flex flex-col gap-1.5 border-t border-border/60 px-2.5 py-2"
-          onSubmit={async (e: FormEvent) => {
-            e.preventDefault();
-            const target = first?.databaseId;
-            if (!target || reply.trim() === "") return;
-            setBusy(true);
-            try {
-              await actions.reply(target, reply.trim());
-              setReply(null);
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          <textarea value={reply} onChange={(e) => setReply(e.target.value)} rows={3} className="w-full resize-none rounded-md border border-input bg-transparent px-2 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" placeholder="Reply on GitHub…" />
+        <form className="flex flex-col gap-1.5 border-t border-border/60 px-3 py-2" onSubmit={async (e: FormEvent) => { e.preventDefault(); const target = first?.databaseId; if (!target || reply.trim() === "") return; setBusy(true); try { await actions.reply(target, reply.trim()); setReply(null); } finally { setBusy(false); } }}>
+          <TextArea value={reply} onChange={setReply} rows={3} placeholder="Reply on GitHub…" autoFocus />
           <div className="flex justify-end gap-1.5">
             <Button type="button" variant="ghost" size="sm" className="h-7" onClick={() => setReply(null)}>Cancel</Button>
             <Button type="submit" size="sm" className="h-7" disabled={busy || reply.trim() === ""}>Reply</Button>
@@ -319,21 +354,21 @@ function ThreadCard({ thread, actions }: { thread: GhThread; actions: AnnoAction
 function PendingCard({ pending, actions }: { pending: PendingComment; actions: AnnoActions }) {
   const [editing, setEditing] = useState<string | null>(null);
   return (
-    <div className="my-1 rounded-md border border-dashed border-foreground/40 bg-card text-xs">
-      <div className="flex items-center gap-2 border-b border-border/60 px-2.5 py-1.5">
+    <div className="my-1.5 rounded-lg border border-dashed border-foreground/40 bg-card text-xs shadow-sm">
+      <div className="flex items-center gap-2 border-b border-border/60 px-3 py-1.5">
         <Icon name="Edit" className="size-3.5 text-muted-foreground" />
         <span className="font-medium">Pending comment</span>
-        <span className="text-muted-foreground">not on GitHub yet</span>
+        <span className="text-muted-foreground">posts with your review</span>
         <span className="ml-auto flex gap-1">
           <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => setEditing((e) => (e === null ? pending.body : null))}>Edit</Button>
           <Button variant="ghost" size="sm" className="h-6 px-2 text-xs text-destructive" onClick={() => void actions.deletePending(pending.id)}>Delete</Button>
         </span>
       </div>
       {editing === null ? (
-        <div className="px-2.5 py-2 text-sm"><Markdown content={pending.body} /></div>
+        <div className="px-3 py-2 text-sm"><Markdown content={pending.body} /></div>
       ) : (
-        <form className="flex flex-col gap-1.5 px-2.5 py-2" onSubmit={async (e: FormEvent) => { e.preventDefault(); if (editing.trim() === "") return; await actions.updatePending(pending.id, editing.trim()); setEditing(null); }}>
-          <textarea value={editing} onChange={(e) => setEditing(e.target.value)} rows={4} className="w-full resize-none rounded-md border border-input bg-transparent px-2 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+        <form className="flex flex-col gap-1.5 px-3 py-2" onSubmit={async (e: FormEvent) => { e.preventDefault(); if (editing.trim() === "") return; await actions.updatePending(pending.id, editing.trim()); setEditing(null); }}>
+          <TextArea value={editing} onChange={setEditing} rows={4} autoFocus />
           <div className="flex justify-end gap-1.5">
             <Button type="button" variant="ghost" size="sm" className="h-7" onClick={() => setEditing(null)}>Cancel</Button>
             <Button type="submit" size="sm" className="h-7">Save</Button>
@@ -344,50 +379,15 @@ function PendingCard({ pending, actions }: { pending: PendingComment; actions: A
   );
 }
 
-function NoteCard({ note, actions, compact }: { note: Note; actions: AnnoActions; compact?: boolean }) {
-  return (
-    <div className={cn("my-1 rounded-md border bg-card text-xs", note.status === "posted" ? "border-border/60 opacity-70" : "border-primary/40")}>
-      <div className="flex flex-wrap items-center gap-2 border-b border-border/60 px-2.5 py-1.5">
-        <Icon name="Brain" className="size-3.5 text-primary" />
-        <span className="font-medium">{note.title}</span>
-        {note.severity ? <SeverityBadge severity={note.severity} /> : null}
-        <span className="text-muted-foreground">{note.providerId}{note.status === "posted" ? " · posted" : ""}</span>
-        {compact && note.path ? <span className="font-mono text-muted-foreground">{note.path}{note.startLine ? `:${note.startLine}` : ""}</span> : null}
-        <span className="ml-auto flex gap-1">
-          {note.status === "draft" && note.path && note.startLine ? (
-            <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => actions.noteToComment(note)} title="Turn into a pending GitHub comment">Add as comment</Button>
-          ) : null}
-          <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => actions.sendToRoom(`${note.title}${note.path ? ` (${note.path}${note.startLine ? `:${note.startLine}` : ""})` : ""}\n\n${note.body}`)} title="Send to a Roundtable room">To room</Button>
-          {note.status !== "dismissed" ? <Button variant="ghost" size="sm" className="h-6 px-2 text-xs text-muted-foreground" onClick={() => void actions.dismissNote(note.id)}>Dismiss</Button> : null}
-        </span>
-      </div>
-      <div className="px-2.5 py-2 text-sm"><Markdown content={note.body} /></div>
-    </div>
-  );
-}
-
 function ComposerCard({ anno, actions }: { anno: Extract<Anno, { kind: "composer" }>; actions: AnnoActions }) {
   const [body, setBody] = useState(anno.initial);
   const [busy, setBusy] = useState(false);
   return (
-    <form
-      className="my-1 flex flex-col gap-1.5 rounded-md border border-foreground/50 bg-card px-2.5 py-2 text-xs"
-      onSubmit={async (e: FormEvent) => {
-        e.preventDefault();
-        if (body.trim() === "") return;
-        setBusy(true);
-        try {
-          await actions.savePending({ path: anno.path, line: anno.line, startLine: anno.startLine, side: anno.side, body: body.trim(), noteId: anno.noteId });
-          actions.closeComposer();
-        } finally {
-          setBusy(false);
-        }
-      }}
-    >
+    <form className="my-1.5 flex flex-col gap-1.5 rounded-lg border border-foreground/50 bg-card px-3 py-2 text-xs shadow-sm" onSubmit={async (e: FormEvent) => { e.preventDefault(); if (body.trim() === "") return; setBusy(true); try { await actions.savePending({ path: anno.path, line: anno.line, startLine: anno.startLine, side: anno.side, body: body.trim() }); actions.closeComposer(); } finally { setBusy(false); } }}>
       <div className="text-muted-foreground">
-        Comment on {anno.path}:{anno.startLine !== null && anno.startLine !== anno.line ? `${anno.startLine}-` : ""}{anno.line} ({anno.side === "LEFT" ? "old" : "new"} side). Saved as pending until you submit the review.
+        Comment on line{anno.startLine !== null && anno.startLine !== anno.line ? `s ${anno.startLine}–${anno.line}` : ` ${anno.line}`} ({anno.side === "LEFT" ? "base" : "head"}). Stays pending until you submit the review.
       </div>
-      <textarea autoFocus value={body} onChange={(e) => setBody(e.target.value)} rows={4} className="w-full resize-none rounded-md border border-input bg-transparent px-2 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" placeholder="Write the comment (Markdown)…" />
+      <TextArea value={body} onChange={setBody} rows={4} placeholder="Write the comment (Markdown)…" autoFocus />
       <div className="flex justify-end gap-1.5">
         <Button type="button" variant="ghost" size="sm" className="h-7" onClick={actions.closeComposer}>Cancel</Button>
         <Button type="submit" size="sm" className="h-7" disabled={busy || body.trim() === ""}>Add pending comment</Button>
@@ -400,13 +400,12 @@ function Annotation({ anno, actions }: { anno: Anno; actions: AnnoActions }) {
   switch (anno.kind) {
     case "thread": return <ThreadCard thread={anno.thread} actions={actions} />;
     case "pending": return <PendingCard pending={anno.pending} actions={actions} />;
-    case "note": return <NoteCard note={anno.note} actions={actions} />;
     case "composer": return <ComposerCard anno={anno} actions={actions} />;
   }
 }
 
 // ---------------------------------------------------------------------------
-// File card with the Pierre diff
+// File card
 // ---------------------------------------------------------------------------
 
 interface Selection {
@@ -414,11 +413,19 @@ interface Selection {
   range: SelectedLineRange;
 }
 
+function toSelectionRef(selection: Selection): SelectionRef {
+  return {
+    path: selection.path,
+    startLine: Math.min(selection.range.start, selection.range.end),
+    endLine: Math.max(selection.range.start, selection.range.end),
+    side: (selection.range.side ?? "additions") === "deletions" ? "old" : "new",
+  };
+}
+
 interface FileCardProps {
   review: Review;
   file: FileEntry;
   threads: GhThread[];
-  notes: Note[];
   pending: PendingComment[];
   composer: Extract<Anno, { kind: "composer" }> | null;
   selection: Selection | null;
@@ -431,11 +438,9 @@ interface FileCardProps {
   theme: { dark: string; light: string; mode: "dark" | "light" };
   actions: AnnoActions;
   rpc: ReturnType<typeof useRpc<Contract>>;
-  onAi(kind: AiKind, question?: string): void;
-  onSendSelection(): void;
-  providers: ProviderOption[];
-  providerId: string;
-  onProvider(id: string): void;
+  onAsk(selection: SelectionRef, question: string): void;
+  onSummarize(): void;
+  onCouncil(text: string): void;
 }
 
 function FileCard(props: FileCardProps) {
@@ -443,24 +448,22 @@ function FileCard(props: FileCardProps) {
   const [patch, setPatch] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [visible, setVisible] = useState(false);
-  const [asking, setAsking] = useState(false);
+  const [menu, setMenu] = useState(false);
   const [question, setQuestion] = useState("");
   const ref = useRef<HTMLDivElement | null>(null);
+  const { name, dir } = splitPath(file.path);
 
   useEffect(() => {
     const el = ref.current;
     if (el === null) return;
-    const observer = new IntersectionObserver((entries) => setVisible(entries.some((e) => e.isIntersecting)), { rootMargin: "800px 0px" });
+    const observer = new IntersectionObserver((entries) => setVisible(entries.some((e) => e.isIntersecting)), { rootMargin: "900px 0px" });
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
 
   useEffect(() => {
     if (!expanded || !visible || patch !== null || file.binary) return;
-    rpc.call("review_patch", { reviewId: review.id, path: file.path }).then(
-      (result) => setPatch(result.patch),
-      (cause: unknown) => setError(describeError(cause)),
-    );
+    rpc.call("review_patch", { reviewId: review.id, path: file.path }).then((r) => setPatch(r.patch), (c: unknown) => setError(describeError(c)));
   }, [expanded, visible, patch, file.binary, file.path, review.id, rpc]);
 
   useEffect(() => {
@@ -470,8 +473,7 @@ function FileCard(props: FileCardProps) {
   const fileDiff = useMemo<FileDiffMetadata | null>(() => {
     if (patch === null || patch.trim() === "") return null;
     try {
-      const parsed = parsePatchFiles(patch);
-      return parsed[0]?.files[0] ?? null;
+      return parsePatchFiles(patch)[0]?.files[0] ?? null;
     } catch {
       return null;
     }
@@ -484,20 +486,12 @@ function FileCard(props: FileCardProps) {
       if (line === null) continue;
       list.push({ side: thread.side === "LEFT" ? "deletions" : "additions", lineNumber: line, metadata: { kind: "thread", thread } });
     }
-    for (const note of props.notes) {
-      if (note.status === "dismissed" || note.startLine === null) continue;
-      list.push({ side: note.side === "old" ? "deletions" : "additions", lineNumber: note.endLine ?? note.startLine, metadata: { kind: "note", note } });
-    }
-    for (const pending of props.pending) {
-      list.push({ side: pending.side === "LEFT" ? "deletions" : "additions", lineNumber: pending.line, metadata: { kind: "pending", pending } });
-    }
+    for (const pending of props.pending) list.push({ side: pending.side === "LEFT" ? "deletions" : "additions", lineNumber: pending.line, metadata: { kind: "pending", pending } });
     if (props.composer) list.push({ side: props.composer.side === "LEFT" ? "deletions" : "additions", lineNumber: props.composer.line, metadata: props.composer });
     return list;
-  }, [props.threads, props.notes, props.pending, props.composer]);
+  }, [props.threads, props.pending, props.composer]);
 
   const selected = selection?.path === file.path ? selection.range : null;
-  const changed = file.additions + file.deletions;
-
   const loadDiffFiles = useCallback(
     async (meta: FileDiffMetadata) => {
       const [oldSide, newSide] = await Promise.all([
@@ -505,70 +499,72 @@ function FileCard(props: FileCardProps) {
         rpc.call("review_file", { reviewId: review.id, path: file.path, side: "new" }),
       ]);
       return {
-        oldFile: oldSide.content === null ? { name: meta.prevName ?? meta.name, contents: "" } : { name: meta.prevName ?? meta.name, contents: oldSide.content },
+        oldFile: { name: meta.prevName ?? meta.name, contents: oldSide.content ?? "" },
         newFile: { name: meta.name, contents: newSide.content ?? "" },
       };
     },
     [rpc, review.id, file.path],
   );
 
+  const ask = (e: FormEvent) => {
+    e.preventDefault();
+    if (!selected) return;
+    props.onAsk(toSelectionRef({ path: file.path, range: selected }), question.trim() === "" ? "Explain these lines in the context of the whole PR." : question.trim());
+    setQuestion("");
+  };
+
   return (
-    <div ref={ref} id={fileAnchorId(file.path)} className={cn("scroll-mt-2 rounded-lg border border-border bg-card", file.viewed && "opacity-80")}>
-      <div className="sticky top-0 z-10 flex flex-wrap items-center gap-2 rounded-t-lg border-b border-border bg-card/95 px-3 py-1.5 text-xs backdrop-blur">
-        <button type="button" onClick={onToggle} className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground" aria-expanded={expanded} aria-label={expanded ? "Collapse file" : "Expand file"}>
+    <div ref={ref} id={fileAnchorId(file.path)} className="scroll-mt-3 rounded-lg border border-border bg-card">
+      <div className="sticky top-0 z-10 flex items-center gap-2 rounded-t-lg border-b border-border bg-card/95 px-3 py-2 text-xs backdrop-blur">
+        <button type="button" onClick={onToggle} className="text-muted-foreground hover:text-foreground" aria-expanded={expanded} aria-label={expanded ? "Collapse file" : "Expand file"}>
           <Icon name={expanded ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
         </button>
-        <span className="min-w-0 flex-1 truncate font-mono">
-          {file.oldPath && file.oldPath !== file.path ? <span className="text-muted-foreground">{file.oldPath} → </span> : null}
-          {file.path}
+        <span className="min-w-0 flex-1 truncate">
+          <span className="font-medium text-foreground">{name}</span>
+          {dir ? <span className="ml-2 text-muted-foreground">{dir}</span> : null}
+          {file.oldPath && file.oldPath !== file.path ? <span className="ml-2 text-muted-foreground">renamed from {file.oldPath}</span> : null}
         </span>
-        <span className="text-muted-foreground">{file.status}</span>
-        <span className="font-mono"><span className="text-primary">+{file.additions}</span> <span className="text-destructive">-{file.deletions}</span></span>
-        {file.unresolvedCount > 0 ? <span className="rounded-full border border-border px-1.5" title="Unresolved GitHub threads"><Icon name="Github" className="mr-0.5 inline size-3" />{file.unresolvedCount}</span> : null}
-        {file.noteCount > 0 ? <span className="rounded-full border border-primary/40 px-1.5 text-primary" title="AI notes"><Icon name="Brain" className="mr-0.5 inline size-3" />{file.noteCount}</span> : null}
-        {file.pendingCount > 0 ? <span className="rounded-full border border-dashed border-foreground/40 px-1.5" title="Pending comments">{file.pendingCount} pending</span> : null}
-        <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => props.onAi("file_summary")} title="Ask the AI to summarize this file's change">Summarize</Button>
-        <FileLink target={{ kind: "host", hostId: review.hostId, path: `${review.worktree}/${file.path}` }} className="text-muted-foreground hover:text-foreground" title="Open the file at the PR head">
-          <Icon name="ExternalLink" className="size-3.5" />
-        </FileLink>
-        <label className="inline-flex items-center gap-1 text-muted-foreground" title="Mark viewed (v)">
-          <input type="checkbox" checked={file.viewed} onChange={(e) => props.onViewed(e.target.checked)} className="size-3.5" />
-          viewed
-        </label>
+        {file.unresolvedCount > 0 ? <span className="inline-flex items-center gap-1 text-muted-foreground" title={`${file.unresolvedCount} open GitHub thread${file.unresolvedCount === 1 ? "" : "s"}`}><Icon name="Github" className="size-3" />{file.unresolvedCount}</span> : null}
+        {file.pendingCount > 0 ? <span className="rounded-full border border-dashed border-foreground/40 px-1.5 text-[10px]">{file.pendingCount} pending</span> : null}
+        <span className="font-mono"><span className="text-primary">+{file.additions}</span> <span className="ml-1 text-destructive">-{file.deletions}</span></span>
+        <Button variant="ghost" size="sm" className={cn("h-6 px-2 text-xs", file.viewed && "text-primary")} onClick={() => props.onViewed(!file.viewed)}>
+          {file.viewed ? <><Icon name="Check" className="size-3" />Viewed</> : "Mark as viewed"}
+        </Button>
+        <span className="relative">
+          <Button variant="ghost" size="sm" className="h-6 w-6 px-0" onClick={() => setMenu((m) => !m)} aria-label="File actions" aria-expanded={menu}><Icon name="MoreHorizontal" className="size-3.5" /></Button>
+          {menu ? (
+            <div className="absolute right-0 top-full z-20 mt-1 w-52 rounded-md border border-border bg-card p-1 text-xs shadow-md">
+              <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => { setMenu(false); props.onSummarize(); }}><Icon name="Brain" className="size-3.5" />Summarize in chat</button>
+              <FileLink target={{ kind: "host", hostId: review.hostId, path: `${review.worktree}/${file.path}` }} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => setMenu(false)}><Icon name="ExternalLink" className="size-3.5" />Open file at head</FileLink>
+              <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => { void navigator.clipboard?.writeText(file.path); setMenu(false); toast.success("Path copied"); }}><Icon name="Copy" className="size-3.5" />Copy path</button>
+            </div>
+          ) : null}
+        </span>
       </div>
+
       {selected ? (
-        <div className="flex flex-wrap items-center gap-1.5 border-b border-border bg-background px-3 py-1.5 text-xs">
-          <span className="text-muted-foreground">
-            Lines {Math.min(selected.start, selected.end)}-{Math.max(selected.start, selected.end)} ({selected.side === "deletions" ? "old" : "new"})
+        <form onSubmit={ask} className="flex flex-wrap items-center gap-2 border-b border-border bg-background px-3 py-2 text-xs">
+          <span className="font-mono text-muted-foreground">
+            L{Math.min(selected.start, selected.end)}{selected.start !== selected.end ? `–${Math.max(selected.start, selected.end)}` : ""}{selected.side === "deletions" ? " (base)" : ""}
           </span>
-          <Button size="sm" className="h-6 px-2 text-xs" onClick={() => props.onOpenComposer(file.path, selected)}><Icon name="Edit" className="size-3" />Comment</Button>
-          <ProviderSelect providers={props.providers} value={props.providerId} onChange={props.onProvider} className="h-6" />
-          <Button variant="outline" size="sm" className="h-6 px-2 text-xs" onClick={() => props.onAi("explain")}>Explain</Button>
-          <Button variant="outline" size="sm" className="h-6 px-2 text-xs" onClick={() => props.onAi("why")}>Why</Button>
-          <Button variant="outline" size="sm" className="h-6 px-2 text-xs" onClick={() => props.onAi("risks")}>Risks</Button>
-          <Button variant="outline" size="sm" className="h-6 px-2 text-xs" onClick={() => props.onAi("fix")}>Fix</Button>
-          {asking ? (
-            <form className="flex items-center gap-1" onSubmit={(e) => { e.preventDefault(); if (question.trim() === "") return; props.onAi("ask", question.trim()); setQuestion(""); setAsking(false); }}>
-              <Input autoFocus value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Ask about these lines…" className="h-6 w-64 text-xs" />
-              <Button type="submit" size="sm" className="h-6 px-2 text-xs">Ask</Button>
-            </form>
-          ) : (
-            <Button variant="outline" size="sm" className="h-6 px-2 text-xs" onClick={() => setAsking(true)}>Ask…</Button>
-          )}
-          <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={props.onSendSelection} title="Send this range to a Roundtable room">To room</Button>
-          <Button variant="ghost" size="sm" className="ml-auto h-6 px-2 text-xs" onClick={() => props.onSelect(null)}>Clear</Button>
-        </div>
+          <Input autoFocus value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Ask the analyst about these lines…" className="h-7 min-w-56 flex-1 text-xs" aria-label="Question about the selected lines" />
+          <Button type="submit" size="sm" className="h-7 text-xs"><Icon name="Brain" className="size-3.5" />Ask</Button>
+          <Button type="button" variant="outline" size="sm" className="h-7 text-xs" onClick={() => props.onOpenComposer(file.path, selected)}><Icon name="Edit" className="size-3.5" />Comment</Button>
+          <Button type="button" variant="outline" size="sm" className="h-7 text-xs" onClick={() => props.onCouncil(`${review.owner}/${review.repo}#${review.number} · ${file.path}:${Math.min(selected.start, selected.end)}-${Math.max(selected.start, selected.end)} (head ${shortSha(review.headSha)})\n\nPlease look at this range.`)} title="Send this range to a Roundtable room"><Icon name="MessageSquare" className="size-3.5" />Council</Button>
+          <Button type="button" variant="ghost" size="sm" className="h-7 w-7 px-0" onClick={() => props.onSelect(null)} aria-label="Clear selection"><Icon name="X" className="size-3.5" /></Button>
+        </form>
       ) : null}
+
       {!expanded ? null : file.binary ? (
         <div className="px-3 py-3 text-xs text-muted-foreground">Binary file.</div>
       ) : error ? (
         <div className="px-3 py-3 text-xs text-destructive">{error}</div>
       ) : patch === null ? (
-        <div className="px-3 py-3 text-xs text-muted-foreground">{visible ? "Loading diff…" : `${changed} changed lines`}</div>
+        <div className="px-3 py-3 text-xs text-muted-foreground">{visible ? "Loading diff…" : `${file.additions + file.deletions} changed lines`}</div>
       ) : fileDiff === null ? (
         <div className="px-3 py-3 text-xs text-muted-foreground">No textual diff.</div>
       ) : (
-        <div className="rd-diff overflow-x-auto text-[12.5px]">
+        <div className="overflow-x-auto text-[12.5px]">
           <FileDiff<Anno>
             fileDiff={fileDiff}
             options={{
@@ -597,7 +593,7 @@ function FileCard(props: FileCardProps) {
 }
 
 // ---------------------------------------------------------------------------
-// Room picker (send text to a Roundtable room)
+// Room sender (Roundtable bridge)
 // ---------------------------------------------------------------------------
 
 function RoomSender({ text, onClose }: { text: string; onClose: () => void }) {
@@ -615,26 +611,10 @@ function RoomSender({ text, onClose }: { text: string; onClose: () => void }) {
   }, [rpc]);
   const room = rooms?.find((r) => r.id === roomId);
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-background/60 p-4" role="dialog" aria-label="Send to Roundtable room">
-      <form
-        className="w-full max-w-lg space-y-3 rounded-lg border border-border bg-card p-4 text-sm shadow-lg"
-        onSubmit={async (e: FormEvent) => {
-          e.preventDefault();
-          if (roomId === "" || body.trim() === "") return;
-          setBusy(true);
-          setError(null);
-          try {
-            await rpc.call("send_to_room", { roomId, text: body.trim(), tags, turns });
-            onClose();
-          } catch (cause) {
-            setError(describeError(cause));
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-background/60 p-4" role="dialog" aria-label="Send to the council">
+      <form className="w-full max-w-lg space-y-3 rounded-lg border border-border bg-card p-4 text-sm shadow-lg" onSubmit={async (e: FormEvent) => { e.preventDefault(); if (roomId === "" || body.trim() === "") return; setBusy(true); setError(null); try { await rpc.call("send_to_room", { roomId, text: body.trim(), tags, turns }); toast.success("Sent to the room"); onClose(); } catch (cause) { setError(describeError(cause)); } finally { setBusy(false); } }}>
         <div className="flex items-center justify-between">
-          <span className="font-semibold">Send to a Roundtable room</span>
+          <span className="font-semibold">Send to the council</span>
           <Button type="button" variant="ghost" size="sm" onClick={onClose} aria-label="Close"><Icon name="X" className="size-4" /></Button>
         </div>
         {!available ? <p className="text-xs text-destructive">The Roundtable plugin is not running.</p> : null}
@@ -653,7 +633,7 @@ function RoomSender({ text, onClose }: { text: string; onClose: () => void }) {
             <label className="ml-auto inline-flex items-center gap-1 text-muted-foreground">Turns<Input type="number" min={0} max={40} value={turns} onChange={(e) => setTurns(Math.max(0, Math.min(40, Number(e.target.value) || 0)))} className="h-7 w-14 text-xs" /></label>
           </div>
         ) : null}
-        <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={8} className="w-full resize-none rounded-md border border-input bg-transparent px-2 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+        <TextArea value={body} onChange={setBody} rows={8} />
         {error ? <p className="text-xs text-destructive">{error}</p> : null}
         <div className="flex justify-end gap-2">
           <Button type="button" variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
@@ -665,294 +645,79 @@ function RoomSender({ text, onClose }: { text: string; onClose: () => void }) {
 }
 
 // ---------------------------------------------------------------------------
-// Review view
+// Review page
 // ---------------------------------------------------------------------------
 
-function ReviewView({ reviewId }: { reviewId: string }) {
-  const { rpc, detail, error, refetch } = useReview(reviewId);
-  const panel = useAppPanel();
-  const navigate = useBbNavigate();
-  const providers = useProviders();
-  const codeTheme = useCodeTheme();
-  const [providerId, setProviderId] = useState("");
-  const [diffStyle, setDiffStyle] = useState<"unified" | "split">("unified");
-  const [rail, setRail] = useState<"files" | "codemap">("files");
-  const [selection, setSelection] = useState<Selection | null>(null);
-  const [composer, setComposer] = useState<Extract<Anno, { kind: "composer" }> | null>(null);
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  const [expandedOverride, setExpandedOverride] = useState<Set<string>>(new Set());
-  const [busy, setBusy] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [roomText, setRoomText] = useState<string | null>(null);
-  const [filter, setFilter] = useState("");
-  const [railOpen, setRailOpen] = useState<boolean | null>(null);
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const codemap = useCodemap(reviewId, rail === "codemap");
-
-  // Default the file rail by available width; the user can still toggle it.
+function Description({ body }: { body: string }) {
+  const [open, setOpen] = useState(false);
+  const [overflowing, setOverflowing] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    const el = rootRef.current;
+    const el = ref.current;
     if (el === null) return;
-    const observer = new ResizeObserver((entries) => {
-      const width = entries[0]?.contentRect.width ?? 0;
-      setRailOpen((current) => (current === null ? width >= 900 : current));
-    });
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    if (providerId === "" && providers[0]) setProviderId(providers[0].id);
-  }, [providers, providerId]);
-
-  const theme = useMemo(() => {
-    const name = codeTheme.name;
-    const known = SHIKI_THEMES.has(name);
-    return {
-      dark: known && codeTheme.mode === "dark" ? name : "github-dark",
-      light: known && codeTheme.mode === "light" ? name : "github-light",
-      mode: codeTheme.mode,
-    };
-  }, [codeTheme.name, codeTheme.mode]);
-
-  const run = async (label: string, fn: () => Promise<unknown>) => {
-    setBusy(label);
-    setActionError(null);
-    try {
-      await fn();
-    } catch (cause) {
-      setActionError(describeError(cause));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const actions = useMemo<AnnoActions>(
-    () => ({
-      reviewId,
-      reply: async (commentId, body) => { await rpc.call("thread_reply", { reviewId, commentId, body }); refetch(); },
-      resolve: async (threadId, resolve) => { await rpc.call("thread_resolve", { reviewId, threadId, resolve }); refetch(); },
-      savePending: async (input) => { await rpc.call("pending_add", { reviewId, ...input }); refetch(); },
-      updatePending: async (id, body) => { await rpc.call("pending_update", { id, body }); refetch(); },
-      deletePending: async (id) => { await rpc.call("pending_delete", { id }); refetch(); },
-      dismissNote: async (id) => { await rpc.call("note_update", { id, status: "dismissed" }); refetch(); },
-      noteToComment: (note) => {
-        if (!note.path || !note.startLine) return;
-        setComposer({ kind: "composer", path: note.path, line: note.endLine ?? note.startLine, startLine: note.startLine !== (note.endLine ?? note.startLine) ? note.startLine : null, side: note.side === "old" ? "LEFT" : "RIGHT", initial: `${note.title}\n\n${note.body}`, noteId: note.id });
-        scrollToFile(note.path);
-      },
-      sendToRoom: (text) => setRoomText(text),
-      closeComposer: () => setComposer(null),
-    }),
-    [rpc, reviewId, refetch],
-  );
-
-  const openComposer = (path: string, range: SelectedLineRange) => {
-    const start = Math.min(range.start, range.end);
-    const end = Math.max(range.start, range.end);
-    setComposer({ kind: "composer", path, line: end, startLine: start !== end ? start : null, side: (range.side ?? "additions") === "deletions" ? "LEFT" : "RIGHT", initial: "", noteId: null });
-  };
-
-  const askAi = (path: string | null, range: SelectedLineRange | null, kind: AiKind, question?: string) => {
-    if (providerId === "") {
-      setActionError("No AI provider is available.");
-      return;
-    }
-    void run("ai", async () => {
-      await rpc.call("ai_ask", {
-        reviewId,
-        kind,
-        providerId,
-        path,
-        startLine: range ? Math.min(range.start, range.end) : null,
-        endLine: range ? Math.max(range.start, range.end) : null,
-        side: range ? ((range.side ?? "additions") === "deletions" ? "old" : "new") : "new",
-        question: question ?? null,
-      });
-      panel.openFixedTab({ surface: { kind: "current" }, tab: NOTES_TAB, target: { reviewId } });
-      refetch();
-    });
-  };
-
-  if (error !== null) return <div className="p-4"><p role="alert" className="text-sm text-destructive">{error}</p></div>;
-  if (detail === null) return <div className="p-4"><EmptyState>Loading review…</EmptyState></div>;
-
-  const { review, files } = detail;
-  const threadsByPath = new Map<string, GhThread[]>();
-  for (const t of detail.threads) threadsByPath.set(t.path, [...(threadsByPath.get(t.path) ?? []), t]);
-  const notesByPath = new Map<string, Note[]>();
-  for (const n of detail.notes) if (n.path) notesByPath.set(n.path, [...(notesByPath.get(n.path) ?? []), n]);
-  const pendingByPath = new Map<string, PendingComment[]>();
-  for (const p of detail.pending) pendingByPath.set(p.path, [...(pendingByPath.get(p.path) ?? []), p]);
-
-  const isExpanded = (f: FileEntry, index: number) => {
-    if (collapsed.has(f.path)) return false;
-    if (expandedOverride.has(f.path)) return true;
-    return index < 60 && f.additions + f.deletions <= 800;
-  };
-  const toggle = (path: string, expanded: boolean) => {
-    if (expanded) setCollapsed((s) => new Set(s).add(path));
-    else setCollapsed((s) => { const n = new Set(s); n.delete(path); return n; });
-    if (!expanded) setExpandedOverride((s) => new Set(s).add(path));
-  };
-  const viewedCount = files.filter((f) => f.viewed).length;
-  const checksOk = review.checks.filter((c) => (c.conclusion ?? "").toLowerCase() === "success").length;
-  const checksBad = review.checks.filter((c) => ["failure", "error", "timed_out", "cancelled"].includes((c.conclusion ?? "").toLowerCase())).length;
-  const runningRequests = detail.requests.filter((r) => r.status === "running");
-  const filteredFiles = filter.trim() === "" ? files : files.filter((f) => f.path.toLowerCase().includes(filter.trim().toLowerCase()));
-
-  const selectionText = () => {
-    if (!selection) return "";
-    const s = Math.min(selection.range.start, selection.range.end);
-    const e = Math.max(selection.range.start, selection.range.end);
-    return `${review.owner}/${review.repo}#${review.number} ${selection.path}:${s}-${e} (${(selection.range.side ?? "additions") === "deletions" ? "old" : "new"} side, head ${shortSha(review.headSha)})\n\nPlease look at this range.`;
-  };
-
+    setOverflowing(el.scrollHeight > el.clientHeight + 8);
+  }, [body]);
+  if (body.trim() === "") return <p className="text-sm text-muted-foreground">No description.</p>;
   return (
-    <div ref={rootRef} className="flex h-full min-h-0 flex-col">
-      <header className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2 text-xs">
-        <Button variant="ghost" size="sm" className="h-7 px-1.5" onClick={() => setRailOpen((v) => !v)} aria-label={railOpen ? "Hide file list" : "Show file list"} aria-pressed={railOpen === true}>
-          <Icon name="PanelLeft" className="size-4" />
-        </Button>
-        <div className="min-w-0 flex-1 basis-64">
-          <div className="flex min-w-0 items-center gap-2">
-            <UrlLink href={review.url} className="min-w-0 truncate text-sm font-semibold hover:underline" title={review.title}>{review.title}</UrlLink>
-            <span className="text-muted-foreground">{review.owner}/{review.repo}#{review.number}</span>
-            <span className={cn("rounded-full border px-1.5 py-0 text-[10px] uppercase", review.state === "OPEN" ? "border-primary/50 text-primary" : "border-border text-muted-foreground")}>{review.isDraft ? "draft" : review.state}</span>
-            {review.reviewDecision ? <span className="rounded-full border border-border px-1.5 py-0 text-[10px]">{review.reviewDecision.replace(/_/g, " ").toLowerCase()}</span> : null}
-          </div>
-          <div className="mt-0.5 flex flex-wrap items-center gap-3 text-muted-foreground">
-            {review.author ? <span>by {review.author}</span> : null}
-            <span className="font-mono">{review.baseRefName} ← {review.headRefName} @ {shortSha(review.headSha)}</span>
-            <span><span className="text-primary">+{review.additions}</span> <span className="text-destructive">-{review.deletions}</span> · {files.length} files · {viewedCount} viewed</span>
-            {review.checks.length > 0 ? <span title={review.checks.map((c) => `${c.name}: ${c.conclusion ?? c.status}`).join("\n")}>checks {checksOk} ok{checksBad > 0 ? `, ${checksBad} failing` : ""}</span> : null}
-            <span>synced {timeAgo(review.syncedAt)}</span>
-          </div>
-        </div>
-        {runningRequests.length > 0 ? (
-          <span className="inline-flex items-center gap-1 text-muted-foreground"><Icon name="Loading" className="size-3.5 animate-spin" />{runningRequests.length} AI request{runningRequests.length === 1 ? "" : "s"}</span>
-        ) : null}
-        <select value={diffStyle} onChange={(e) => setDiffStyle(e.target.value as "unified" | "split")} className="h-7 rounded-md border border-input bg-background px-1.5 text-xs" aria-label="Diff style">
-          <option value="unified">Unified</option>
-          <option value="split">Split</option>
-        </select>
-        <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => void run("sync", async () => { await rpc.call("reviews_sync", { reviewId }); refetch(); })} disabled={busy !== null}>
-          <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", busy === "sync" && "animate-spin")} />Sync
-        </Button>
-        <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: NOTES_TAB, target: { reviewId } })}>
-          <Icon name="Brain" className="size-3.5" />AI
-        </Button>
-        <Button size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: CONVERSATION_TAB, target: { reviewId } })}>
-          <Icon name="Github" className="size-3.5" />Review{detail.pending.length > 0 ? ` (${detail.pending.length} pending)` : ""}
-        </Button>
-        <Button variant="ghost" size="sm" className="h-7" aria-label="Remove review from the list" onClick={() => { if (window.confirm("Remove this review from Review Desk? The worktree stays on disk.")) void run("remove", async () => { await rpc.call("reviews_remove", { reviewId }); navigate.toPluginPanel(PANEL_PATH, { replace: true }); }); }}>
-          <Icon name="Trash2" className="size-3.5" />
-        </Button>
-      </header>
-      {actionError ? <p role="alert" className="border-b border-border px-4 py-1.5 text-xs text-destructive">{actionError}</p> : null}
-
-      <div className="flex min-h-0 flex-1">
-        <aside className={cn("flex w-64 shrink-0 flex-col border-r border-border", railOpen !== true && "hidden")}>
-          <div className="flex items-center gap-1 border-b border-border px-2 py-1.5 text-xs">
-            <button type="button" onClick={() => setRail("files")} className={cn("rounded px-2 py-1", rail === "files" ? "bg-state-active font-medium" : "text-muted-foreground hover:bg-state-hover")}>Files {files.length}</button>
-            <button type="button" onClick={() => setRail("codemap")} className={cn("rounded px-2 py-1", rail === "codemap" ? "bg-state-active font-medium" : "text-muted-foreground hover:bg-state-hover")}>Codemap</button>
-            <Button variant="ghost" size="sm" className="ml-auto h-6 px-1.5 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: CODEMAP_TAB, target: { reviewId } })} title="Open the codemap detail tab"><Icon name="PanelRight" className="size-3.5" /></Button>
-          </div>
-          {rail === "files" ? (
-            <>
-              <div className="border-b border-border px-2 py-1.5">
-                <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter files…" className="h-7 text-xs" />
-              </div>
-              <ul className="min-h-0 flex-1 overflow-y-auto py-1 text-xs">
-                {filteredFiles.map((f) => (
-                  <li key={f.path}>
-                    <button type="button" onClick={() => { setExpandedOverride((s) => new Set(s).add(f.path)); setCollapsed((s) => { const n = new Set(s); n.delete(f.path); return n; }); scrollToFile(f.path); }} className="flex w-full items-center gap-1.5 px-2 py-1 text-left hover:bg-state-hover">
-                      <span className={cn("size-1.5 shrink-0 rounded-full", f.viewed ? "bg-primary" : "bg-muted-foreground/30")} />
-                      <span className="min-w-0 flex-1 truncate font-mono" title={f.path}>{f.path}</span>
-                      {f.unresolvedCount > 0 ? <span className="text-muted-foreground" title="Unresolved threads">{f.unresolvedCount}</span> : null}
-                      {f.noteCount > 0 ? <Icon name="Brain" className="size-3 text-primary" /> : null}
-                      <span className="font-mono text-[10px]"><span className="text-primary">+{f.additions}</span> <span className="text-destructive">-{f.deletions}</span></span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </>
-          ) : (
-            <CodemapRail state={codemap.state} error={codemap.error} onRefresh={codemap.refresh} />
-          )}
-        </aside>
-
-        <main className="min-w-0 flex-1 overflow-y-auto">
-          <div className="flex w-full min-w-0 flex-col gap-3 p-3">
-            {files.length === 0 ? <EmptyState>No changed files.</EmptyState> : null}
-            {files.map((f, index) => (
-              <FileCard
-                key={f.path}
-                review={review}
-                file={f}
-                threads={threadsByPath.get(f.path) ?? []}
-                notes={notesByPath.get(f.path) ?? []}
-                pending={pendingByPath.get(f.path) ?? []}
-                composer={composer?.path === f.path ? composer : null}
-                selection={selection}
-                onSelect={setSelection}
-                onOpenComposer={openComposer}
-                expanded={isExpanded(f, index)}
-                onToggle={() => toggle(f.path, isExpanded(f, index))}
-                onViewed={(viewed) => void run("viewed", async () => { await rpc.call("viewed_set", { reviewId, path: f.path, viewed }); refetch(); })}
-                diffStyle={diffStyle}
-                theme={theme}
-                actions={actions}
-                rpc={rpc}
-                onAi={(kind, question) => askAi(f.path, kind === "file_summary" ? null : selection?.path === f.path ? selection.range : null, kind, question)}
-                onSendSelection={() => setRoomText(selectionText())}
-                providers={providers}
-                providerId={providerId}
-                onProvider={setProviderId}
-              />
-            ))}
-          </div>
-        </main>
+    <div>
+      <div ref={ref} className={cn("relative text-sm", !open && "max-h-72 overflow-hidden")}>
+        <Markdown content={body} />
+        {!open && overflowing ? <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-background to-transparent" /> : null}
       </div>
-      {roomText !== null ? <RoomSender text={roomText} onClose={() => setRoomText(null)} /> : null}
+      {overflowing || open ? (
+        <div className="mt-2 flex justify-center">
+          <Button variant="outline" size="sm" className="h-7 rounded-full text-xs" onClick={() => setOpen((v) => !v)}>
+            {open ? "Show less" : "Read more"}<Icon name={open ? "ChevronUp" : "ChevronDown"} className="size-3.5" />
+          </Button>
+        </div>
+      ) : null}
     </div>
   );
 }
 
-function CodemapRail({ state, error, onRefresh }: { state: CodemapState | null; error: string | null; onRefresh: () => void }) {
-  if (error) return <p className="p-3 text-xs text-destructive">{error}</p>;
-  if (state === null) return <p className="p-3 text-xs text-muted-foreground">Loading…</p>;
-  if (state.status === "building" || state.status === "missing") return <p className="inline-flex items-center gap-1.5 p-3 text-xs text-muted-foreground"><Icon name="Loading" className="size-3.5 animate-spin" />Building the codemap (parsing changed files, counting references)…</p>;
-  if (state.status === "failed" || state.codemap === null) return <div className="space-y-2 p-3 text-xs"><p className="text-destructive">{state.error ?? "Codemap failed."}</p><Button size="sm" variant="outline" onClick={onRefresh}>Retry</Button></div>;
-  const c = state.codemap;
+function Discussion({ reviewId, threads }: { reviewId: string; threads: GhThread[] }) {
+  const rpc = useRpc<Contract>();
+  const [conversation, setConversation] = useState<{ comments: { id: number; author: string; body: string; createdAt: string; url: string }[]; reviews: { id: number; author: string; state: string; body: string; submittedAt: string | null; url: string }[] } | null>(null);
+  const load = useCallback((refresh = false) => {
+    rpc.call("review_conversation", { reviewId, refresh }).then((r) => setConversation({ comments: r.comments, reviews: r.reviews }), () => undefined);
+  }, [rpc, reviewId]);
+  useEffect(() => { load(); }, [load]);
+  const open = threads.filter((t) => !t.isResolved);
+  if (conversation === null) return <p className="text-sm text-muted-foreground">Loading…</p>;
+  const items = [
+    ...conversation.reviews.map((r) => ({ key: `r-${r.id}`, author: r.author, when: r.submittedAt, body: r.body, badge: r.state, url: r.url })),
+    ...conversation.comments.map((c) => ({ key: `c-${c.id}`, author: c.author, when: c.createdAt, body: c.body, badge: null as string | null, url: c.url })),
+  ].sort((a, b) => Date.parse(a.when ?? "") - Date.parse(b.when ?? ""));
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto text-xs">
-      <div className="flex items-center justify-between border-b border-border px-2 py-1.5 text-muted-foreground">
-        <span>{c.stats.symbols} symbols · +{c.stats.added} ~{c.stats.modified} -{c.stats.removed} · {c.engine}</span>
-        <Button variant="ghost" size="sm" className="h-6 px-1.5" onClick={onRefresh} aria-label="Rebuild codemap"><Icon name="ArrowReloadHorizontal" className="size-3" /></Button>
+    <div className="space-y-4 text-sm">
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-muted-foreground">{items.length} comments and reviews · {open.length} open threads in the diff</span>
+        <Button variant="ghost" size="sm" className="h-6 px-1.5" onClick={() => { load(true); void rpc.call("review_threads_refresh", { reviewId }); }} aria-label="Refresh discussion"><Icon name="ArrowReloadHorizontal" className="size-3.5" /></Button>
       </div>
-      <div className="px-2 py-1.5 font-medium">Reading order</div>
-      <ol className="space-y-1 px-2 pb-2">
-        {c.readingOrder.map((m, i) => (
-          <li key={m.module} className="rounded border border-border p-1.5">
-            <div className="flex items-center gap-1.5"><span className="text-muted-foreground">{i + 1}.</span><span className="font-mono font-medium">{m.module}</span><span className="ml-auto text-muted-foreground">{m.paths.length}</span></div>
-            <div className="text-[11px] text-muted-foreground">{m.reason}</div>
-            <ul className="mt-1 space-y-0.5">
-              {m.paths.map((p) => (
-                <li key={p}><button type="button" onClick={() => scrollToFile(p)} className="w-full truncate text-left font-mono text-[11px] hover:underline" title={p}>{p.split("/").slice(2).join("/") || p}</button></li>
-              ))}
-            </ul>
-          </li>
-        ))}
-      </ol>
-      <div className="px-2 py-1.5 font-medium">Hotspots</div>
-      <ul className="space-y-0.5 px-2 pb-3">
-        {c.hotspots.slice(0, 12).map((h) => (
-          <li key={`${h.path}#${h.qualified}`}>
-            <button type="button" onClick={() => scrollToFile(h.path)} className="flex w-full items-center gap-1.5 text-left hover:underline" title={`${h.path} · ${h.changedLines} changed lines · fan-in ${h.fanIn}`}>
-              <span className="w-8 shrink-0 text-right font-mono text-muted-foreground">{h.score}</span>
-              <span className="min-w-0 flex-1 truncate font-mono">{h.qualified}</span>
-            </button>
+      {open.length > 0 ? (
+        <div className="rounded-lg border border-border">
+          <div className="border-b border-border px-3 py-1.5 text-xs font-medium">Open threads</div>
+          <ul className="divide-y divide-border/60">
+            {open.slice(0, 40).map((t) => (
+              <li key={t.id} className="flex items-baseline gap-2 px-3 py-1.5 text-xs">
+                <button type="button" onClick={() => scrollToFile(t.path)} className="shrink-0 font-mono hover:underline">{splitPath(t.path).name}{t.line ? `:${t.line}` : ""}</button>
+                <span className="min-w-0 truncate text-muted-foreground"><span className="font-medium text-foreground">{t.comments[0]?.author}</span> {t.comments[0]?.body.split("\n")[0]}</span>
+              </li>
+            ))}
+            {open.length > 40 ? <li className="px-3 py-1.5 text-xs text-muted-foreground">and {open.length - 40} more in the diff</li> : null}
+          </ul>
+        </div>
+      ) : null}
+      <ul className="space-y-3">
+        {items.map((item) => (
+          <li key={item.key} className="rounded-lg border border-border bg-card p-3">
+            <div className="mb-1 flex items-center gap-2 text-xs text-muted-foreground">
+              <span className="font-medium text-foreground">{item.author}</span>
+              {item.badge ? <span className={cn("inline-flex items-center gap-1 rounded-full border border-border px-1.5 py-0 text-[10px] uppercase", reviewStateTone(item.badge))}>{item.badge.replace(/_/g, " ").toLowerCase()}</span> : null}
+              {item.when ? <span>{timeAgo(item.when)}</span> : null}
+              <UrlLink href={item.url} className="ml-auto hover:text-foreground" title="Open on GitHub"><Icon name="ExternalLink" className="size-3.5" /></UrlLink>
+            </div>
+            {item.body.trim() === "" ? <span className="text-xs text-muted-foreground">No text.</span> : <Markdown content={item.body} />}
           </li>
         ))}
       </ul>
@@ -960,187 +725,406 @@ function CodemapRail({ state, error, onRefresh }: { state: CodemapState | null; 
   );
 }
 
+function Commits({ review }: { review: Review }) {
+  if (review.commits.length === 0) return <p className="text-sm text-muted-foreground">No commits.</p>;
+  return (
+    <ul className="divide-y divide-border/60 rounded-lg border border-border text-sm">
+      {[...review.commits].reverse().map((c) => (
+        <li key={c.sha} className="flex items-center gap-3 px-3 py-2">
+          <UrlLink href={`${review.url.replace(/\/pull\/\d+$/, "")}/commit/${c.sha}`} className="shrink-0 font-mono text-xs text-muted-foreground hover:text-foreground">{shortSha(c.sha)}</UrlLink>
+          <span className="min-w-0 flex-1 truncate">{c.title}</span>
+          <span className="shrink-0 text-xs text-muted-foreground">{c.author} · {timeAgo(c.date)}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+type Tab = "description" | "discussion" | "commits";
+
+function ReviewView({ reviewId }: { reviewId: string }) {
+  const { rpc, detail, error, refetch } = useReview(reviewId);
+  const panel = useAppPanel();
+  const navigate = useBbNavigate();
+  const { providers, defaultProvider } = useProviders();
+  const [providerId] = useChatProvider(providers, defaultProvider);
+  const codeTheme = useCodeTheme();
+  const [tab, setTab] = useState<Tab>("description");
+  const [diffStyle, setDiffStyle] = useState<"unified" | "split">("unified");
+  const [selection, setSelectionState] = useState<Selection | null>(null);
+  const [composer, setComposer] = useState<Extract<Anno, { kind: "composer" }> | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [expandedOverride, setExpandedOverride] = useState<Set<string>>(new Set());
+  const [allCollapsed, setAllCollapsed] = useState(false);
+  const [filter, setFilter] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [roomText, setRoomText] = useState<string | null>(null);
+
+  const setSelection = useCallback((next: Selection | null) => {
+    setSelectionState(next);
+    writeStorage(selectionKey(reviewId), next === null ? null : toSelectionRef(next));
+  }, [reviewId]);
+
+  const theme = useMemo(() => {
+    const known = SHIKI_THEMES.has(codeTheme.name);
+    return {
+      dark: known && codeTheme.mode === "dark" ? codeTheme.name : "github-dark",
+      light: known && codeTheme.mode === "light" ? codeTheme.name : "github-light",
+      mode: codeTheme.mode,
+    };
+  }, [codeTheme.name, codeTheme.mode]);
+
+  const run = async (label: string, fn: () => Promise<unknown>) => {
+    setBusy(label);
+    try {
+      await fn();
+    } catch (cause) {
+      toast.error(describeError(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const actions = useMemo<AnnoActions>(() => ({
+    reply: async (commentId, body) => { await rpc.call("thread_reply", { reviewId, commentId, body }); refetch(); toast.success("Reply posted"); },
+    resolve: async (threadId, resolve) => { await rpc.call("thread_resolve", { reviewId, threadId, resolve }); refetch(); },
+    savePending: async (input) => { await rpc.call("pending_add", { reviewId, ...input }); refetch(); },
+    updatePending: async (id, body) => { await rpc.call("pending_update", { id, body }); refetch(); },
+    deletePending: async (id) => { await rpc.call("pending_delete", { id }); refetch(); },
+    closeComposer: () => setComposer(null),
+  }), [rpc, reviewId, refetch]);
+
+  const openChat = () => panel.openFixedTab({ surface: { kind: "current" }, tab: CHAT_TAB, target: { reviewId } });
+
+  const askAnalyst = (text: string, sel: SelectionRef | null) => {
+    if (providerId === "") {
+      toast.error("No AI provider is available.");
+      return;
+    }
+    void run("ask", async () => {
+      await rpc.call("chat_send", { reviewId, providerId, text, selection: sel });
+      openChat();
+      refetch();
+    });
+  };
+
+  if (error !== null) return <div className="p-6"><p role="alert" className="text-sm text-destructive">{error}</p></div>;
+  if (detail === null) return <div className="p-6"><EmptyState>Loading review…</EmptyState></div>;
+
+  const { review, files, threads, pending } = detail;
+  const threadsByPath = new Map<string, GhThread[]>();
+  for (const t of threads) threadsByPath.set(t.path, [...(threadsByPath.get(t.path) ?? []), t]);
+  const pendingByPath = new Map<string, PendingComment[]>();
+  for (const p of pending) pendingByPath.set(p.path, [...(pendingByPath.get(p.path) ?? []), p]);
+  const viewedCount = files.filter((f) => f.viewed).length;
+  const linesLeft = files.filter((f) => !f.viewed).reduce((n, f) => n + f.additions + f.deletions, 0);
+  const isExpanded = (f: FileEntry, index: number) => {
+    if (collapsed.has(f.path)) return false;
+    if (expandedOverride.has(f.path)) return true;
+    if (allCollapsed) return false;
+    return !f.viewed && index < 60 && f.additions + f.deletions <= 800;
+  };
+  const toggle = (path: string, expanded: boolean) => {
+    if (expanded) {
+      setCollapsed((s) => new Set(s).add(path));
+      setExpandedOverride((s) => { const n = new Set(s); n.delete(path); return n; });
+    } else {
+      setCollapsed((s) => { const n = new Set(s); n.delete(path); return n; });
+      setExpandedOverride((s) => new Set(s).add(path));
+    }
+  };
+  const shown = filter.trim() === "" ? files : files.filter((f) => f.path.toLowerCase().includes(filter.trim().toLowerCase()));
+  const openThreads = threads.filter((t) => !t.isResolved).length;
+  const repoUrl = review.url.replace(/\/pull\/\d+$/, "");
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-xs">
+        <Button variant="ghost" size="sm" className="h-7 px-1.5" onClick={() => navigate.toPluginPanel(PANEL_PATH)} aria-label="Back to reviews"><Icon name="ChevronLeft" className="size-4" /></Button>
+        <Icon name="GitPullRequest" className="size-3.5 text-muted-foreground" />
+        <span className="min-w-0 truncate"><span className="text-muted-foreground">#{review.number}</span> <span className="font-medium">{review.title}</span> <span className="text-muted-foreground">{review.repo}</span></span>
+        <span className="ml-auto flex items-center gap-1.5">
+          {busy === "ask" ? <span className="inline-flex items-center gap-1 text-muted-foreground"><Icon name="Loading" className="size-3.5 animate-spin" />sending</span> : null}
+          <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => void run("sync", async () => { await rpc.call("reviews_sync", { reviewId }); refetch(); toast.success("Synced with GitHub"); })} disabled={busy !== null} title="Refresh PR metadata, head, and threads">
+            <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", busy === "sync" && "animate-spin")} />Sync
+          </Button>
+          <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: CODEMAP_TAB, target: { reviewId } })}><Icon name="Layers" className="size-3.5" />Codemap</Button>
+          <Button variant="outline" size="sm" className="h-7 text-xs" onClick={openChat}><Icon name="Brain" className="size-3.5" />Chat</Button>
+          <Button size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: INFO_TAB, target: { reviewId } })}>
+            <Icon name="Github" className="size-3.5" />Review{pending.length > 0 ? ` · ${pending.length}` : ""}
+          </Button>
+        </span>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto w-full max-w-5xl px-6 pb-16 pt-8">
+          <div className="space-y-3">
+            <StatePill state={review.state} isDraft={review.isDraft} />
+            <div className="text-xs text-muted-foreground"><UrlLink href={repoUrl} className="hover:underline">{review.owner}/{review.repo}</UrlLink> #{review.number}</div>
+            <h1 className="text-2xl font-semibold leading-tight tracking-tight">
+              <UrlLink href={review.url} className="hover:underline">{review.title}</UrlLink>
+            </h1>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              {review.author ? <span className="inline-flex items-center gap-1.5"><span className="inline-flex size-5 items-center justify-center rounded-full bg-foreground/10 text-[10px] font-medium uppercase">{review.author[0]}</span>{review.author}</span> : null}
+              <span className="rounded-md border border-border bg-card px-1.5 py-0.5 font-mono">{review.baseRefName}</span>
+              <Icon name="ChevronLeft" className="size-3 text-muted-foreground" />
+              <span className="rounded-md border border-border bg-card px-1.5 py-0.5 font-mono">{review.headRefName}</span>
+              <span className="font-mono text-muted-foreground">{shortSha(review.headSha)}</span>
+            </div>
+            <div className="text-xs text-muted-foreground">
+              Opened {timeAgo(review.createdAt)} · {files.length} files · <span className="text-primary">+{review.additions}</span> <span className="text-destructive">-{review.deletions}</span> · {review.commits.length} commits · synced {timeAgo(review.syncedAt)}
+            </div>
+          </div>
+
+          <div className="mt-6 flex items-center gap-1 border-b border-border text-sm">
+            {([["description", "Description", null], ["discussion", "Discussion", openThreads], ["commits", "Commits", review.commits.length]] as const).map(([id, label, count]) => (
+              <button key={id} type="button" onClick={() => setTab(id)} className={cn("-mb-px border-b-2 px-3 py-2", tab === id ? "border-foreground font-medium" : "border-transparent text-muted-foreground hover:text-foreground")}>
+                {label}{count !== null && count > 0 ? <span className="ml-1.5 rounded-full bg-foreground/10 px-1.5 text-[11px]">{count}</span> : null}
+              </button>
+            ))}
+          </div>
+          <div className="mt-4">
+            {tab === "description" ? <Description body={review.body} /> : tab === "discussion" ? <Discussion reviewId={reviewId} threads={threads} /> : <Commits review={review} />}
+          </div>
+
+          <div className="mt-10 flex flex-wrap items-center gap-3">
+            <h2 className="text-lg font-semibold">Changes</h2>
+            <span className="text-xs text-muted-foreground">{viewedCount}/{files.length} viewed</span>
+            <Progress value={viewedCount} total={files.length} className="w-24" />
+            <span className="text-xs text-muted-foreground">{linesLeft.toLocaleString()} lines left</span>
+            <span className="ml-auto flex items-center gap-1.5">
+              <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Find a file…" className="h-7 w-44 text-xs" aria-label="Filter files" />
+              <select value={diffStyle} onChange={(e) => setDiffStyle(e.target.value as "unified" | "split")} className="h-7 rounded-md border border-input bg-background px-1.5 text-xs" aria-label="Diff style">
+                <option value="unified">Unified</option>
+                <option value="split">Split</option>
+              </select>
+              <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => { setAllCollapsed((v) => !v); setCollapsed(new Set()); setExpandedOverride(new Set()); }}>{allCollapsed ? "Expand all" : "Collapse all"}</Button>
+            </span>
+          </div>
+
+          <div className="mt-3 flex flex-col gap-3">
+            {shown.length === 0 ? <EmptyState>No files match.</EmptyState> : null}
+            {shown.map((f) => {
+              const index = files.indexOf(f);
+              const expanded = isExpanded(f, index);
+              return (
+                <FileCard
+                  key={f.path}
+                  review={review}
+                  file={f}
+                  threads={threadsByPath.get(f.path) ?? []}
+                  pending={pendingByPath.get(f.path) ?? []}
+                  composer={composer?.path === f.path ? composer : null}
+                  selection={selection}
+                  onSelect={setSelection}
+                  onOpenComposer={(path, range) => {
+                    const start = Math.min(range.start, range.end);
+                    const end = Math.max(range.start, range.end);
+                    setComposer({ kind: "composer", path, line: end, startLine: start !== end ? start : null, side: (range.side ?? "additions") === "deletions" ? "LEFT" : "RIGHT", initial: "" });
+                  }}
+                  expanded={expanded}
+                  onToggle={() => toggle(f.path, expanded)}
+                  onViewed={(viewed) => void run("viewed", async () => { await rpc.call("viewed_set", { reviewId, path: f.path, viewed }); refetch(); })}
+                  diffStyle={diffStyle}
+                  theme={theme}
+                  actions={actions}
+                  rpc={rpc}
+                  onAsk={(sel, question) => askAnalyst(question, sel)}
+                  onSummarize={() => askAnalyst(`Summarize the changes to ${f.path} and why they matter for this PR.`, null)}
+                  onCouncil={(text) => setRoomText(text)}
+                />
+              );
+            })}
+          </div>
+        </div>
+      </div>
+      {roomText !== null ? <RoomSender text={roomText} onClose={() => setRoomText(null)} /> : null}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
-// Fixed tabs
+// Side panel tabs
 // ---------------------------------------------------------------------------
 
-function ConversationTab() {
-  const target = useFixedTabTarget(CONVERSATION_TAB);
+function InfoTab() {
+  const target = useFixedTabTarget(INFO_TAB);
   const reviewId = target?.target.reviewId ?? null;
   const { rpc, detail, refetch } = useReview(reviewId);
-  const [conversation, setConversation] = useState<{ comments: { id: number; author: string; body: string; createdAt: string; url: string }[]; reviews: { id: number; author: string; state: string; body: string; submittedAt: string | null; url: string }[] } | null>(null);
   const [event, setEvent] = useState<"COMMENT" | "APPROVE" | "REQUEST_CHANGES">("COMMENT");
   const [body, setBody] = useState("");
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const load = useCallback((refresh = false) => {
-    if (reviewId === null) return;
-    rpc.call("review_conversation", { reviewId, refresh }).then((r) => setConversation({ comments: r.comments, reviews: r.reviews }), () => undefined);
-  }, [rpc, reviewId]);
-  useEffect(() => { load(); }, [load]);
-  if (reviewId === null) return <div className="p-4"><EmptyState>Open a review and press Review to see its conversation here.</EmptyState></div>;
+  const [showAllChecks, setShowAllChecks] = useState(false);
+  if (reviewId === null) return <div className="p-4"><EmptyState>Open a review to see its checks, reviewers, and your pending comments here.</EmptyState></div>;
   if (detail === null) return <div className="p-4"><EmptyState>Loading…</EmptyState></div>;
-  const { review, pending, threads } = detail;
+  const { review, pending } = detail;
+  const ok = (c: Review["checks"][number]) => (c.conclusion ?? "").toLowerCase() === "success" || (c.conclusion ?? "").toLowerCase() === "skipped" || (c.conclusion ?? "").toLowerCase() === "neutral";
+  const failing = (c: Review["checks"][number]) => ["failure", "error", "timed_out", "cancelled", "action_required", "startup_failure"].includes((c.conclusion ?? "").toLowerCase());
+  const passed = review.checks.filter(ok).length;
+  const sortedChecks = [...review.checks].sort((a, b) => Number(failing(b)) - Number(failing(a)) || Number(ok(a)) - Number(ok(b)));
+  const visibleChecks = showAllChecks ? sortedChecks : sortedChecks.slice(0, 6);
   return (
     <div className="flex h-full min-h-0 flex-col text-xs">
-      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3">
+      <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
         <section className="space-y-2">
           <div className="flex items-center justify-between">
-            <span className="text-sm font-semibold">Submit review</span>
+            <span className="text-sm font-semibold">Review</span>
             <span className="text-muted-foreground">{pending.length} pending comment{pending.length === 1 ? "" : "s"}</span>
           </div>
           {pending.length > 0 ? (
             <ul className="space-y-1">
               {pending.map((p) => (
-                <li key={p.id} className="rounded border border-dashed border-foreground/40 px-2 py-1">
-                  <button type="button" onClick={() => scrollToFile(p.path)} className="font-mono hover:underline">{p.path}:{p.startLine && p.startLine !== p.line ? `${p.startLine}-` : ""}{p.line}</button>
+                <li key={p.id} className="rounded-md border border-dashed border-foreground/40 px-2 py-1">
+                  <button type="button" onClick={() => scrollToFile(p.path)} className="font-mono hover:underline">{splitPath(p.path).name}:{p.startLine && p.startLine !== p.line ? `${p.startLine}-` : ""}{p.line}</button>
                   <div className="truncate text-muted-foreground">{p.body.split("\n")[0]}</div>
                 </li>
               ))}
             </ul>
-          ) : null}
-          <form className="space-y-2" onSubmit={async (e: FormEvent) => { e.preventDefault(); setBusy(true); setMessage(null); try { const r = await rpc.call("review_submit", { reviewId, event, body }); setMessage(`Submitted ${r.posted} comment${r.posted === 1 ? "" : "s"}${r.url ? ` · ${r.url}` : ""}`); setBody(""); refetch(); load(true); } catch (cause) { setMessage(describeError(cause)); } finally { setBusy(false); } }}>
-            <div className="flex flex-wrap gap-2">
+          ) : <p className="text-muted-foreground">Select lines in the diff and press Comment to add one.</p>}
+          <form className="space-y-2" onSubmit={async (e: FormEvent) => { e.preventDefault(); setBusy(true); try { const r = await rpc.call("review_submit", { reviewId, event, body }); toast.success(`Submitted ${r.posted} comment${r.posted === 1 ? "" : "s"} to GitHub`); setBody(""); refetch(); } catch (cause) { toast.error(describeError(cause)); } finally { setBusy(false); } }}>
+            <div className="flex flex-wrap gap-3">
               {(["COMMENT", "APPROVE", "REQUEST_CHANGES"] as const).map((ev) => (
-                <label key={ev} className="inline-flex items-center gap-1"><input type="radio" name="event" checked={event === ev} onChange={() => setEvent(ev)} />{ev.replace("_", " ").toLowerCase()}</label>
+                <label key={ev} className="inline-flex items-center gap-1.5"><input type="radio" name="event" checked={event === ev} onChange={() => setEvent(ev)} />{ev === "COMMENT" ? "Comment" : ev === "APPROVE" ? "Approve" : "Request changes"}</label>
               ))}
             </div>
-            <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={3} placeholder="Review body (optional for comment reviews)" className="w-full resize-none rounded-md border border-input bg-transparent px-2 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
-            <div className="flex items-center gap-2">
-              <Button type="submit" size="sm" disabled={busy || (pending.length === 0 && body.trim() === "")}><Icon name="Github" className="size-3.5" />Submit to GitHub</Button>
-              {message ? <span className="text-muted-foreground">{message}</span> : null}
-            </div>
+            <TextArea value={body} onChange={setBody} rows={3} placeholder="Review summary (optional for comment reviews)" />
+            <Button type="submit" size="sm" disabled={busy || (pending.length === 0 && body.trim() === "")}><Icon name="Github" className="size-3.5" />Submit review to GitHub</Button>
           </form>
         </section>
 
-        <section className="space-y-1.5">
-          <div className="text-sm font-semibold">Description</div>
-          <div className="rounded-md border border-border bg-card p-2 text-sm">{review.body.trim() === "" ? <span className="text-muted-foreground">No description.</span> : <Markdown content={review.body} />}</div>
-          {review.labels.length > 0 ? <div className="flex flex-wrap gap-1">{review.labels.map((l) => <span key={l} className="rounded-full border border-border px-1.5">{l}</span>)}</div> : null}
-        </section>
-
-        {review.checks.length > 0 ? (
-          <section className="space-y-1">
-            <div className="text-sm font-semibold">Checks</div>
-            <ul className="space-y-0.5">
-              {review.checks.map((c, i) => (
-                <li key={`${c.name}-${i}`} className="flex items-center gap-2">
-                  <span className={cn("size-2 rounded-full", (c.conclusion ?? "").toLowerCase() === "success" ? "bg-primary" : ["failure", "error"].includes((c.conclusion ?? "").toLowerCase()) ? "bg-destructive" : "bg-muted-foreground/40")} />
-                  {c.url ? <UrlLink href={c.url} className="truncate hover:underline">{c.name}</UrlLink> : <span className="truncate">{c.name}</span>}
-                  <span className="ml-auto text-muted-foreground">{c.conclusion ?? c.status}</span>
-                </li>
-              ))}
-            </ul>
-          </section>
-        ) : null}
-
-        <section className="space-y-1.5">
-          <div className="flex items-center justify-between"><span className="text-sm font-semibold">Review threads ({threads.filter((t) => !t.isResolved).length} open)</span><Button variant="ghost" size="sm" className="h-6 px-1.5" onClick={() => void rpc.call("review_threads_refresh", { reviewId }).then(() => refetch())} aria-label="Refresh threads"><Icon name="ArrowReloadHorizontal" className="size-3" /></Button></div>
-          <ul className="space-y-1">
-            {threads.filter((t) => !t.isResolved).map((t) => (
-              <li key={t.id} className="rounded border border-border px-2 py-1">
-                <button type="button" onClick={() => scrollToFile(t.path)} className="font-mono hover:underline">{t.path}{t.line ? `:${t.line}` : ""}</button>
-                <div className="truncate text-muted-foreground">{t.comments[0]?.author}: {t.comments[0]?.body.split("\n")[0]}</div>
+        <section className="space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-semibold">Checks</span>
+            <span className="text-muted-foreground">{passed}/{review.checks.length}</span>
+          </div>
+          <Progress value={passed} total={review.checks.length} />
+          <ul className="space-y-0.5">
+            {visibleChecks.map((c, i) => (
+              <li key={`${c.name}-${i}`} className="flex items-center gap-2">
+                <span className={cn("size-2 shrink-0 rounded-full", ok(c) ? "bg-primary" : failing(c) ? "bg-destructive" : "bg-muted-foreground/40")} />
+                {c.url ? <UrlLink href={c.url} className="min-w-0 truncate hover:underline">{c.name}</UrlLink> : <span className="min-w-0 truncate">{c.name}</span>}
+                <span className="ml-auto shrink-0 text-muted-foreground">{(c.conclusion ?? c.status).toLowerCase().replace(/_/g, " ")}</span>
               </li>
             ))}
           </ul>
+          {review.checks.length > 6 ? <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs" onClick={() => setShowAllChecks((v) => !v)}>{showAllChecks ? "Show fewer" : `Show all ${review.checks.length}`}</Button> : null}
         </section>
 
-        <section className="space-y-1.5">
-          <div className="flex items-center justify-between"><span className="text-sm font-semibold">Conversation</span><Button variant="ghost" size="sm" className="h-6 px-1.5" onClick={() => load(true)} aria-label="Refresh conversation"><Icon name="ArrowReloadHorizontal" className="size-3" /></Button></div>
-          {conversation === null ? <p className="text-muted-foreground">Loading…</p> : (
-            <ul className="space-y-1.5">
-              {conversation.reviews.map((r) => (
-                <li key={`r-${r.id}`} className="rounded border border-border bg-card p-2">
-                  <div className="text-muted-foreground"><span className="font-medium text-foreground">{r.author}</span> {r.state.replace(/_/g, " ").toLowerCase()}{r.submittedAt ? ` · ${timeAgo(r.submittedAt)}` : ""}</div>
-                  {r.body.trim() !== "" ? <div className="mt-1 text-sm"><Markdown content={r.body} /></div> : null}
-                </li>
-              ))}
-              {conversation.comments.map((c) => (
-                <li key={`c-${c.id}`} className="rounded border border-border bg-card p-2">
-                  <div className="text-muted-foreground"><span className="font-medium text-foreground">{c.author}</span> · {timeAgo(c.createdAt)}</div>
-                  <div className="mt-1 text-sm"><Markdown content={c.body} /></div>
+        <section className="space-y-2">
+          <div className="flex items-center justify-between"><span className="text-sm font-semibold">Reviewers</span><span className="text-muted-foreground">{review.reviewers.length}</span></div>
+          {review.reviewers.length === 0 ? <p className="text-muted-foreground">None yet.</p> : (
+            <ul className="space-y-1">
+              {review.reviewers.map((r) => (
+                <li key={r.login} className="flex items-center gap-2">
+                  <span className="inline-flex size-5 items-center justify-center rounded-full bg-foreground/10 text-[10px] font-medium uppercase">{r.login[0]}</span>
+                  <span className="min-w-0 truncate">{r.login}</span>
+                  <Icon name={reviewStateIcon(r.state)} className={cn("ml-auto size-3.5", reviewStateTone(r.state))} aria-label={r.state} />
                 </li>
               ))}
             </ul>
           )}
+          {review.reviewDecision ? <p className="text-muted-foreground">Decision: {review.reviewDecision.replace(/_/g, " ").toLowerCase()}</p> : null}
+        </section>
+
+        <section className="space-y-2">
+          <span className="text-sm font-semibold">Assignees</span>
+          <p className="text-muted-foreground">{review.assignees.length === 0 ? "No assignees" : review.assignees.join(", ")}</p>
+        </section>
+
+        <section className="space-y-2">
+          <div className="flex items-center justify-between"><span className="text-sm font-semibold">Labels</span><span className="text-muted-foreground">{review.labels.length}</span></div>
+          <div className="flex flex-wrap gap-1">{review.labels.map((l) => <span key={l} className="rounded-full border border-border px-2 py-0.5">{l}</span>)}</div>
         </section>
       </div>
     </div>
   );
 }
 
-function NotesTab() {
-  const target = useFixedTabTarget(NOTES_TAB);
+function ChatTab() {
+  const target = useFixedTabTarget(CHAT_TAB);
   const reviewId = target?.target.reviewId ?? null;
   const { rpc, detail, refetch } = useReview(reviewId);
-  const providers = useProviders();
-  const [providerId, setProviderId] = useState("");
-  const [showDismissed, setShowDismissed] = useState(false);
+  const { providers, defaultProvider } = useProviders();
+  const [providerId, setProviderId] = useChatProvider(providers, defaultProvider);
+  const [starter, setStarter] = useState("");
+  const [busy, setBusy] = useState(false);
   const [roomText, setRoomText] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => { if (providerId === "" && providers[0]) setProviderId(providers[0].id); }, [providers, providerId]);
-  if (reviewId === null) return <div className="p-4"><EmptyState>Open a review and press AI to run passes and read notes here.</EmptyState></div>;
+  if (reviewId === null) return <div className="p-4"><EmptyState>Open a review and press Chat to talk with its analyst here.</EmptyState></div>;
   if (detail === null) return <div className="p-4"><EmptyState>Loading…</EmptyState></div>;
-  const actions: AnnoActions = {
-    reviewId,
-    reply: async () => undefined,
-    resolve: async () => undefined,
-    savePending: async (input) => { await rpc.call("pending_add", { reviewId, ...input }); refetch(); },
-    updatePending: async () => undefined,
-    deletePending: async () => undefined,
-    dismissNote: async (id) => { await rpc.call("note_update", { id, status: "dismissed" }); refetch(); },
-    noteToComment: async (note) => {
-      if (!note.path || !note.startLine) return;
-      await rpc.call("pending_add", { reviewId, path: note.path, line: note.endLine ?? note.startLine, startLine: null, side: note.side === "old" ? "LEFT" : "RIGHT", body: `${note.title}\n\n${note.body}`, noteId: note.id });
+  const seat = detail.seats.find((s) => s.providerId === providerId) ?? null;
+  const send = async (e: FormEvent) => {
+    e.preventDefault();
+    if (starter.trim() === "" || providerId === "") return;
+    setBusy(true);
+    try {
+      await rpc.call("chat_send", { reviewId, providerId, text: starter.trim(), selection: null });
+      setStarter("");
       refetch();
-    },
-    sendToRoom: (text) => setRoomText(text),
-    closeComposer: () => undefined,
+    } catch (cause) {
+      toast.error(describeError(cause));
+    } finally {
+      setBusy(false);
+    }
   };
-  const passes: AiKind[] = ["pass_summary", "pass_risk", "pass_perf", "pass_slop", "pass_tests"];
-  const runPass = (kind: AiKind) => {
-    if (providerId === "") return;
-    rpc.call("ai_ask", { reviewId, kind, providerId }).then(() => refetch(), (c: unknown) => setError(describeError(c)));
+  const addAsComment = async (text: string) => {
+    const sel = readStorage<SelectionRef>(selectionKey(reviewId));
+    if (sel === null) {
+      toast.error("Select lines in the diff first, then use this action to attach the answer there.");
+      return;
+    }
+    try {
+      await rpc.call("pending_add", { reviewId, path: sel.path, line: sel.endLine, startLine: sel.startLine !== sel.endLine ? sel.startLine : null, side: sel.side === "old" ? "LEFT" : "RIGHT", body: text.trim() });
+      toast.success(`Pending comment added at ${splitPath(sel.path).name}:${sel.endLine}`);
+      refetch();
+    } catch (cause) {
+      toast.error(describeError(cause));
+    }
   };
-  const notes = detail.notes.filter((n) => showDismissed || n.status !== "dismissed");
-  const general = notes.filter((n) => n.path === null || n.kind === "summary");
-  const anchored = notes.filter((n) => n.path !== null && n.kind !== "summary");
-  const byPath = new Map<string, Note[]>();
-  for (const n of anchored) byPath.set(n.path as string, [...(byPath.get(n.path as string) ?? []), n]);
   return (
-    <div className="flex h-full min-h-0 flex-col text-xs">
-      <div className="space-y-2 border-b border-border p-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm font-semibold">Passes</span>
-          <ProviderSelect providers={providers} value={providerId} onChange={setProviderId} />
-          <label className="ml-auto inline-flex items-center gap-1 text-muted-foreground"><input type="checkbox" checked={showDismissed} onChange={(e) => setShowDismissed(e.target.checked)} />show dismissed</label>
-        </div>
-        <div className="flex flex-wrap gap-1.5">
-          {passes.map((k) => <Button key={k} size="sm" variant="outline" className="h-7 text-xs" onClick={() => runPass(k)} disabled={providerId === ""}>{KIND_LABELS[k]}</Button>)}
-        </div>
-        {error ? <p className="text-destructive">{error}</p> : null}
-        {detail.requests.filter((r) => r.status === "running").map((r) => (
-          <div key={r.id} className="flex items-center gap-2 text-muted-foreground">
-            <Icon name="Loading" className="size-3.5 animate-spin" />
-            <span>{KIND_LABELS[r.kind]}{r.path ? ` · ${r.path}${r.startLine ? `:${r.startLine}` : ""}` : ""} · {r.providerId} · {timeAgo(r.createdAt)}</span>
-            <Button variant="ghost" size="sm" className="ml-auto h-6 px-2 text-xs" onClick={() => void rpc.call("ai_cancel", { requestId: r.id }).then(() => refetch())}>Cancel</Button>
-          </div>
-        ))}
-        {detail.requests.filter((r) => r.status === "failed").slice(0, 3).map((r) => (
-          <div key={r.id} className="text-destructive">{KIND_LABELS[r.kind]} failed: {r.error}</div>
-        ))}
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex items-center gap-1 border-b border-border px-2 py-1.5 text-xs">
+        {providers.map((p) => {
+          const has = detail.seats.some((s) => s.providerId === p.id);
+          return (
+            <button key={p.id} type="button" onClick={() => setProviderId(p.id)} className={cn("inline-flex items-center gap-1.5 rounded-md px-2 py-1", providerId === p.id ? "bg-state-active font-medium" : "text-muted-foreground hover:bg-state-hover")}>
+              {p.displayName}
+              {has ? <span className="size-1.5 rounded-full bg-primary" aria-label="Chat started" /> : null}
+            </button>
+          );
+        })}
+        {seat ? (
+          <Button variant="ghost" size="sm" className="ml-auto h-6 px-1.5 text-xs" onClick={() => { if (window.confirm("Reset this chat? The analyst starts over with a fresh thread.")) void rpc.call("chat_reset", { reviewId, providerId }).then(() => refetch()); }} title="Start a fresh analyst thread">
+            <Icon name="RotateCcw" className="size-3.5" />Reset
+          </Button>
+        ) : null}
       </div>
-      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
-        {notes.length === 0 ? <EmptyState>No notes yet. Select lines in the diff and press Explain, or run a pass above.</EmptyState> : null}
-        {general.map((n) => <NoteCard key={n.id} note={n} actions={actions} compact />)}
-        {[...byPath.entries()].map(([path, list]) => (
-          <div key={path} className="space-y-1">
-            <button type="button" onClick={() => scrollToFile(path)} className="font-mono text-muted-foreground hover:underline">{path}</button>
-            {list.map((n) => <NoteCard key={n.id} note={n} actions={actions} compact />)}
+      {seat ? (
+        <ThreadChat
+          key={seat.threadId}
+          threadId={seat.threadId}
+          variant="compact"
+          layout="contained"
+          className="min-h-0 flex-1"
+          messageActions={[
+            { id: "add-comment", title: "Add as PR comment on the selected lines", icon: "Edit", roles: ["assistant"], run: (message) => { void addAsComment(message.text); } },
+            { id: "council", title: "Send to the council", icon: "MessageSquare", roles: ["assistant", "user"], run: (message) => setRoomText(message.text) },
+          ]}
+        />
+      ) : (
+        <form onSubmit={send} className="flex min-h-0 flex-1 flex-col justify-center gap-3 p-4 text-sm">
+          <div className="space-y-1 text-center">
+            <p className="font-medium">Chat with this PR</p>
+            <p className="text-xs text-muted-foreground">
+              The analyst runs in a worktree at the PR head with the full diff, description, and repository at hand. It reads, it never edits. Select lines in the diff and press Ask to bring code into the conversation.
+            </p>
           </div>
-        ))}
-      </div>
+          <TextArea value={starter} onChange={setStarter} rows={4} placeholder="What should I read first? Where are the risks? What does this change for callers of X?" autoFocus />
+          <div className="flex items-center justify-between text-xs text-muted-foreground">
+            <span>{providers.find((p) => p.id === providerId)?.displayName ?? "no provider"}</span>
+            <Button type="submit" size="sm" disabled={busy || starter.trim() === "" || providerId === ""}>{busy ? <Icon name="Loading" className="size-3.5 animate-spin" /> : <Icon name="Sent" className="size-3.5" />}Start chat</Button>
+          </div>
+        </form>
+      )}
       {roomText !== null ? <RoomSender text={roomText} onClose={() => setRoomText(null)} /> : null}
     </div>
   );
@@ -1151,9 +1135,9 @@ function CodemapTab() {
   const reviewId = target?.target.reviewId ?? null;
   const { state, error, refresh } = useCodemap(reviewId, reviewId !== null);
   const [filter, setFilter] = useState("");
-  if (reviewId === null) return <div className="p-4"><EmptyState>Open a review and choose Codemap to see its structure here.</EmptyState></div>;
+  if (reviewId === null) return <div className="p-4"><EmptyState>Open a review and press Codemap to see its structure here.</EmptyState></div>;
   if (error) return <p className="p-3 text-xs text-destructive">{error}</p>;
-  if (state === null || state.status === "building" || state.status === "missing") return <p className="inline-flex items-center gap-1.5 p-3 text-xs text-muted-foreground"><Icon name="Loading" className="size-3.5 animate-spin" />Building the codemap…</p>;
+  if (state === null || state.status === "building" || state.status === "missing") return <p className="inline-flex items-center gap-1.5 p-3 text-xs text-muted-foreground"><Icon name="Loading" className="size-3.5 animate-spin" />Building the codemap: parsing changed files and counting references…</p>;
   if (state.status === "failed" || state.codemap === null) return <div className="space-y-2 p-3 text-xs"><p className="text-destructive">{state.error ?? "Codemap failed."}</p><Button size="sm" variant="outline" onClick={refresh}>Retry</Button></div>;
   const c: Codemap = state.codemap;
   const files = c.files.filter((f) => f.symbols.some((s) => s.status !== "unchanged")).filter((f) => filter === "" || f.path.toLowerCase().includes(filter.toLowerCase()));
@@ -1161,29 +1145,58 @@ function CodemapTab() {
     <div className="flex h-full min-h-0 flex-col text-xs">
       <div className="flex flex-wrap items-center gap-2 border-b border-border p-3">
         <span className="text-sm font-semibold">Codemap</span>
-        <span className="text-muted-foreground">{c.engine} · {c.stats.files} files · {c.stats.symbols} symbols · {c.edges.length} references{c.stats.parseFailures > 0 ? ` · ${c.stats.parseFailures} parse fallbacks` : ""}</span>
-        <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter…" className="ml-auto h-7 w-40 text-xs" />
-        <Button variant="ghost" size="sm" className="h-7 px-1.5" onClick={refresh} aria-label="Rebuild codemap"><Icon name="ArrowReloadHorizontal" className="size-3.5" /></Button>
+        <span className="text-muted-foreground">{c.stats.symbols} symbols · +{c.stats.added} ~{c.stats.modified} -{c.stats.removed} · {c.edges.length} references</span>
+        <Button variant="ghost" size="sm" className="ml-auto h-7 px-1.5" onClick={refresh} aria-label="Rebuild codemap"><Icon name="ArrowReloadHorizontal" className="size-3.5" /></Button>
       </div>
-      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
-        {files.map((f) => (
-          <div key={f.path} className="rounded-md border border-border bg-card">
-            <button type="button" onClick={() => scrollToFile(f.path)} className="flex w-full items-center gap-2 border-b border-border/60 px-2 py-1.5 text-left font-mono hover:underline">
-              <span className="min-w-0 flex-1 truncate">{f.path}</span>
-              <span className="text-muted-foreground">{f.lang ?? "text"} · {f.changedLines} lines</span>
-            </button>
-            <ul className="divide-y divide-border/60">
-              {f.symbols.filter((s) => s.status !== "unchanged").map((s) => (
-                <li key={`${s.kind}:${s.qualified}`} className="flex flex-wrap items-center gap-2 px-2 py-1">
-                  <span className={cn("w-14 shrink-0 rounded-full border px-1.5 text-center text-[10px] uppercase", s.status === "added" ? "border-primary/50 text-primary" : s.status === "removed" ? "border-destructive/50 text-destructive" : "border-border text-muted-foreground")}>{s.status}</span>
-                  <span className="text-muted-foreground">{s.kind}</span>
-                  <span className="min-w-0 flex-1 truncate font-mono" title={s.qualified}>{s.qualified}</span>
-                  <span className="text-muted-foreground">{s.status === "removed" ? `old ${s.oldStart}-${s.oldEnd}` : `${s.start}-${s.end}`} · Δ{s.changedLines}{s.fanIn > 0 ? ` · fan-in ${s.fanIn}` : ""}{s.refs.length > 0 ? ` · uses ${s.refs.length}` : ""}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ))}
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3">
+        <section className="space-y-1.5">
+          <div className="font-medium">Reading order</div>
+          <ol className="space-y-1.5">
+            {c.readingOrder.map((m, i) => (
+              <li key={m.module} className="rounded-md border border-border p-2">
+                <div className="flex items-center gap-1.5"><span className="text-muted-foreground">{i + 1}.</span><span className="font-mono font-medium">{m.module}</span><span className="ml-auto text-muted-foreground">{m.paths.length} files</span></div>
+                <div className="text-[11px] text-muted-foreground">{m.reason}</div>
+                <ul className="mt-1 space-y-0.5">
+                  {m.paths.map((p) => <li key={p}><button type="button" onClick={() => scrollToFile(p)} className="w-full truncate text-left font-mono text-[11px] hover:underline" title={p}>{p.split("/").slice(2).join("/") || p}</button></li>)}
+                </ul>
+              </li>
+            ))}
+          </ol>
+        </section>
+        <section className="space-y-1.5">
+          <div className="font-medium">Hotspots</div>
+          <ul className="space-y-0.5">
+            {c.hotspots.slice(0, 12).map((h) => (
+              <li key={`${h.path}#${h.qualified}`}>
+                <button type="button" onClick={() => scrollToFile(h.path)} className="flex w-full items-center gap-2 text-left hover:underline" title={`${h.path} · ${h.changedLines} changed lines · fan-in ${h.fanIn}`}>
+                  <span className="w-10 shrink-0 text-right font-mono text-muted-foreground">{Math.round(h.score)}</span>
+                  <span className="min-w-0 flex-1 truncate font-mono">{h.qualified}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+        <section className="space-y-1.5">
+          <div className="flex items-center gap-2"><span className="font-medium">Changed symbols</span><Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter files…" className="ml-auto h-7 w-40 text-xs" /></div>
+          {files.map((f) => (
+            <div key={f.path} className="rounded-md border border-border bg-card">
+              <button type="button" onClick={() => scrollToFile(f.path)} className="flex w-full items-center gap-2 border-b border-border/60 px-2 py-1.5 text-left font-mono hover:underline">
+                <span className="min-w-0 flex-1 truncate">{f.path}</span>
+                <span className="text-muted-foreground">{f.changedLines} lines</span>
+              </button>
+              <ul className="divide-y divide-border/60">
+                {f.symbols.filter((s) => s.status !== "unchanged").map((s) => (
+                  <li key={`${s.kind}:${s.qualified}`} className="flex items-center gap-2 px-2 py-1">
+                    <span className={cn("w-14 shrink-0 rounded-full border px-1.5 text-center text-[10px] uppercase", s.status === "added" ? "border-primary/50 text-primary" : s.status === "removed" ? "border-destructive/50 text-destructive" : "border-border text-muted-foreground")}>{s.status}</span>
+                    <span className="text-muted-foreground">{s.kind}</span>
+                    <span className="min-w-0 flex-1 truncate font-mono" title={s.qualified}>{s.qualified}</span>
+                    <span className="shrink-0 text-muted-foreground">{s.status === "removed" ? `old ${s.oldStart}-${s.oldEnd}` : `${s.start}-${s.end}`}{s.fanIn > 0 ? ` · ${s.fanIn} refs` : ""}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </section>
       </div>
     </div>
   );
@@ -1202,6 +1215,7 @@ function ReviewsPage({ subPath }: { subPath: string }) {
   const [openError, setOpenError] = useState<string | null>(null);
   const [head] = subPath.split("/");
   const reviewId = head !== "" ? head : null;
+  if (reviewId !== null) return <ReviewView key={reviewId} reviewId={reviewId} />;
   const open = async (e: FormEvent) => {
     e.preventDefault();
     if (ref.trim() === "") return;
@@ -1218,55 +1232,39 @@ function ReviewsPage({ subPath }: { subPath: string }) {
       setOpening(false);
     }
   };
-  if (reviewId !== null) {
-    return (
-      <div className="flex h-full min-h-0 flex-col">
-        <div className="flex items-center gap-2 border-b border-border px-2 py-1 text-xs">
-          <Button variant="ghost" size="sm" className="h-6 px-1.5" onClick={() => navigate.toPluginPanel(PANEL_PATH)} aria-label="Back to reviews">
-            <Icon name="ChevronLeft" className="size-3.5" />
-            Reviews
-          </Button>
-          {reviews && reviews.length > 1 ? (
-            <select value={reviewId} onChange={(e) => navigate.toPluginPanel(PANEL_PATH, { subPath: e.target.value })} className="h-6 max-w-xs truncate rounded-md border border-input bg-background px-1.5 text-xs" aria-label="Switch review">
-              {reviews.map((r) => <option key={r.id} value={r.id}>{r.owner}/{r.repo}#{r.number} {r.title}</option>)}
-            </select>
-          ) : null}
-        </div>
-        <div className="min-h-0 flex-1">
-          <ReviewView key={reviewId} reviewId={reviewId} />
-        </div>
-      </div>
-    );
-  }
   return (
-    <div className="flex h-full min-h-0">
-      <aside className="flex w-72 shrink-0 flex-col border-r border-border">
-        <form onSubmit={open} className="space-y-1.5 border-b border-border p-2">
-          <Input value={ref} onChange={(e) => setRef(e.target.value)} placeholder="PR URL or owner/repo#123" className="h-8 text-xs" aria-label="Pull request" />
-          <Button type="submit" size="sm" className="h-7 w-full text-xs" disabled={opening || ref.trim() === ""}>
-            {opening ? <Icon name="Loading" className="size-3.5 animate-spin" /> : <Icon name="GitPullRequest" className="size-3.5" />}
-            {opening ? "Fetching PR and worktree…" : "Open review"}
+    <div className="h-full min-h-0 overflow-y-auto">
+      <div className="mx-auto w-full max-w-2xl px-6 py-12">
+        <h1 className="text-2xl font-semibold tracking-tight">Reviews</h1>
+        <p className="mt-1 text-sm text-muted-foreground">Open a pull request to read it with the diff, the conversation, and an analyst that has the code in front of it.</p>
+        <form onSubmit={open} className="mt-6 flex items-center gap-2">
+          <Input value={ref} onChange={(e) => setRef(e.target.value)} placeholder="https://github.com/owner/repo/pull/123 or owner/repo#123" className="h-10" aria-label="Pull request" />
+          <Button type="submit" className="h-10" disabled={opening || ref.trim() === ""}>
+            {opening ? <Icon name="Loading" className="size-4 animate-spin" /> : <Icon name="GitPullRequest" className="size-4" />}
+            {opening ? "Fetching…" : "Open"}
           </Button>
-          {openError ? <p className="text-xs text-destructive">{openError}</p> : null}
         </form>
-        <div className="min-h-0 flex-1 overflow-y-auto px-1.5 py-1.5">
-          {error ? <p className="px-2 text-xs text-destructive">{error}</p> : reviews === null ? <p className="px-2 text-xs text-muted-foreground">Loading…</p> : reviews.length === 0 ? <p className="px-2 text-xs text-muted-foreground">No reviews yet.</p> : (
-            <ul className="space-y-0.5">
+        {openError ? <p className="mt-2 text-sm text-destructive">{openError}</p> : null}
+        <div className="mt-10">
+          <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Recent</div>
+          {error ? <p className="text-sm text-destructive">{error}</p> : reviews === null ? <p className="text-sm text-muted-foreground">Loading…</p> : reviews.length === 0 ? <EmptyState>No reviews yet.</EmptyState> : (
+            <ul className="divide-y divide-border/60 rounded-lg border border-border">
               {reviews.map((r) => (
                 <li key={r.id}>
-                  <button type="button" onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: r.id })} aria-current={r.id === reviewId ? "page" : undefined} className={cn("w-full rounded-md px-2.5 py-2 text-left hover:bg-state-hover", r.id === reviewId && "bg-state-active")}>
-                    <div className="truncate text-sm font-medium">{r.title}</div>
-                    <div className="truncate text-xs text-muted-foreground">{r.owner}/{r.repo}#{r.number} · {r.state.toLowerCase()}{r.pendingCount > 0 ? ` · ${r.pendingCount} pending` : ""}{r.noteCount > 0 ? ` · ${r.noteCount} notes` : ""}</div>
+                  <button type="button" onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: r.id })} className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-state-hover">
+                    <Icon name="GitPullRequest" className={cn("size-4 shrink-0", r.state === "OPEN" ? "text-primary" : "text-muted-foreground")} />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-medium">{r.title}</span>
+                      <span className="block truncate text-xs text-muted-foreground">{r.owner}/{r.repo} #{r.number} · {r.state.toLowerCase()}{r.pendingCount > 0 ? ` · ${r.pendingCount} pending` : ""}</span>
+                    </span>
+                    <span className="shrink-0 text-xs text-muted-foreground">{timeAgo(r.updatedAt)}</span>
                   </button>
                 </li>
               ))}
             </ul>
           )}
         </div>
-      </aside>
-      <main className="min-w-0 flex-1">
-        <div className="p-6"><EmptyState>Paste a pull request URL to start. Review Desk fetches the PR into a detached worktree, renders the diff with inline GitHub threads, and lets you ask an AI about any selection.</EmptyState></div>
-      </main>
+      </div>
     </div>
   );
 }
@@ -1279,8 +1277,8 @@ export default definePluginApp((app) => {
     path: PANEL_PATH,
     component: ReviewsPage,
     fixedTabs: [
-      { ...CONVERSATION_TAB, title: "Review", icon: "Github", layout: "flush", component: ConversationTab },
-      { ...NOTES_TAB, title: "AI notes", icon: "Brain", layout: "flush", component: NotesTab },
+      { ...INFO_TAB, title: "Info", icon: "Info", layout: "flush", component: InfoTab },
+      { ...CHAT_TAB, title: "Chat", icon: "Brain", layout: "flush", component: ChatTab },
       { ...CODEMAP_TAB, title: "Codemap", icon: "Layers", layout: "flush", component: CodemapTab },
     ],
   });
