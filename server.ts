@@ -9,8 +9,9 @@ import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
-import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi, type PluginMentionItem, type PluginMentionSearchContext } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { MENTION_PROVIDER_ID, decodeMentionRef, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
 import {
   changedFileSchema,
   codemapSchema,
@@ -146,6 +147,8 @@ export const rpcContract = defineRpcContract({
       pending: z.array(pendingSchema),
       threads: z.array(ghThreadSchema),
       seats: z.array(seatSchema),
+      /** Project the analyst threads are created in (the composer needs one). */
+      chatProjectId: z.string(),
     }),
   },
   reviews_sync: { input: reviewIdSchema, output: z.object({ review: reviewSchema, headChanged: z.boolean() }) },
@@ -194,6 +197,27 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({ seat: seatSchema }),
   },
+  /**
+   * Start or continue a chat from bb's own new-thread composer: the input is
+   * the composer's prompt blocks (text, @-mention pills, attachments) and the
+   * execution choices the user made on screen. Spawns the seat on first use
+   * with the analyst intro as agent-only context ahead of the message.
+   */
+  chat_start: {
+    input: z.object({
+      reviewId: z.string(),
+      providerId: z.string().min(1),
+      model: z.string().min(1).optional(),
+      reasoningLevel: z.string().optional(),
+      permissionMode: z.string().optional(),
+      serviceTier: z.string().optional(),
+      executionInputSources: z.record(z.string(), z.enum(["client-preference", "explicit"])).optional(),
+      input: z.array(z.record(z.string(), z.unknown())).min(1),
+    }),
+    output: z.object({ seat: seatSchema }),
+  },
+  /** Which review a thread belongs to, if it is one of our analyst seats. */
+  seat_lookup: { input: z.object({ threadId: z.string() }), output: z.object({ seat: z.object({ reviewId: z.string(), providerId: z.string() }).nullable() }) },
   chat_reset: { input: z.object({ reviewId: z.string(), providerId: z.string() }), output: okSchema },
   codemap_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: codemapStateSchema },
   rooms_list: { input: z.null(), output: z.object({ rooms: z.array(z.object({ id: z.string(), title: z.string(), handles: z.array(z.string()) })), available: z.boolean() }) },
@@ -315,6 +339,8 @@ function createStore(db: Database.Database) {
     clearPending: db.prepare<[string]>(`DELETE FROM pending WHERE review_id = ?`),
     seat: db.prepare<[string, string], SeatRow>(`SELECT * FROM seats WHERE review_id = ? AND provider_id = ?`),
     seats: db.prepare<[string], SeatRow>(`SELECT * FROM seats WHERE review_id = ? ORDER BY created_at ASC`),
+    seatByThread: db.prepare<[string], SeatRow>(`SELECT * FROM seats WHERE thread_id = ?`),
+    reviewsByProject: db.prepare<[string], ReviewRow>(`SELECT * FROM reviews WHERE project_id = ? ORDER BY updated_at DESC`),
     upsertSeat: db.prepare<[string, string, string, string | null, number]>(
       `INSERT INTO seats (review_id, provider_id, thread_id, environment_id, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(review_id, provider_id) DO UPDATE SET thread_id = excluded.thread_id, environment_id = excluded.environment_id`,
     ),
@@ -580,6 +606,7 @@ export default async function plugin(bb: BbPluginApi) {
       pending,
       threads,
       seats: q.seats.all(row.id).map(toSeat),
+      chatProjectId: await chatProjectId(row),
     };
   }
 
@@ -605,7 +632,8 @@ export default async function plugin(bb: BbPluginApi) {
       `Your working directory is a detached worktree at the PR head ${row.head_sha}. The merge base with ${row.base_ref} is ${row.base_sha}.`,
       `The full diff is: git diff ${row.base_sha} ${row.head_sha}. One file: git diff ${row.base_sha} ${row.head_sha} -- <path>. Base version of a file: git show ${row.base_sha}:<path>.`,
       "You are read-only: never modify files, never commit, never push. Read files and run read-only commands to verify claims before making them.",
-      "Selected ranges arrive as messages with an excerpt where > marks the selected lines. Answer for the reviewer: specific, concise, citing paths and line numbers. When asked to draft a GitHub comment, write ready-to-post Markdown with no preamble.",
+      "The reviewer attaches code as pills: @-mentions of a line range, a changed file, a changed symbol, a GitHub review thread, or the PR description. Each pill's content arrives with the message as a context block titled \"Context for @<pill>\"; in range excerpts, > marks the selected lines. Treat those blocks as the code the reviewer is pointing at.",
+      "Answer for the reviewer: specific, concise, citing paths and line numbers. When asked to draft a GitHub comment, write ready-to-post Markdown with no preamble.",
       "",
       "PR description:",
       row.body.trim() === "" ? "(none)" : row.body.trim().slice(0, 6000),
@@ -644,15 +672,35 @@ export default async function plugin(bb: BbPluginApi) {
     ].join("\n");
   }
 
+  type SpawnArgs = Parameters<typeof bb.sdk.threads.spawn>[0];
+  type PromptBlocks = Extract<SpawnArgs, { input: unknown }>["input"];
+  type SpawnExecution = Pick<SpawnArgs, "model" | "reasoningLevel" | "permissionMode" | "serviceTier" | "executionInputSources">;
+
+  async function chatProjectId(row: ReviewRow): Promise<string> {
+    if (row.project_id !== null) return row.project_id;
+    const projectId = (await bb.sdk.projects.list({ includePersonal: true })).find((p) => p.kind !== "standard")?.id;
+    if (projectId === undefined) throw new Error("no project to spawn the analyst in");
+    return projectId;
+  }
+
   async function chatSend(reviewId: string, providerId: string, model: string | null, text: string, selection: SelectionRef | null): Promise<Seat> {
     const row = requireReview(reviewId);
     const message = await chatMessage(row, text, selection);
+    return deliver(row, providerId, model === null ? {} : { model }, [{ type: "text", text: message, mentions: [] }]);
+  }
+
+  /**
+   * Send prompt blocks to the provider's seat, spawning it on first use. The
+   * blocks may carry @-mention pills; bb resolves those through our mention
+   * provider when it accepts the message.
+   */
+  async function deliver(row: ReviewRow, providerId: string, execution: SpawnExecution, blocks: PromptBlocks): Promise<Seat> {
     const existing = q.seat.get(row.id, providerId);
     if (existing !== undefined) {
       try {
         const thread = await bb.sdk.threads.get({ threadId: existing.thread_id });
         if (thread.archivedAt === null && thread.deletedAt === null) {
-          await bb.sdk.threads.send({ threadId: existing.thread_id, mode: "auto", input: [{ type: "text", text: message, mentions: [] }] });
+          await bb.sdk.threads.send({ threadId: existing.thread_id, mode: "auto", input: blocks });
           q.touch.run(Date.now(), row.id);
           return toSeat(existing);
         }
@@ -665,26 +713,22 @@ export default async function plugin(bb: BbPluginApi) {
     const provider = providers.find((p) => p.id === providerId);
     if (provider === undefined) throw new Error(`unknown provider ${providerId}`);
     const modes = provider.capabilities.permissionModes;
-    const permissionMode = modes.includes("auto") ? "auto" : modes.includes("accept-edits") ? "accept-edits" : undefined;
+    const permissionMode = execution.permissionMode ?? (modes.includes("auto") ? "auto" : modes.includes("accept-edits") ? "accept-edits" : undefined);
     const knownEnvironment = row.environment_id ?? q.seats.all(row.id).find((s) => s.environment_id !== null)?.environment_id ?? null;
-    const projectId = row.project_id ?? (await bb.sdk.projects.list({ includePersonal: true })).find((p) => p.kind !== "standard")?.id;
-    if (projectId === undefined) throw new Error("no project to spawn the analyst in");
+    const projectId = await chatProjectId(row);
     const thread = await bb.sdk.threads.spawn({
       projectId,
       environment: knownEnvironment !== null
         ? { type: "reuse", environmentId: knownEnvironment }
         : { type: "host", hostId: row.host_id, workspace: { type: "unmanaged", path: row.worktree } },
       providerId,
-      ...(model ? { model } : {}),
+      ...execution,
       ...(permissionMode ? { permissionMode } : {}),
       title: `Review Desk ${row.owner}/${row.repo}#${row.number}: ${provider.displayName}`,
       visibility: hideSeatThreads ? "hidden" : "visible",
       // The intro is agent-only context so the chat transcript starts with the
       // reviewer's own question.
-      input: [
-        { type: "text", text: seatIntro(row), mentions: [], visibility: "agent-only" },
-        { type: "text", text: message, mentions: [] },
-      ],
+      input: [{ type: "text", text: seatIntro(row), mentions: [], visibility: "agent-only" }, ...blocks],
     });
     const now = Date.now();
     q.upsertSeat.run(row.id, providerId, thread.id, knownEnvironment, now);
@@ -748,6 +792,199 @@ export default async function plugin(bb: BbPluginApi) {
       }
     })();
   }
+
+  // -- code pills (mention provider) -----------------------------------------
+  //
+  // `@` in a seat's composer searches this PR: changed files, changed symbols
+  // from the codemap, GitHub review threads, the description, and explicit
+  // `path:10-20` ranges. The picked item becomes a pill in the draft; bb calls
+  // `resolve` when the message is sent and attaches the text as agent-only
+  // context, so the transcript shows the pill and the analyst sees the code.
+
+  interface ChangedSymbol { path: string; qualified: string; kind: string; status: string; start: number; end: number; oldStart: number | null; oldEnd: number | null; changedLines: number; fanIn: number }
+  const symbolCache = new Map<string, { headSha: string; symbols: ChangedSymbol[] }>();
+
+  function changedSymbols(row: ReviewRow): ChangedSymbol[] {
+    const cached = symbolCache.get(row.id);
+    if (cached !== undefined && cached.headSha === row.head_sha) return cached.symbols;
+    const state = codemapState(row);
+    if (state.status !== "ready" || state.codemap === null) return [];
+    const symbols = state.codemap.files.flatMap((f) =>
+      f.symbols
+        .filter((s) => s.status !== "unchanged")
+        .map((s) => ({ path: f.path, qualified: s.qualified.replace(/\s+/g, " "), kind: s.kind, status: s.status, start: s.start, end: s.end, oldStart: s.oldStart, oldEnd: s.oldEnd, changedLines: s.changedLines, fanIn: s.fanIn })),
+    );
+    symbolCache.set(row.id, { headSha: row.head_sha, symbols });
+    return symbols;
+  }
+
+  /** The review a composer talks about: the seat's review for a thread composer, else the project's latest review. */
+  function reviewForComposer(ctx: PluginMentionSearchContext): ReviewRow | null {
+    if (ctx.threadId !== null) {
+      const seat = q.seatByThread.get(ctx.threadId);
+      return seat === undefined ? null : q.review.get(seat.review_id) ?? null;
+    }
+    if (ctx.projectId !== null) return q.reviewsByProject.all(ctx.projectId)[0] ?? null;
+    return null;
+  }
+
+  const baseName = (path: string) => path.slice(path.lastIndexOf("/") + 1);
+
+  function matchScore(haystack: string, query: string, weight: number, fuzzy = false): number {
+    if (query === "") return weight * 0.5;
+    const h = haystack.toLowerCase();
+    if (h === query) return weight * 3;
+    if (h.startsWith(query)) return weight * 2;
+    if (h.includes(query)) return weight;
+    if (!fuzzy || query.length < 3) return 0;
+    // Subsequence match for paths: "kvr/sel" finds kv-router/src/services/selection.
+    let i = 0;
+    for (const ch of h) {
+      if (ch === query[i]) i++;
+      if (i === query.length) return weight * 0.4;
+    }
+    return 0;
+  }
+
+  type ScoredItem = PluginMentionItem & { score: number };
+  const scored = (ref: MentionRef, title: string, subtitle: string, icon: string, score: number): ScoredItem => ({ id: encodeMentionRef(ref), title, subtitle, icon, score });
+
+  function mentionSearch(ctx: PluginMentionSearchContext): PluginMentionItem[] {
+    const row = reviewForComposer(ctx);
+    if (row === null) return [];
+    const raw = ctx.query.trim();
+    const query = raw.toLowerCase();
+    const browsing = query === "";
+    const files = cachedFiles(row) ?? [];
+    const groups: ScoredItem[][] = [];
+
+    // Explicit ranges: path:10-20, path:10, path#L10-L20.
+    const range = /^(.*?)[:#]L?(\d+)(?:-L?(\d+))?$/.exec(raw);
+    if (range !== null) {
+      const needle = range[1].toLowerCase();
+      const a = Number(range[2]);
+      const b = Number(range[3] ?? range[2]);
+      const candidates = needle === "" ? files.slice(0, 3) : files.filter((f) => f.path.toLowerCase().includes(needle)).slice(0, 5);
+      groups.push(candidates.map((f) => {
+        const ref: MentionRef = { kind: "range", reviewId: row.id, path: f.path, startLine: Math.min(a, b), endLine: Math.max(a, b), side: "new" };
+        return scored(ref, mentionLabel(ref), f.path, "Code", 100);
+      }));
+    }
+
+    const maxChanged = Math.max(1, ...files.map((f) => f.additions + f.deletions));
+    const fileItems: ScoredItem[] = [];
+    for (const f of files) {
+      const s = Math.max(matchScore(baseName(f.path), query, 10), matchScore(f.path, query, 6, true));
+      if (s === 0) continue;
+      fileItems.push(scored({ kind: "file", reviewId: row.id, path: f.path }, baseName(f.path), `${f.path} · +${f.additions} -${f.deletions}`, "Code", s + ((f.additions + f.deletions) / maxChanged) * 2));
+    }
+    groups.push(fileItems);
+
+    const symbolItems: ScoredItem[] = [];
+    for (const sym of changedSymbols(row)) {
+      const s = Math.max(matchScore(sym.qualified.split("::").pop() ?? sym.qualified, query, 9), matchScore(sym.qualified, query, 5));
+      if (s === 0) continue;
+      // Removed symbols only exist on the base side.
+      const removed = sym.status === "removed" && sym.oldStart !== null && sym.oldEnd !== null;
+      const ref: MentionRef = removed
+        ? { kind: "symbol", reviewId: row.id, path: sym.path, qualified: sym.qualified, startLine: sym.oldStart ?? 1, endLine: sym.oldEnd ?? 1, side: "old" }
+        : { kind: "symbol", reviewId: row.id, path: sym.path, qualified: sym.qualified, startLine: sym.start, endLine: sym.end, side: "new" };
+      symbolItems.push(scored(ref, sym.qualified, `${sym.kind} ${sym.status} · ${sym.path}:${ref.startLine}-${ref.endLine}${removed ? " (base)" : ""}`, "Workflow", s + Math.min(sym.changedLines, 200) / 100 + Math.min(sym.fanIn, 50) / 50));
+    }
+    groups.push(symbolItems);
+
+    const threadItems: ScoredItem[] = [];
+    for (const t of cachedThreads(row)) {
+      const first = t.comments[0];
+      if (first === undefined) continue;
+      const s = Math.max(matchScore(first.author, query, 6), matchScore(baseName(t.path), query, 4), matchScore(first.body.slice(0, 300), query, 3));
+      if (s === 0) continue;
+      const ref: MentionRef = { kind: "thread", reviewId: row.id, threadId: t.id };
+      threadItems.push(scored(ref, mentionLabel(ref, { author: first.author, path: t.path, line: t.line ?? t.originalLine }), `${t.isResolved ? "resolved" : "open"} · ${first.body.replace(/\s+/g, " ").slice(0, 80)}`, "MessageSquare", s - (t.isResolved ? 2 : 0)));
+    }
+    groups.push(threadItems);
+
+    const prScore = Math.max(matchScore("pr description", query, 8), matchScore("description", query, 8), matchScore(row.title, query, 4));
+    groups.push(prScore > 0 ? [scored({ kind: "pr", reviewId: row.id }, "PR description", row.title, "Info", prScore)] : []);
+
+    // Browsing (empty query) shows a mix; a query ranks everything together.
+    const caps = browsing ? [3, 8, 6, 4, 1] : [5, 40, 40, 40, 1];
+    const items = groups.flatMap((group, i) => group.sort((a, b) => b.score - a.score).slice(0, caps[i]));
+    if (!browsing) items.sort((a, b) => b.score - a.score);
+    return items.slice(0, 24).map(({ score: _score, ...rest }) => rest);
+  }
+
+  async function mentionResolve(itemId: string): Promise<string> {
+    const ref = decodeMentionRef(itemId);
+    if (ref === null) throw new Error("unknown code pill");
+    const row = requireReview(ref.reviewId);
+    const prefix = `${row.owner}/${row.repo}#${row.number}`;
+    const short = (sha: string) => sha.slice(0, 10);
+    switch (ref.kind) {
+      case "range": {
+        const startLine = Math.min(ref.startLine, ref.endLine);
+        const endLine = Math.max(ref.startLine, ref.endLine);
+        return [
+          `${prefix} — ${ref.path} lines ${startLine}-${endLine} (${ref.side === "old" ? `base ${short(row.base_sha)}` : `head ${short(row.head_sha)}`}). Lines marked > are the ones the reviewer selected; the rest is surrounding context.`,
+          "```",
+          await excerpt(row, { path: ref.path, startLine, endLine, side: ref.side }),
+          "```",
+        ].join("\n");
+      }
+      case "file": {
+        const file = (await filesFor(row)).find((f) => f.path === ref.path) ?? null;
+        const result = await host.call("git_patch", { worktree: row.worktree, baseSha: row.base_sha, headSha: row.head_sha, path: ref.path, oldPath: file?.oldPath ?? null }, hostOptions(row));
+        const lines = result.patch.split("\n");
+        const MAX = 400;
+        const body = lines.length > MAX
+          ? [...lines.slice(0, MAX), `... ${lines.length - MAX} more diff lines. Ask about a range with path:start-end, or run: git diff ${row.base_sha} ${row.head_sha} -- ${ref.path}`].join("\n")
+          : result.patch;
+        return [`${prefix} — diff of ${ref.path}${file ? ` (${file.status}, +${file.additions} -${file.deletions})` : ""} from ${short(row.base_sha)} to ${short(row.head_sha)}:`, "```diff", body, "```"].join("\n");
+      }
+      case "symbol": {
+        const file = (await filesFor(row)).find((f) => f.path === ref.path);
+        const shown = await host.call(
+          "git_show",
+          { worktree: row.worktree, sha: ref.side === "old" ? row.base_sha : row.head_sha, path: ref.side === "old" ? file?.oldPath ?? ref.path : ref.path },
+          hostOptions(row),
+        );
+        const lines = (shown.content ?? "").split("\n");
+        const start = Math.max(1, ref.startLine);
+        const end = Math.min(lines.length, Math.max(start, ref.endLine));
+        const MAX = 250;
+        const slice = lines.slice(start - 1, Math.min(end, start - 1 + MAX));
+        const width = String(end).length;
+        const sym = changedSymbols(row).find((s) => s.path === ref.path && s.qualified === ref.qualified);
+        return [
+          `${prefix} — ${ref.qualified}${sym ? ` (${sym.kind}, ${sym.status}, ${sym.changedLines} changed lines, fan-in ${sym.fanIn})` : ""} in ${ref.path} lines ${start}-${end} at ${ref.side === "old" ? `base ${short(row.base_sha)}` : `head ${short(row.head_sha)}`}:`,
+          "```",
+          slice.map((line, i) => `${String(start + i).padStart(width)}| ${line}`).join("\n"),
+          ...(end - start + 1 > MAX ? [`... truncated after ${MAX} lines; read the file for the rest`] : []),
+          "```",
+        ].join("\n");
+      }
+      case "thread": {
+        const thread = cachedThreads(row).find((t) => t.id === ref.threadId);
+        if (thread === undefined) throw new Error("that review thread is not cached; press Sync and try again");
+        const line = thread.line ?? thread.originalLine;
+        const parts = [`${prefix} — GitHub review thread on ${thread.path}${line === null ? "" : `:${line}`} (${thread.isResolved ? "resolved" : "open"}${thread.isOutdated ? ", outdated" : ""}, ${thread.side === "LEFT" ? "base" : "head"} side):`];
+        for (const c of thread.comments) parts.push(`--- @${c.author} (${c.createdAt}):`, c.body.trim());
+        if (line !== null) {
+          parts.push("", "Code at that line:", "```", await excerpt(row, { path: thread.path, startLine: line, endLine: line, side: thread.side === "LEFT" ? "old" : "new" }), "```");
+        }
+        return parts.join("\n");
+      }
+      case "pr":
+        return [`${prefix}: ${row.title}`, `by ${row.author ?? "unknown"} · ${row.base_ref} ← ${row.head_ref} · ${row.state}`, "", row.body.trim() === "" ? "(no description)" : row.body.trim().slice(0, 12_000)].join("\n");
+    }
+  }
+
+  bb.ui.registerMentionProvider({
+    id: MENTION_PROVIDER_ID,
+    label: "This PR",
+    search: (ctx) => mentionSearch(ctx),
+    resolve: async (itemId) => ({ context: await mentionResolve(itemId) }),
+  });
 
   // -- GitHub write paths ----------------------------------------------------
 
@@ -879,6 +1116,23 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: true as const };
     },
     chat_send: async ({ reviewId, providerId, model, text, selection }) => ({ seat: await chatSend(reviewId, providerId, model ?? null, text, selection ?? null) }),
+    chat_start: async ({ reviewId, providerId, model, reasoningLevel, permissionMode, serviceTier, executionInputSources, input }) => {
+      const row = requireReview(reviewId);
+      // The composer already validated these against the provider catalog; the
+      // SDK types are stricter than our wire schema, so narrow here.
+      const execution = {
+        ...(model === undefined ? {} : { model }),
+        ...(reasoningLevel === undefined ? {} : { reasoningLevel }),
+        ...(permissionMode === undefined ? {} : { permissionMode }),
+        ...(serviceTier === undefined ? {} : { serviceTier }),
+        ...(executionInputSources === undefined ? {} : { executionInputSources }),
+      } as SpawnExecution;
+      return { seat: await deliver(row, providerId, execution, input as unknown as PromptBlocks) };
+    },
+    seat_lookup: ({ threadId }) => {
+      const seat = q.seatByThread.get(threadId);
+      return { seat: seat === undefined ? null : { reviewId: seat.review_id, providerId: seat.provider_id } };
+    },
     chat_reset: async ({ reviewId, providerId }) => {
       await chatReset(reviewId, providerId);
       return { ok: true as const };

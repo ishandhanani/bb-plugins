@@ -6,7 +6,7 @@
 // threads, pending comments). The side panel holds Info (checks, reviewers,
 // labels, submit review), Chat (bb's own ThreadChat on an analyst thread that
 // lives in the PR worktree), and Codemap.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { toast } from "sonner";
 import {
@@ -15,19 +15,25 @@ import {
   ThreadChat,
   UrlLink,
   useBbNavigate,
+  useComposer,
+  useComposerView,
   useRealtime,
   useRpc,
   experimental_FileLink as FileLink,
+  experimental_NewThreadComposer as NewThreadComposer,
   experimental_useAppPanel as useAppPanel,
   experimental_useCodeTheme as useCodeTheme,
   experimental_useFixedTabTarget as useFixedTabTarget,
   type ExperimentalPluginFixedTabReference,
   type JsonValue,
+  type NewThreadRequest,
+  type PluginComposerMention,
 } from "@get-bb/plugin-sdk/app";
 import { FileDiff, type DiffLineAnnotation, type FileDiffMetadata, type SelectedLineRange } from "@pierre/diffs/react";
 import { parsePatchFiles } from "@pierre/diffs";
 import type { CodemapState, FileEntry, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, rpcContract } from "./server";
 import type { Codemap, GhThread } from "./host-contract";
+import { MENTION_PROVIDER_ID, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
@@ -40,6 +46,87 @@ const PANEL_PATH = "reviews";
 const REVIEW_CHANGED = "review-changed";
 const PROVIDER_KEY = "review-desk:provider";
 const selectionKey = (reviewId: string) => `review-desk:selection:${reviewId}`;
+
+// ---------------------------------------------------------------------------
+// Code pills
+//
+// A pill is a bb @-mention that our server resolves to code when the message
+// is sent. The diff page cannot write into a composer directly (it lives in
+// the nav panel; the composer lives in the Chat tab), so it queues the pill
+// per review and the composer banner, mounted inside the composer, drains the
+// queue with `useComposer().insertMention`.
+// ---------------------------------------------------------------------------
+
+interface Attach { mention: PluginComposerMention; text?: string }
+const ATTACH_EVENT = "review-desk:attach";
+const SELECTION_EVENT = "review-desk:selection";
+const pendingAttaches = new Map<string, Attach[]>();
+
+function pill(ref: MentionRef): PluginComposerMention {
+  return { provider: MENTION_PROVIDER_ID, id: encodeMentionRef(ref), label: mentionLabel(ref) };
+}
+
+function selectionPill(reviewId: string, sel: SelectionRef): PluginComposerMention {
+  return pill({ kind: "range", reviewId, path: sel.path, startLine: sel.startLine, endLine: sel.endLine, side: sel.side });
+}
+
+function queueAttach(reviewId: string, attach: Attach): void {
+  pendingAttaches.set(reviewId, [...(pendingAttaches.get(reviewId) ?? []), attach]);
+  window.dispatchEvent(new CustomEvent(ATTACH_EVENT, { detail: { reviewId } }));
+}
+
+function drainAttaches(reviewId: string): Attach[] {
+  const list = pendingAttaches.get(reviewId) ?? [];
+  pendingAttaches.delete(reviewId);
+  return list;
+}
+
+/** Review whose "new chat" composer is on screen; that composer scope has no thread id yet. */
+let composingReview: string | null = null;
+const composingListeners = new Set<() => void>();
+function setComposingReview(reviewId: string | null): void {
+  if (composingReview === reviewId) return;
+  composingReview = reviewId;
+  for (const listener of composingListeners) listener();
+}
+function useComposingReview(): string | null {
+  return useSyncExternalStore(
+    (listener) => {
+      composingListeners.add(listener);
+      return () => composingListeners.delete(listener);
+    },
+    () => composingReview,
+  );
+}
+
+const seatLookups = new Map<string, Promise<string | null>>();
+function lookupSeatReview(rpc: ReturnType<typeof useRpc<Contract>>, threadId: string): Promise<string | null> {
+  let promise = seatLookups.get(threadId);
+  if (promise === undefined) {
+    promise = rpc.call("seat_lookup", { threadId }).then((r) => r.seat?.reviewId ?? null, () => null);
+    seatLookups.set(threadId, promise);
+    // Not a seat today may be one later (reset spawns a new thread id, so
+    // negative answers are only cached briefly).
+    void promise.then((id) => { if (id === null) setTimeout(() => seatLookups.delete(threadId), 5000); });
+  }
+  return promise;
+}
+
+/** The diff selection for a review, shared through storage and kept live by an event. */
+function useSelectionRef(reviewId: string | null): SelectionRef | null {
+  const read = () => (reviewId === null ? null : readStorage<SelectionRef>(selectionKey(reviewId)));
+  const [selection, setSelection] = useState<SelectionRef | null>(read);
+  useEffect(() => {
+    setSelection(read());
+    const onChange = (e: Event) => {
+      if ((e as CustomEvent<{ reviewId: string }>).detail.reviewId === reviewId) setSelection(read());
+    };
+    window.addEventListener(SELECTION_EVENT, onChange);
+    return () => window.removeEventListener(SELECTION_EVENT, onChange);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviewId]);
+  return selection;
+}
 
 interface ReviewTarget {
   reviewId: string;
@@ -127,6 +214,7 @@ interface ReviewDetail {
   pending: PendingComment[];
   threads: GhThread[];
   seats: Seat[];
+  chatProjectId: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +526,7 @@ interface FileCardProps {
   theme: { dark: string; light: string; mode: "dark" | "light" };
   actions: AnnoActions;
   rpc: ReturnType<typeof useRpc<Contract>>;
-  onAsk(selection: SelectionRef, question: string): void;
+  onAttach(selection: SelectionRef): void;
   onSummarize(): void;
   onCouncil(text: string): void;
 }
@@ -449,7 +537,6 @@ function FileCard(props: FileCardProps) {
   const [error, setError] = useState<string | null>(null);
   const [visible, setVisible] = useState(false);
   const [menu, setMenu] = useState(false);
-  const [question, setQuestion] = useState("");
   const ref = useRef<HTMLDivElement | null>(null);
   const { name, dir } = splitPath(file.path);
 
@@ -506,13 +593,6 @@ function FileCard(props: FileCardProps) {
     [rpc, review.id, file.path],
   );
 
-  const ask = (e: FormEvent) => {
-    e.preventDefault();
-    if (!selected) return;
-    props.onAsk(toSelectionRef({ path: file.path, range: selected }), question.trim() === "" ? "Explain these lines in the context of the whole PR." : question.trim());
-    setQuestion("");
-  };
-
   return (
     <div ref={ref} id={fileAnchorId(file.path)} className="scroll-mt-3 rounded-lg border border-border bg-card">
       <div className="sticky top-0 z-10 flex items-center gap-2 rounded-t-lg border-b border-border bg-card/95 px-3 py-2 text-xs backdrop-blur">
@@ -543,16 +623,18 @@ function FileCard(props: FileCardProps) {
       </div>
 
       {selected ? (
-        <form onSubmit={ask} className="flex flex-wrap items-center gap-2 border-b border-border bg-background px-3 py-2 text-xs">
+        <div className="flex flex-wrap items-center gap-2 border-b border-border bg-background px-3 py-2 text-xs">
           <span className="font-mono text-muted-foreground">
             L{Math.min(selected.start, selected.end)}{selected.start !== selected.end ? `–${Math.max(selected.start, selected.end)}` : ""}{selected.side === "deletions" ? " (base)" : ""}
           </span>
-          <Input autoFocus value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Ask the analyst about these lines…" className="h-7 min-w-56 flex-1 text-xs" aria-label="Question about the selected lines" />
-          <Button type="submit" size="sm" className="h-7 text-xs"><Icon name="Brain" className="size-3.5" />Ask</Button>
+          <Button type="button" size="sm" className="h-7 text-xs" onClick={() => props.onAttach(toSelectionRef({ path: file.path, range: selected }))} title="Put these lines in the chat as a pill, then ask (shortcut: a)">
+            <Icon name="Brain" className="size-3.5" />Add to chat<kbd className="ml-1 rounded border border-primary-foreground/40 px-1 font-mono text-[10px] opacity-80">a</kbd>
+          </Button>
           <Button type="button" variant="outline" size="sm" className="h-7 text-xs" onClick={() => props.onOpenComposer(file.path, selected)}><Icon name="Edit" className="size-3.5" />Comment</Button>
           <Button type="button" variant="outline" size="sm" className="h-7 text-xs" onClick={() => props.onCouncil(`${review.owner}/${review.repo}#${review.number} · ${file.path}:${Math.min(selected.start, selected.end)}-${Math.max(selected.start, selected.end)} (head ${shortSha(review.headSha)})\n\nPlease look at this range.`)} title="Send this range to a Roundtable room"><Icon name="MessageSquare" className="size-3.5" />Council</Button>
+          <span className="flex-1" />
           <Button type="button" variant="ghost" size="sm" className="h-7 w-7 px-0" onClick={() => props.onSelect(null)} aria-label="Clear selection"><Icon name="X" className="size-3.5" /></Button>
-        </form>
+        </div>
       ) : null}
 
       {!expanded ? null : file.binary ? (
@@ -746,8 +828,6 @@ function ReviewView({ reviewId }: { reviewId: string }) {
   const { rpc, detail, error, refetch } = useReview(reviewId);
   const panel = useAppPanel();
   const navigate = useBbNavigate();
-  const { providers, defaultProvider } = useProviders();
-  const [providerId] = useChatProvider(providers, defaultProvider);
   const codeTheme = useCodeTheme();
   const [tab, setTab] = useState<Tab>("description");
   const [diffStyle, setDiffStyle] = useState<"unified" | "split">("unified");
@@ -763,6 +843,7 @@ function ReviewView({ reviewId }: { reviewId: string }) {
   const setSelection = useCallback((next: Selection | null) => {
     setSelectionState(next);
     writeStorage(selectionKey(reviewId), next === null ? null : toSelectionRef(next));
+    window.dispatchEvent(new CustomEvent(SELECTION_EVENT, { detail: { reviewId } }));
   }, [reviewId]);
 
   const theme = useMemo(() => {
@@ -796,17 +877,26 @@ function ReviewView({ reviewId }: { reviewId: string }) {
 
   const openChat = () => panel.openFixedTab({ surface: { kind: "current" }, tab: CHAT_TAB, target: { reviewId } });
 
-  const askAnalyst = (text: string, sel: SelectionRef | null) => {
-    if (providerId === "") {
-      toast.error("No AI provider is available.");
-      return;
-    }
-    void run("ask", async () => {
-      await rpc.call("chat_send", { reviewId, providerId, text, selection: sel });
-      openChat();
-      refetch();
-    });
-  };
+  /** Put a pill (and optional text) in the chat composer, opening the Chat tab so its composer is on screen to receive it. */
+  const attachToChat = useCallback((mention: PluginComposerMention, text?: string) => {
+    queueAttach(reviewId, text === undefined ? { mention } : { mention, text });
+    openChat();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviewId]);
+
+  // `a` with lines selected drops them into the chat; ignored while typing.
+  useEffect(() => {
+    if (selection === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "a" || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
+      e.preventDefault();
+      attachToChat(selectionPill(reviewId, toSelectionRef(selection)));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selection, reviewId, attachToChat]);
 
   if (error !== null) return <div className="p-6"><p role="alert" className="text-sm text-destructive">{error}</p></div>;
   if (detail === null) return <div className="p-6"><EmptyState>Loading review…</EmptyState></div>;
@@ -844,7 +934,6 @@ function ReviewView({ reviewId }: { reviewId: string }) {
         <Icon name="GitPullRequest" className="size-3.5 text-muted-foreground" />
         <span className="min-w-0 truncate"><span className="text-muted-foreground">#{review.number}</span> <span className="font-medium">{review.title}</span> <span className="text-muted-foreground">{review.repo}</span></span>
         <span className="ml-auto flex items-center gap-1.5">
-          {busy === "ask" ? <span className="inline-flex items-center gap-1 text-muted-foreground"><Icon name="Loading" className="size-3.5 animate-spin" />sending</span> : null}
           <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => void run("sync", async () => { await rpc.call("reviews_sync", { reviewId }); refetch(); toast.success("Synced with GitHub"); })} disabled={busy !== null} title="Refresh PR metadata, head, and threads">
             <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", busy === "sync" && "animate-spin")} />Sync
           </Button>
@@ -929,8 +1018,8 @@ function ReviewView({ reviewId }: { reviewId: string }) {
                   theme={theme}
                   actions={actions}
                   rpc={rpc}
-                  onAsk={(sel, question) => askAnalyst(question, sel)}
-                  onSummarize={() => askAnalyst(`Summarize the changes to ${f.path} and why they matter for this PR.`, null)}
+                  onAttach={(sel) => attachToChat(selectionPill(reviewId, sel))}
+                  onSummarize={() => attachToChat(pill({ kind: "file", reviewId, path: f.path }), "Summarize these changes and why they matter for this PR.")}
                   onCouncil={(text) => setRoomText(text)}
                 />
               );
@@ -1046,25 +1135,38 @@ function ChatTab() {
   const { rpc, detail, refetch } = useReview(reviewId);
   const { providers, defaultProvider } = useProviders();
   const [providerId, setProviderId] = useChatProvider(providers, defaultProvider);
-  const [starter, setStarter] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [composing, setComposing] = useState(false);
   const [roomText, setRoomText] = useState<string | null>(null);
+  const seats = detail?.seats ?? [];
+  const seat = composing ? null : seats.find((s) => s.providerId === providerId) ?? seats[0] ?? null;
+
+  // The "new chat" composer has no thread yet; tell the composer banner which
+  // review it belongs to so queued pills land in it.
+  useEffect(() => {
+    if (reviewId === null || detail === null || seat !== null) return;
+    setComposingReview(reviewId);
+    return () => setComposingReview(null);
+  }, [reviewId, detail, seat]);
+
   if (reviewId === null) return <div className="p-4"><EmptyState>Open a review and press Chat to talk with its analyst here.</EmptyState></div>;
   if (detail === null) return <div className="p-4"><EmptyState>Loading…</EmptyState></div>;
-  const seat = detail.seats.find((s) => s.providerId === providerId) ?? null;
-  const send = async (e: FormEvent) => {
-    e.preventDefault();
-    if (starter.trim() === "" || providerId === "") return;
-    setBusy(true);
-    try {
-      await rpc.call("chat_send", { reviewId, providerId, text: starter.trim(), selection: null });
-      setStarter("");
-      refetch();
-    } catch (cause) {
-      toast.error(describeError(cause));
-    } finally {
-      setBusy(false);
-    }
+  const { review } = detail;
+  const displayName = (id: string) => providers.find((p) => p.id === id)?.displayName ?? id;
+
+  const start = async (request: NewThreadRequest) => {
+    await rpc.call("chat_start", {
+      reviewId,
+      providerId: request.providerId,
+      model: request.model,
+      reasoningLevel: request.reasoningLevel,
+      permissionMode: request.permissionMode,
+      ...(request.serviceTier === undefined ? {} : { serviceTier: request.serviceTier }),
+      executionInputSources: request.executionInputSources as Record<string, "client-preference" | "explicit">,
+      input: request.input as unknown as Record<string, unknown>[],
+    });
+    setProviderId(request.providerId);
+    setComposing(false);
+    refetch();
   };
   const addAsComment = async (text: string) => {
     const sel = readStorage<SelectionRef>(selectionKey(reviewId));
@@ -1083,17 +1185,16 @@ function ChatTab() {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center gap-1 border-b border-border px-2 py-1.5 text-xs">
-        {providers.map((p) => {
-          const has = detail.seats.some((s) => s.providerId === p.id);
-          return (
-            <button key={p.id} type="button" onClick={() => setProviderId(p.id)} className={cn("inline-flex items-center gap-1.5 rounded-md px-2 py-1", providerId === p.id ? "bg-state-active font-medium" : "text-muted-foreground hover:bg-state-hover")}>
-              {p.displayName}
-              {has ? <span className="size-1.5 rounded-full bg-primary" aria-label="Chat started" /> : null}
-            </button>
-          );
-        })}
+        {seats.map((s) => (
+          <button key={s.providerId} type="button" onClick={() => { setProviderId(s.providerId); setComposing(false); }} className={cn("inline-flex items-center gap-1.5 rounded-md px-2 py-1", seat?.providerId === s.providerId ? "bg-state-active font-medium" : "text-muted-foreground hover:bg-state-hover")}>
+            {displayName(s.providerId)}
+          </button>
+        ))}
+        <button type="button" onClick={() => setComposing(true)} className={cn("inline-flex items-center gap-1 rounded-md px-2 py-1", seat === null ? "bg-state-active font-medium" : "text-muted-foreground hover:bg-state-hover")} title="Start a chat with another provider">
+          <Icon name="Plus" className="size-3.5" />{seats.length === 0 ? "New chat" : null}
+        </button>
         {seat ? (
-          <Button variant="ghost" size="sm" className="ml-auto h-6 px-1.5 text-xs" onClick={() => { if (window.confirm("Reset this chat? The analyst starts over with a fresh thread.")) void rpc.call("chat_reset", { reviewId, providerId }).then(() => refetch()); }} title="Start a fresh analyst thread">
+          <Button variant="ghost" size="sm" className="ml-auto h-6 px-1.5 text-xs" onClick={() => { if (window.confirm("Reset this chat? The analyst starts over with a fresh thread.")) void rpc.call("chat_reset", { reviewId, providerId: seat.providerId }).then(() => refetch()); }} title="Start a fresh analyst thread">
             <Icon name="RotateCcw" className="size-3.5" />Reset
           </Button>
         ) : null}
@@ -1111,21 +1212,90 @@ function ChatTab() {
           ]}
         />
       ) : (
-        <form onSubmit={send} className="flex min-h-0 flex-1 flex-col justify-center gap-3 p-4 text-sm">
-          <div className="space-y-1 text-center">
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex-1 overflow-y-auto p-4 text-sm">
             <p className="font-medium">Chat with this PR</p>
-            <p className="text-xs text-muted-foreground">
-              The analyst runs in a worktree at the PR head with the full diff, description, and repository at hand. It reads, it never edits. Select lines in the diff and press Ask to bring code into the conversation.
+            <p className="mt-1 text-xs text-muted-foreground">
+              The analyst runs in a worktree at the PR head with the full diff, description, and repository at hand. It reads, it never edits.
             </p>
+            <ul className="mt-3 space-y-1.5 text-xs text-muted-foreground">
+              <li><kbd className="rounded border border-border px-1 font-mono">@</kbd> attaches a changed file, symbol, review thread, or <span className="font-mono">path:10-20</span> as a pill.</li>
+              <li>Select lines in the diff and press <kbd className="rounded border border-border px-1 font-mono">a</kbd> or <span className="text-foreground">Add to chat</span>.</li>
+              <li>Pills turn into code when you send. You keep a short transcript; the analyst gets the excerpt.</li>
+            </ul>
           </div>
-          <TextArea value={starter} onChange={setStarter} rows={4} placeholder="What should I read first? Where are the risks? What does this change for callers of X?" autoFocus />
-          <div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span>{providers.find((p) => p.id === providerId)?.displayName ?? "no provider"}</span>
-            <Button type="submit" size="sm" disabled={busy || starter.trim() === "" || providerId === ""}>{busy ? <Icon name="Loading" className="size-3.5 animate-spin" /> : <Icon name="Sent" className="size-3.5" />}Start chat</Button>
+          <div className="border-t border-border p-2">
+            <NewThreadComposer
+              defaultProjectId={detail.chatProjectId}
+              defaultProviderId={providerId || defaultProvider || undefined}
+              defaultEnvironment={review.environmentId ? { type: "reuse", environmentId: review.environmentId } : { type: "host", hostId: review.hostId, workspace: { type: "unmanaged", path: review.worktree } }}
+              placeholder="Ask about the PR. @ attaches code, a adds the selected lines."
+              layout="contained"
+              draftKey={`review-desk:${reviewId}`}
+              onSubmit={start}
+            />
           </div>
-        </form>
+        </div>
       )}
       {roomText !== null ? <RoomSender text={roomText} onClose={() => setRoomText(null)} /> : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Composer banner: lives inside every thread and new-thread composer, shows
+// only for our analyst composers. Drains queued pills and offers the current
+// diff selection.
+// ---------------------------------------------------------------------------
+
+function PillBanner() {
+  const view = useComposerView();
+  const composer = useComposer();
+  const rpc = useRpc<Contract>();
+  const scope = view.scope;
+  const threadId = scope.kind === "thread" ? scope.threadId : null;
+  const composing = useComposingReview();
+  const [seatReview, setSeatReview] = useState<string | null>(null);
+  useEffect(() => {
+    if (threadId === null) {
+      setSeatReview(null);
+      return;
+    }
+    let cancelled = false;
+    void lookupSeatReview(rpc, threadId).then((id) => { if (!cancelled) setSeatReview(id); });
+    return () => { cancelled = true; };
+  }, [threadId, rpc]);
+  const reviewId = scope.kind === "thread" ? seatReview : scope.kind === "new-thread" ? composing : null;
+  const selection = useSelectionRef(reviewId);
+
+  const composerRef = useRef(composer);
+  composerRef.current = composer;
+  useEffect(() => {
+    if (reviewId === null) return;
+    const drain = () => {
+      const list = drainAttaches(reviewId);
+      if (list.length === 0) return;
+      for (const attach of list) {
+        composerRef.current.insertMention(attach.mention);
+        if (attach.text) composerRef.current.updateText((t) => `${t.trim() === "" ? "" : `${t.trimEnd()} `}${attach.text}`);
+      }
+      composerRef.current.focus();
+    };
+    drain();
+    const onAttach = (e: Event) => { if ((e as CustomEvent<{ reviewId: string }>).detail.reviewId === reviewId) drain(); };
+    window.addEventListener(ATTACH_EVENT, onAttach);
+    return () => window.removeEventListener(ATTACH_EVENT, onAttach);
+  }, [reviewId]);
+
+  if (reviewId === null || selection === null) return null;
+  const label = mentionLabel({ kind: "range", reviewId, path: selection.path, startLine: selection.startLine, endLine: selection.endLine, side: selection.side });
+  return (
+    <div className="flex items-center gap-2 px-1 pb-1 text-xs text-muted-foreground">
+      <Icon name="Code" className="size-3.5 shrink-0" />
+      <span className="min-w-0 truncate">Selected <span className="font-mono text-foreground">{label}</span>{splitPath(selection.path).dir ? <span> in {splitPath(selection.path).dir}</span> : null}</span>
+      <button type="button" className="ml-auto shrink-0 rounded-md border border-border px-2 py-0.5 hover:bg-state-hover" onClick={() => { composer.insertMention(selectionPill(reviewId, selection)); composer.focus(); }}>
+        Add to chat
+      </button>
     </div>
   );
 }
@@ -1281,5 +1451,10 @@ export default definePluginApp((app) => {
       { ...CHAT_TAB, title: "Chat", icon: "Brain", layout: "flush", component: ChatTab },
       { ...CODEMAP_TAB, title: "Codemap", icon: "Layers", layout: "flush", component: CodemapTab },
     ],
+  });
+  app.composer.customize({
+    id: "code-pills",
+    scopes: ["thread", "new-thread"],
+    banners: [{ id: "selection", chrome: "bare", component: PillBanner }],
   });
 });

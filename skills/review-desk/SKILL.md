@@ -12,8 +12,8 @@ The first message gives the base and head shas. The PR diff is `git diff <base> 
 ## How requests arrive
 
 - A plain question about the PR.
-- A selected range: a message with the path, the line range, and an excerpt where `>` marks the selected lines, followed by the question. Answer about those lines in the context of the whole change.
-- "Summarize the changes to <path>": explain what changed in that file and why it matters, in under 150 words.
+- A question with code pills. The reviewer attaches a line range (`mod.rs:40-70`), a changed file (`mod.rs`), a changed symbol (`SelectionCore::schedule_selection`), a GitHub review thread (`@alice on mod.rs:66`), or the `PR description` as @-mentions. Each pill's content arrives with the message as a block titled `Context for @<pill>`: for a range, an excerpt where `>` marks the selected lines; for a file, its diff; for a symbol, its source at the head (or at the base, if removed); for a thread, the comments and the code at that line. Treat those blocks as the code the reviewer is pointing at and answer about it in the context of the whole change.
+- A file pill with "Summarize these changes and why they matter for this PR": explain what changed in that file and why it matters, in under 150 words.
 
 ## How to answer
 
