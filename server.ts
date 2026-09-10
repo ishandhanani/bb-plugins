@@ -61,6 +61,12 @@ const participantSchema = z.object({
   relayedChars: z.number(),
   lastStance: stanceSchema.nullable(),
   removed: z.boolean(),
+  /** What the seat is doing right now, when it is working; null otherwise. */
+  activity: z.string().nullable(),
+  /** When the current turn was handed to the seat, for an elapsed timer. */
+  activeSince: z.number().nullable(),
+  /** Context window used, in percent, when the provider reports it. */
+  contextPct: z.number().nullable(),
 });
 export type Participant = z.infer<typeof participantSchema>;
 
@@ -1450,6 +1456,64 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  interface LooseRow {
+    kind?: string;
+    status?: string;
+    workKind?: string;
+    command?: string;
+    toolName?: string;
+    path?: string;
+    children?: LooseRow[] | null;
+    presentation?: { label?: { pending?: string; completed?: string }; title?: string } | null;
+  }
+
+  function firstLine(text: string, max = 110): string {
+    const line = text.split("\n").map((l) => l.trim()).find((l) => l !== "") ?? "";
+    return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+  }
+
+  function describeRow(row: LooseRow): string | null {
+    if (row.kind !== "work") return null;
+    const label = row.status === "running" ? row.presentation?.label?.pending : row.presentation?.label?.completed;
+    if (label) return row.path ? `${label} ${row.path}` : label;
+    if (row.command) return `${row.status === "running" ? "Running" : "Ran"} ${firstLine(row.command, 90)}`;
+    if (row.toolName) return `${row.status === "running" ? "Using" : "Used"} ${row.toolName}`;
+    return row.workKind ? `${row.status === "running" ? "Working:" : "Did:"} ${row.workKind.replace(/_/g, " ")}` : null;
+  }
+
+  /** The most recent work row, descending into turn rows and nested children. */
+  function lastWork(rows: LooseRow[]): LooseRow | null {
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      if (row.children && row.children.length > 0) {
+        const nested = lastWork(row.children);
+        if (nested !== null) return nested;
+      }
+      if (row.kind === "work") return row;
+    }
+    return null;
+  }
+
+  async function describeActivity(threadId: string): Promise<{ activity: string | null; contextPct: number | null }> {
+    try {
+      const timeline = await bb.sdk.threads.timeline({ threadId, includeNestedRows: "true" });
+      const usage = timeline.contextWindowUsage;
+      const contextPct = usage && usage.modelContextWindow > 0 ? Math.round((usage.usedTokens / usage.modelContextWindow) * 100) : null;
+      if (timeline.activeThinking !== null) {
+        return { activity: `Thinking: ${firstLine(timeline.activeThinking.text)}`, contextPct };
+      }
+      const background = timeline.activeBackgroundCommands[0];
+      if (background !== undefined && background.completedAt === null) {
+        return { activity: `Running in background: ${firstLine(background.description, 90)}`, contextPct };
+      }
+      const row = lastWork(timeline.rows as unknown as LooseRow[]);
+      return { activity: row === null ? "Working" : describeRow(row) ?? "Working", contextPct };
+    } catch (cause) {
+      bb.log.warn(`activity for ${threadId}: ${errorMessage(cause)}`);
+      return { activity: null, contextPct: null };
+    }
+  }
+
   async function roomDetail(roomId: string): Promise<RoomDetail> {
     let room = store.room(roomId);
     if (room === undefined) throw new Error(`room ${roomId} not found`);
@@ -1465,6 +1529,9 @@ export default async function plugin(bb: BbPluginApi) {
             status = null;
           }
         }
+        const running = status === "active" || status === "starting" || status === "pending";
+        const expectation = awaiting.get(pendingKey(room.id, row.handle));
+        const live = running && row.thread_id !== null ? await describeActivity(row.thread_id) : { activity: null, contextPct: null };
         const last = store.q.lastMessageBy.get(room.id, row.handle, 0);
         return {
           handle: row.handle,
@@ -1479,6 +1546,9 @@ export default async function plugin(bb: BbPluginApi) {
           relayedChars: row.relayed_chars,
           lastStance: last !== undefined && isStance(last.stance) ? last.stance : null,
           removed: row.removed_at !== null,
+          activity: live.activity,
+          activeSince: running ? expectation?.deliveredAt ?? null : null,
+          contextPct: live.contextPct,
         };
       }),
     );

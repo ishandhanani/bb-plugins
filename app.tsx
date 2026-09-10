@@ -209,18 +209,46 @@ function EmptyState({ children }: { children: ReactNode }) {
   );
 }
 
+function isRunning(status: string | null): boolean {
+  return status === "active" || status === "starting" || status === "pending";
+}
+
 function StatusDot({ status }: { status: string | null }) {
-  const running = status === "active" || status === "starting" || status === "pending";
+  if (isRunning(status)) return <Icon name="Loading" className="size-3 shrink-0 animate-spin text-primary" aria-label="Working" />;
   return (
     <span
       aria-hidden
-      className={cn(
-        "inline-block size-1.5 shrink-0 rounded-full",
-        running && "animate-pulse bg-primary",
-        status === "error" && "bg-destructive",
-        !running && status !== "error" && "bg-muted-foreground/40",
-      )}
+      className={cn("inline-block size-1.5 shrink-0 rounded-full", status === "error" ? "bg-destructive" : "bg-muted-foreground/40")}
     />
+  );
+}
+
+/** Re-renders once a second while `enabled`, for elapsed timers. */
+function useTicker(enabled: boolean): number {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!enabled) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [enabled]);
+  return now;
+}
+
+function WorkingRow({ participant, now }: { participant: Participant; now: number }) {
+  const elapsed = participant.activeSince === null ? null : durationLabel(Math.max(0, now - participant.activeSince));
+  return (
+    <li className="flex flex-col gap-1 py-3" aria-live="polite">
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <Icon name="Loading" className="size-3.5 animate-spin text-primary" />
+        <span className="font-medium text-foreground">@{participant.handle}</span>
+        <span className="text-muted-foreground">{participant.providerId}</span>
+        <span className="text-muted-foreground">is working{elapsed ? ` · ${elapsed}` : ""}</span>
+        {participant.contextPct !== null ? <span className="text-muted-foreground">· context {participant.contextPct}%</span> : null}
+      </div>
+      <div className="max-w-[85%] rounded-lg border border-dashed border-border px-3.5 py-2 text-xs text-muted-foreground">
+        {participant.activity ?? "Starting up…"}
+      </div>
+    </li>
   );
 }
 
@@ -804,6 +832,7 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
 
   const active = useMemo(() => detail?.participants.filter((p) => !p.removed) ?? [], [detail]);
   const handles = useMemo(() => active.map((p) => p.handle), [active]);
+  const now = useTicker(active.some((p) => isRunning(p.status)));
   const mentioned = useMemo(() => parseMentions(text, handles), [text, handles]);
   const tags = useMemo(() => [...new Set([...tagged, ...mentioned])], [tagged, mentioned]);
   const providerOf = useCallback(
@@ -938,7 +967,8 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
   const job = detail.job;
   const canSend = text.trim() !== "" && pendingAction === null;
   const speakers = active.filter((p) => p.threadId !== null);
-  const anyRunning = job !== null || active.some((p) => p.status === "active" || p.status === "starting" || p.status === "pending");
+  const working = active.filter((p) => isRunning(p.status));
+  const anyRunning = job !== null || working.length > 0;
   const docTarget = detail.room.docPath !== null && detail.room.environmentId !== null
     ? { kind: "workspace" as const, environmentId: detail.room.environmentId, path: detail.room.docPath }
     : null;
@@ -1052,6 +1082,9 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
           <ul className="mx-auto w-full max-w-3xl divide-y divide-border/60">
             {detail.messages.map((message) => (
               <MessageRow key={message.seq} message={message} providerOf={providerOf} />
+            ))}
+            {working.map((participant) => (
+              <WorkingRow key={`working-${participant.handle}`} participant={participant} now={now} />
             ))}
           </ul>
         )}
