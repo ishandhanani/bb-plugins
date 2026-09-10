@@ -228,6 +228,8 @@ export const rpcContract = defineRpcContract({
   },
   rooms_cancel_job: { input: roomIdSchema, output: okSchema },
   rooms_resume_job: { input: roomIdSchema, output: okSchema },
+  /** Stop every running seat and drop pending relays. */
+  rooms_halt: { input: roomIdSchema, output: z.object({ stopped: z.array(z.string()) }) },
   rooms_archive: { input: roomIdSchema, output: okSchema },
   rooms_add_participant: {
     input: z.object({
@@ -310,6 +312,14 @@ const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS participants_thread_idx ON participants(thread_id)`,
   `ALTER TABLE participants ADD COLUMN can_edit INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE rooms ADD COLUMN default_turns INTEGER NOT NULL DEFAULT 4`,
+  `CREATE TABLE IF NOT EXISTS awaiting (
+     room_id TEXT NOT NULL,
+     handle TEXT NOT NULL,
+     turns_left INTEGER NOT NULL,
+     delivered_at INTEGER NOT NULL,
+     job INTEGER NOT NULL DEFAULT 0,
+     PRIMARY KEY (room_id, handle)
+   )`,
 ];
 
 interface RoomRow {
@@ -355,6 +365,13 @@ interface MessageMeta {
   openPoints?: string[];
   turnsLeft?: number;
   durationMs?: number | null;
+}
+interface AwaitingRow {
+  room_id: string;
+  handle: string;
+  turns_left: number;
+  delivered_at: number;
+  job: number;
 }
 
 function createStore(db: Database.Database) {
@@ -438,6 +455,12 @@ function createStore(db: Database.Database) {
     >(
       `INSERT INTO messages (room_id, seq, author, text, tags, created_at, stance, open_points, hops_left, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ),
+    awaitingAll: db.prepare<[], AwaitingRow>(`SELECT * FROM awaiting`),
+    awaitingUpsert: db.prepare<[string, string, number, number, number]>(
+      `INSERT INTO awaiting (room_id, handle, turns_left, delivered_at, job) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(room_id, handle) DO UPDATE SET turns_left = excluded.turns_left, delivered_at = excluded.delivered_at, job = excluded.job`,
+    ),
+    awaitingDelete: db.prepare<[string, string]>(`DELETE FROM awaiting WHERE room_id = ? AND handle = ?`),
   };
 
   const appendMessage = db.transaction(
@@ -803,12 +826,49 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** Promises awaiting a reply, keyed by `${roomId}/${handle}` (discussions and briefings). */
   const pending = new Map<string, PendingTurn[]>();
-  /** Participants the room expects a reply from; set by every delivery. */
-  const awaiting = new Map<string, Awaiting>();
   const jobs = new Map<string, JobState>();
   const spawnLocks = new Map<string, Promise<unknown>>();
 
   const pendingKey = (roomId: string, handle: string) => `${roomId}/${handle}`;
+  const splitKey = (key: string): [string, string] => {
+    const slash = key.indexOf("/");
+    return [key.slice(0, slash), key.slice(slash + 1)];
+  };
+
+  /**
+   * Participants the room expects a reply from; set by every delivery. Mirrored
+   * in SQLite so a plugin reload while agents are mid-turn does not lose their
+   * replies.
+   */
+  const awaiting = {
+    map: new Map<string, Awaiting>(
+      store.q.awaitingAll.all().map((row) => [
+        pendingKey(row.room_id, row.handle),
+        { turnsLeft: row.turns_left, deliveredAt: row.delivered_at, job: row.job === 1 },
+      ]),
+    ),
+    get(key: string): Awaiting | undefined {
+      return this.map.get(key);
+    },
+    has(key: string): boolean {
+      return this.map.has(key);
+    },
+    set(key: string, entry: Awaiting): void {
+      this.map.set(key, entry);
+      const [roomId, handle] = splitKey(key);
+      store.q.awaitingUpsert.run(roomId, handle, entry.turnsLeft, entry.deliveredAt, entry.job ? 1 : 0);
+    },
+    delete(key: string): boolean {
+      const existed = this.map.delete(key);
+      const [roomId, handle] = splitKey(key);
+      store.q.awaitingDelete.run(roomId, handle);
+      return existed;
+    },
+    keysForRoom(roomId: string): string[] {
+      return [...this.map.keys()].filter((key) => key.startsWith(`${roomId}/`));
+    },
+  };
+  if (awaiting.map.size > 0) bb.log.info(`restored ${awaiting.map.size} in-flight expectation(s)`);
 
   function publish(roomId: string): void {
     bb.realtime.publish(ROOM_CHANGED, { roomId });
@@ -925,12 +985,59 @@ export default async function plugin(bb: BbPluginApi) {
         prompt: text,
       });
       store.q.setParticipantThread.run(thread.id, room.id, handle);
-      if (freshRoom.environment_id === null && thread.environmentId !== null) {
-        store.q.setRoomEnvironment.run(thread.environmentId, room.id);
+      if (freshRoom.environment_id === null) {
+        // A repo project provisions its worktree after the row is created.
+        // Wait for it here, inside the spawn lock, so the next seat reuses it
+        // instead of getting a worktree of its own.
+        const environmentId = thread.environmentId ?? (await waitForEnvironment(thread.id));
+        if (environmentId !== null) store.q.setRoomEnvironment.run(environmentId, room.id);
+        else bb.log.warn(`thread ${thread.id} has no environment after waiting; later seats may not share a workspace`);
       }
     });
     spawnLocks.set(room.id, run.catch(() => undefined));
     await run;
+  }
+
+  async function waitForEnvironment(threadId: string, timeoutMs = 90_000): Promise<string | null> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      try {
+        const thread = await bb.sdk.threads.get({ threadId });
+        if (thread.environmentId !== null) return thread.environmentId;
+      } catch (cause) {
+        bb.log.warn(`waiting for environment of ${threadId}: ${errorMessage(cause)}`);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Rooms created before the environment wait may have seats in separate
+   * worktrees and no room environment. Adopt one so the pinned document and
+   * the changes bar work, and so any seat reset lands in the shared workspace.
+   */
+  async function adoptEnvironment(room: RoomRow): Promise<RoomRow> {
+    if (room.environment_id !== null) return room;
+    const seats = store.participants(room.id).filter((p) => p.thread_id !== null);
+    seats.sort((a, b) => Number(b.handle === room.doc_owner) - Number(a.handle === room.doc_owner));
+    for (const seat of seats) {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: seat.thread_id as string });
+        if (thread.environmentId !== null) {
+          store.q.setRoomEnvironment.run(thread.environmentId, room.id);
+          const others = seats.filter((s) => s.handle !== seat.handle).map((s) => `@${s.handle}`);
+          postSystem(
+            room.id,
+            `Room workspace set to @${seat.handle}'s worktree.${others.length ? ` ${others.join(", ")} are in separate worktrees; reset them to move them here.` : ""}`,
+          );
+          return store.room(room.id) ?? room;
+        }
+      } catch (cause) {
+        bb.log.warn(`adopt environment from @${seat.handle}: ${errorMessage(cause)}`);
+      }
+    }
+    return room;
   }
 
   interface DeliverOptions {
@@ -944,8 +1051,9 @@ export default async function plugin(bb: BbPluginApi) {
    * is accepted; the reply arrives through `thread.idle`.
    */
   async function deliver(roomId: string, handle: string, instruction: string, options: DeliverOptions): Promise<void> {
-    const room = store.room(roomId);
+    let room = store.room(roomId);
     if (room === undefined) throw new Error(`room ${roomId} not found`);
+    room = await adoptEnvironment(room);
     const participant = store.participant(room.id, handle);
     if (participant === undefined) throw new Error(`@${handle} is not in room ${room.id}`);
     const others = store.participants(room.id).filter((other) => other.handle !== handle);
@@ -1159,6 +1267,30 @@ export default async function plugin(bb: BbPluginApi) {
     return true;
   }
 
+  /** Stop every running seat and drop every pending relay in the room. */
+  async function haltRoom(roomId: string): Promise<string[]> {
+    const room = store.room(roomId);
+    if (room === undefined) throw new Error(`room ${roomId} not found`);
+    await cancelJob(room.id);
+    for (const key of awaiting.keysForRoom(room.id)) awaiting.delete(key);
+    const stopped: string[] = [];
+    for (const participant of store.participants(room.id)) {
+      if (participant.thread_id === null) continue;
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: participant.thread_id });
+        if (thread.status !== "active" && thread.status !== "starting" && thread.status !== "pending") continue;
+        await bb.sdk.threads.stop({ threadId: participant.thread_id });
+        stopped.push(participant.handle);
+      } catch (cause) {
+        bb.log.warn(`halt @${participant.handle}: ${errorMessage(cause)}`);
+      }
+    }
+    postSystem(room.id, stopped.length === 0
+      ? "Stopped: pending relays cleared; no seat was running."
+      : `Stopped ${stopped.map((h) => `@${h}`).join(", ")} mid-turn and cleared pending relays. Their partial work stays in their threads.`);
+    return stopped;
+  }
+
   // -- lifecycle events -----------------------------------------------------
 
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
@@ -1319,8 +1451,9 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function roomDetail(roomId: string): Promise<RoomDetail> {
-    const room = store.room(roomId);
+    let room = store.room(roomId);
     if (room === undefined) throw new Error(`room ${roomId} not found`);
+    room = await adoptEnvironment(room);
     const rows = store.q.allParticipants.all(room.id);
     const participants = await Promise.all(
       rows.map(async (row): Promise<Participant> => {
@@ -1586,8 +1719,9 @@ export default async function plugin(bb: BbPluginApi) {
       : posted.tags.length > 1
         ? PARALLEL_INSTRUCTION
         : USER_TAG_INSTRUCTION;
-    const dispatched = await dispatch(roomId, posted.tags, instruction, { turnsLeft: turns, job: false });
-    return { seq: posted.seq, dispatched };
+    // Delivery can wait on worktree provisioning; do not hold the caller.
+    void dispatch(roomId, posted.tags, instruction, { turnsLeft: turns, job: false });
+    return { seq: posted.seq, dispatched: posted.tags };
   }
 
   bb.rpc.register(rpcContract, {
@@ -1613,6 +1747,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!resumeJob(roomId)) throw new Error("no paused discussion in this room");
       return { ok: true as const };
     },
+    rooms_halt: async ({ roomId }) => ({ stopped: await haltRoom(roomId) }),
     rooms_archive: async ({ roomId }) => {
       await archiveRoom(roomId);
       return { ok: true as const };
@@ -1657,7 +1792,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb roundtable doc <room> --path <path> [--owner <handle>]",
     "  bb roundtable intro <room> <handle>",
     "  bb roundtable compact|reset|remove <room> <handle>",
-    "  bb roundtable resume|cancel|archive <room>",
+    "  bb roundtable resume|cancel|stop|archive <room>",
     "",
     "<room> is a room id or its exact title. Inside a participant thread, `say`",
     "posts as that participant. @handle mentions tag participants even without",
@@ -1730,6 +1865,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "remove", summary: "Remove a participant", usage: "bb roundtable remove <room> <handle>" },
       { name: "resume", summary: "Resume a discussion paused on need-info", usage: "bb roundtable resume <room>" },
       { name: "cancel", summary: "Cancel the running discussion", usage: "bb roundtable cancel <room>" },
+      { name: "stop", summary: "Stop every running seat and drop pending relays", usage: "bb roundtable stop <room>" },
       { name: "archive", summary: "Archive a room and stop its participant threads", usage: "bb roundtable archive <room>" },
     ],
     async run(argv, ctx) {
@@ -1894,6 +2030,13 @@ export default async function plugin(bb: BbPluginApi) {
             await cancelJob(room.id);
             return ok({ ok: true }, "Cancelled.");
           }
+          case "halt":
+          case "stop": {
+            const room = resolveRoom(rest[0]);
+            if (room === undefined) return fail(`Unknown room "${rest[0] ?? ""}".`);
+            const stopped = await haltRoom(room.id);
+            return ok({ stopped }, stopped.length === 0 ? "Nothing was running; pending relays cleared." : `Stopped ${stopped.map((h) => `@${h}`).join(", ")}.`);
+          }
           case "archive": {
             const room = resolveRoom(rest[0]);
             if (room === undefined) return fail(`Unknown room "${rest[0] ?? ""}".`);
@@ -1916,7 +2059,7 @@ export default async function plugin(bb: BbPluginApi) {
       for (const entry of list) entry.reject(new Error("plugin disposed"));
     }
     pending.clear();
-    awaiting.clear();
+    // `awaiting` stays in SQLite on purpose so in-flight replies survive a reload.
     bb.log.info("disposed");
   });
 

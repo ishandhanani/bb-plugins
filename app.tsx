@@ -784,7 +784,7 @@ function parseMentions(text: string, handles: readonly string[]): string[] {
   return [...found];
 }
 
-type PendingAction = "send" | "discuss" | "cancel" | "resume" | "archive" | "participant" | null;
+type PendingAction = "send" | "discuss" | "cancel" | "resume" | "halt" | "archive" | "participant" | null;
 
 function RoomView({ roomId, compact = false }: { roomId: string; compact?: boolean }) {
   const { rpc, detail, error, refetch } = useRoom(roomId);
@@ -870,6 +870,12 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
 
   const cancelJob = () => run("cancel", () => rpc.call("rooms_cancel_job", { roomId }));
   const resumeJob = () => run("resume", () => rpc.call("rooms_resume_job", { roomId }));
+  const halt = () =>
+    run("halt", async () => {
+      if (!window.confirm("Stop every running seat mid-turn and drop pending relays? Their partial work stays in their threads.")) return;
+      await rpc.call("rooms_halt", { roomId });
+      refetch();
+    });
 
   const archive = () =>
     run("archive", async () => {
@@ -932,6 +938,7 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
   const job = detail.job;
   const canSend = text.trim() !== "" && pendingAction === null;
   const speakers = active.filter((p) => p.threadId !== null);
+  const anyRunning = job !== null || active.some((p) => p.status === "active" || p.status === "starting" || p.status === "pending");
   const docTarget = detail.room.docPath !== null && detail.room.environmentId !== null
     ? { kind: "workspace" as const, environmentId: detail.room.environmentId, path: detail.room.docPath }
     : null;
@@ -963,6 +970,12 @@ function RoomView({ roomId, compact = false }: { roomId: string; compact?: boole
               <span className="text-muted-foreground">{detail.room.docOwner ? `@${detail.room.docOwner}` : "you"}</span>
             </button>
           )
+        ) : null}
+        {anyRunning ? (
+          <Button variant="outline" size="sm" onClick={halt} disabled={pendingAction !== null} aria-label="Stop all running seats and drop pending relays">
+            <Icon name="Square" className="size-3.5" />
+            Stop
+          </Button>
         ) : null}
         <Button variant="ghost" size="sm" onClick={() => { setShowSettings((v) => !v); setShowAdd(false); }} aria-label="Room settings" aria-pressed={showSettings}>
           <Icon name="Settings" className="size-4" />
