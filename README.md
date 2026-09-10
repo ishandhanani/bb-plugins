@@ -1,141 +1,48 @@
 # bb-plugin-review-desk
 
-A BB plugin that keeps a todo list. It shows every surface a plugin can own:
+Review GitHub pull requests inside bb with an online-style diff, inline GitHub threads, comment authoring, ask-AI on any selection, a tree-sitter codemap, and analysis passes whose findings anchor to file:line.
 
-- `server.ts` — the backend: a todo store in `bb.storage.kv`, RPC methods
-  for the page, a `bb review-desk` CLI command, a setting, and a realtime signal
-  that keeps every open page current.
-- `app.tsx` — the frontend: an **Example todos** page in the left sidebar
-  (`app.slots.navPanel`) built from the vendored components.
-- `skills/example-todos/SKILL.md` — a skill that tells agents how to keep the list
-  with `bb review-desk`. BB imports it into agent threads automatically.
-- `PLUGIN_OVERVIEW.md` — the store listing text: a longer version of
-  `bb.description` that the plugin detail page shows under it. See
-  [Store listing](#store-listing).
+## What it does
 
-Try it: install the plugin, open **Example todos** in the sidebar, then run
-`bb review-desk add "Ship it"` in a terminal. The page updates at once.
+- **Open a PR** by URL or `owner/repo#123`. The host entry finds the local checkout of that repository among bb projects (or clones it), fetches the PR head, and keeps a detached worktree under the plugin's host data directory.
+- **Read the diff** per file with Pierre diffs: unified or split, syntax highlighting from bb's code theme, expandable context, sticky file headers, viewed marks, a filterable file rail.
+- **GitHub threads inline**, anchored to their lines, with resolved and outdated state, reply, and resolve. The Review tab shows the PR description, checks, prior reviews, and the conversation.
+- **Author comments**: select lines, press Comment (or the gutter button), write Markdown. Comments stay pending until you submit one review from the Review tab as COMMENT, APPROVE, or REQUEST_CHANGES. Nothing reaches GitHub without that click.
+- **Ask AI about a selection**: Explain, Why changed, Risks, Suggest fix, or a free question. Each review gets one hidden analyst thread per provider, spawned into the PR worktree, read-only by instruction. Answers become notes anchored to the selection; findings inside a fenced `findings` block become individual notes with severity and line. Notes can be turned into pending comments or sent to a Roundtable room.
+- **Passes**: Summary, Risk review, Perf review, Slop review, Test gaps, run against the whole diff from the AI notes tab.
+- **Codemap**: tree-sitter (Rust, Python, TypeScript, JavaScript, Go, C and C++) parses the base and head of every changed file, diffs symbols, links references between changed symbols, counts fan-in with `git grep`, orders modules for reading, and ranks hotspots. Regex extraction is the fallback for other languages.
 
-## UI components
+## Layout
 
-`components/ui/` is vendored source you own (the shadcn model): edit the
-files freely — they never update out from under you. Add more from the BB
-component registry (the full shadcn set, version-matched to your BB install
-via the pinned ref in `components.json`):
+- `host-contract.ts` — RPC contract between server and host.
+- `host.ts` — runs on the machine with the repository: git worktrees and diffs, `gh` for PR data and review submission, tree-sitter codemap.
+- `server.ts` — SQLite store (reviews, viewed files, GitHub caches, AI notes, pending comments, requests, codemaps), AI seats, RPC for the UI, `bb review-desk` CLI.
+- `app.tsx` — the **Reviews** nav panel with the diff column and file rail; fixed tabs **Review**, **AI notes**, **Codemap**.
+- `skills/review-desk/SKILL.md` — instructions the analyst threads receive.
 
-```
-npx shadcn add @bb/select @bb/table
-```
-
-Run `npm install` once before `bb plugin build` — the vendored components'
-npm deps bundle into your dist. React, and BB-shimmed packages like the
-radix portal primitives and `sonner` (`import { toast } from "sonner"`
-reaches BB's own toaster), are provided by the BB app at runtime and never
-bundled. Every shimmed package is declared in `devDependencies` at the
-host's version so those imports typecheck; keep them there (never in
-`dependencies`, which would bundle a second copy), and `bb plugin types`
-repins them alongside the SDK. Ship `dist/` (npm tarball or committed for
-git installs) so people installing your plugin never need npm.
-
-## Manifest
-
-`package.json` is the plugin manifest. Notable fields:
-
-- `bb.server` — backend entry (required).
-- `bb.app` — frontend entry. Delete it, `app.tsx`, `components/`,
-  `hooks/`, and `lib/` for a headless plugin.
-- `bb.skills` — skill roots; omitted here, so BB reads `skills/`. Each
-  directory with a `SKILL.md` is one skill, named after the directory.
-- `bb.name` and `bb.description` — required human-facing identity.
-- `bb.branding` — required; declare `icon` as a BB icon name or a
-  plugin-relative compact SVG, or declare `logo.light` (with optional
-  `logo.dark`). Logo assets must be relative `.svg`, `.png`, or
-  `.webp` files.
-- `engines.bb` — supported bb app version range.
-- `engines.bbPluginSdk` — the lowest plugin SDK you need (scaffold:
-  `>=0.4.47`). BB reads this as a floor, not a ceiling: a later
-  SDK in the same major still loads your plugin.
-- `dependencies` — every package your source imports that BB does not provide.
-  `bb plugin build` inlines them into `dist/`, and git installs resolve this
-  list alone, so a build-required package here rather than in
-  `devDependencies` is what keeps your plugin installable. `devDependencies`
-  is for types and tooling only (BB shims React, the portal primitives, and
-  `@get-bb/plugin-sdk` at runtime — never bundle them).
-
-Run `bb plugin build` before publishing git/npm installs. It writes
-`dist/server.js` + `server.meta.json` and `app.js` / `app.css` /
-`app.meta.json`. Each `*.meta.json` stamps SDK major/version,
-`artifactFormatVersion`, `pluginId`, `pluginVersion`, and
-`builtWith` so managed installs can verify the artifacts.
-
-## Store listing
-
-Two texts describe the plugin in the store. `bb.description` in package.json
-is the one-sentence hook on every browse card and the lead paragraph on the
-detail page; keep it under about 140 characters. `PLUGIN_OVERVIEW.md` is the
-same claim at length, shown in an Overview section under that paragraph.
-Rewrite the scaffold's copy for your plugin, and update it whenever
-`bb.description` changes, so the two never disagree.
-
-The submission to the public BB Community marketplace requires the file. Keep
-it under 4000 characters (aim for 700 to 1800) and use headings, paragraphs,
-emphasis, code, blockquotes, lists, thematic breaks, and absolute https links
-only — raw HTML, images, tables, footnotes, and task lists are rejected. Do
-not open with a `#` title or repeat `bb.description` verbatim; the page
-shows both directly above.
-
-## Install
-
-From this directory (`bb plugin new` already ran the install; a fresh clone
-needs it):
+## Develop
 
 ```
 npm install
-bb plugin install .
-```
-
-After editing sources, reload:
-
-```
+bb plugin install .      # builds server, app, and host bundles and registers the directory
 bb plugin reload review-desk
+npx tsc -p .
+bb plugin logs review-desk
 ```
 
-Or let `bb plugin dev` rebuild and reload on every save.
+Requires `gh` authenticated on the machine that holds the repository. The tree-sitter grammars come from `@vscode/tree-sitter-wasm` in `node_modules`; the server passes that directory to the host.
 
-## Configure
-
-```
-bb plugin config review-desk
-bb plugin config review-desk set showDone false
-bb plugin reload review-desk
-```
-
-## Types & API reference
-
-The plugin API ships as the npm package `@get-bb/plugin-sdk`, pinned to an
-exact version in `devDependencies` (`0.4.47` — the SDK of the BB
-that scaffolded this plugin). After `npm install`, the full surface is on disk
-at:
+## CLI
 
 ```
-node_modules/@get-bb/plugin-sdk/bundled-types/bb-plugin-sdk.d.ts      # backend
-node_modules/@get-bb/plugin-sdk/bundled-types/bb-plugin-sdk-app.d.ts  # frontend
+bb review-desk open <url | owner/repo#N>
+bb review-desk list
+bb review-desk pass <reviewId> <summary|risk|perf|slop|tests> [--provider <id>]
+bb review-desk notes <reviewId>
+bb review-desk codemap <reviewId>
 ```
 
-Your editor and `tsc` resolve `@get-bb/plugin-sdk` there through ordinary node
-resolution — no path mapping. These are readable declarations: open them for an
-exact signature.
+## Settings
 
-The SDK surface grows with every BB release, so the pin has to track the BB you
-actually run:
-
-```
-bb plugin types          # sync this plugin's SDK surface to the running BB
-bb plugin types --check  # CI: fail when it does not match
-```
-
-Ask BB to write plugins for you: the `bb-plugin-authoring` skill documents
-the whole surface with examples.
-
-Confused by the API, or need something the types don't explain? Clone the BB
-repo and read the source: <https://github.com/get-bb/bb>.
+- `defaultProvider` (default `claude-code`): the analyst provider preselected in the UI and used by the CLI.
+- `hideSeatThreads` (default true): keep analyst threads out of the sidebar.
