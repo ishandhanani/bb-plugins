@@ -7,6 +7,7 @@ Review a GitHub pull request inside bb the way you would online, with a chat par
 - **Comments from the diff**: select lines, write Markdown, keep them pending, then submit one review to GitHub as comment, approve, or request changes.
 - **Chat with the PR**: an analyst per provider runs in a worktree at the PR head. Ask anything. Code goes in as pills: select lines and press `a`, or type `@` to attach a changed file, symbol, review thread, or `path:10-20`. Pills resolve to the code when you send, so the transcript stays readable. Turn an answer into a pending comment or send it to a Roundtable room.
 - **Codemap**: symbols added, removed, and modified per file, references between changed symbols, fan-in from the rest of the repository, a reading order by module, and hotspots.
+- **Diagrams**: a change map of the PR drawn instantly from the codemap, plus architecture, control-flow, data-model, and per-file diagrams drawn on request by an illustrator that reads the code first. Every node is checked against the PR and clicks through to the diff.
 
 ## How it works
 
