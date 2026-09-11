@@ -13,7 +13,11 @@ export type MentionRef =
   | { kind: "file"; reviewId: string; path: string }
   | { kind: "symbol"; reviewId: string; path: string; qualified: string; startLine: number; endLine: number; side: "old" | "new" }
   | { kind: "thread"; reviewId: string; threadId: string }
-  | { kind: "pr"; reviewId: string };
+  | { kind: "pr"; reviewId: string }
+  /** One commit of the PR: message, stat, and patch. */
+  | { kind: "commit"; reviewId: string; sha: string }
+  /** Lines of a file as they were at one commit (the commit view's selection). */
+  | { kind: "crange"; reviewId: string; sha: string; path: string; startLine: number; endLine: number };
 
 export function encodeMentionRef(ref: MentionRef): string {
   return JSON.stringify(ref);
@@ -29,6 +33,8 @@ export function decodeMentionRef(id: string): MentionRef | null {
       case "symbol":
       case "thread":
       case "pr":
+      case "commit":
+      case "crange":
         return value as MentionRef;
       default:
         return null;
@@ -56,5 +62,9 @@ export function mentionLabel(ref: MentionRef, thread?: { author: string; path: s
       return thread ? `@${thread.author} on ${baseName(thread.path)}${thread.line === null ? "" : `:${thread.line}`}` : "review thread";
     case "pr":
       return "PR description";
+    case "commit":
+      return `commit ${ref.sha.slice(0, 7)}`;
+    case "crange":
+      return `${baseName(ref.path)}:${ref.startLine === ref.endLine ? ref.startLine : `${ref.startLine}-${ref.endLine}`}@${ref.sha.slice(0, 7)}`;
   }
 }

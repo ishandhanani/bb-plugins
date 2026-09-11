@@ -145,6 +145,11 @@ export const hostContract = defineRpcContract({
     input: z.object({ worktree: z.string(), sha: z.string(), path: z.string() }),
     output: z.object({ content: z.string().nullable(), binary: z.boolean() }),
   },
+  /** Message, author, date, and parents of one commit. */
+  git_commit: {
+    input: z.object({ worktree: z.string(), sha: z.string() }),
+    output: z.object({ sha: z.string(), parents: z.array(z.string()), author: z.string(), date: z.string(), title: z.string(), body: z.string() }),
+  },
   gh_pr: {
     input: z.object({ owner: z.string(), repo: z.string(), number: z.number() }),
     output: ghPrSchema,

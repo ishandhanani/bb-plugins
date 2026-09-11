@@ -150,6 +150,9 @@ const briefStateSchema = z.object({
 });
 export type BriefState = z.infer<typeof briefStateSchema>;
 
+const commitInfoSchema = z.object({ sha: z.string(), parents: z.array(z.string()), author: z.string(), date: z.string(), title: z.string(), body: z.string() });
+export type CommitInfo = z.infer<typeof commitInfoSchema>;
+
 /** A private note: visible only here until promoted to a pending GitHub comment. */
 const noteKindSchema = z.enum(["slop", "cleanup", "risk", "question"]);
 const noteSeveritySchema = z.enum(["low", "medium", "high"]);
@@ -191,6 +194,8 @@ export const rpcContract = defineRpcContract({
       /** The helper is currently looking for slop and cleanups. */
       notesRunning: z.boolean(),
       notesError: z.string().nullable(),
+      /** Heads you opened this review at: the one before the current, and the current. */
+      seen: z.object({ prevHead: z.string().nullable(), seenHead: z.string().nullable() }),
       /** Project the analyst threads are created in (the composer needs one). */
       chatProjectId: z.string(),
     }),
@@ -287,6 +292,25 @@ export const rpcContract = defineRpcContract({
   /** Turn a note into a pending GitHub comment; the note is kept as promoted. */
   note_promote: { input: z.object({ id: z.string() }), output: z.object({ pending: pendingSchema }) },
   notes_clear: { input: z.object({ reviewId: z.string(), source: z.enum(["signal", "helper", "me"]).optional(), dismissedOnly: z.boolean().optional() }), output: z.object({ removed: z.number() }) },
+  /** Record that the review is open at its current head; returns the head it was last opened at before this one. */
+  review_seen: { input: reviewIdSchema, output: z.object({ prevHead: z.string().nullable(), seenHead: z.string().nullable() }) },
+  /**
+   * A commit or a range of the PR as a diff. `to` alone diffs that commit
+   * against its first parent; with `from`, the diff runs from `from` (or
+   * from its parent when `inclusive`) to `to`.
+   */
+  commit_get: {
+    input: z.object({ reviewId: z.string(), to: z.string(), from: z.string().optional(), inclusive: z.boolean().optional() }),
+    output: z.object({ base: z.string(), head: z.string(), info: commitInfoSchema, commits: z.array(commitInfoSchema), files: z.array(changedFileSchema) }),
+  },
+  commit_patch: {
+    input: z.object({ reviewId: z.string(), base: z.string(), head: z.string(), path: z.string(), oldPath: z.string().nullable() }),
+    output: z.object({ patch: z.string() }),
+  },
+  commit_file: {
+    input: z.object({ reviewId: z.string(), sha: z.string(), path: z.string() }),
+    output: z.object({ content: z.string().nullable(), binary: z.boolean() }),
+  },
 });
 
 export const REVIEW_CHANGED = "review-changed";
@@ -403,6 +427,7 @@ const MIGRATIONS = [
      updated_at INTEGER NOT NULL
    )`,
   `CREATE INDEX IF NOT EXISTS notes_review ON notes (review_id)`,
+  `CREATE TABLE IF NOT EXISTS review_seen (review_id TEXT PRIMARY KEY, seen_head_sha TEXT NOT NULL, prev_head_sha TEXT, seen_at INTEGER NOT NULL)`,
 ];
 
 interface ReviewRow {
@@ -499,6 +524,10 @@ function createStore(db: Database.Database) {
     deleteNotesBySource: db.prepare<[string, string]>(`DELETE FROM notes WHERE review_id = ? AND source = ? AND state <> 'promoted'`),
     deleteDismissedNotes: db.prepare<[string]>(`DELETE FROM notes WHERE review_id = ? AND state = 'dismissed'`),
     deleteAllNotes: db.prepare<[string]>(`DELETE FROM notes WHERE review_id = ? AND state <> 'promoted'`),
+    seen: db.prepare<[string], { review_id: string; seen_head_sha: string; prev_head_sha: string | null; seen_at: number }>(`SELECT * FROM review_seen WHERE review_id = ?`),
+    upsertSeen: db.prepare<[string, string, string | null, number]>(
+      `INSERT INTO review_seen (review_id, seen_head_sha, prev_head_sha, seen_at) VALUES (?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET seen_head_sha = excluded.seen_head_sha, prev_head_sha = excluded.prev_head_sha, seen_at = excluded.seen_at`,
+    ),
     codemap: db.prepare<[string], CodemapRow>(`SELECT * FROM codemaps WHERE review_id = ?`),
     setCodemap: db.prepare<[string, string, string, string | null, string | null, number]>(
       `INSERT INTO codemaps (review_id, head_sha, status, json, error, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, status = excluded.status, json = excluded.json, error = excluded.error, updated_at = excluded.updated_at`,
@@ -636,8 +665,9 @@ export default async function plugin(bb: BbPluginApi) {
     defaultProvider: { type: "string", label: "Default AI provider id for the PR chat", default: "claude-code" },
     hideSeatThreads: { type: "boolean", label: "Hide analyst threads from the sidebar", default: true },
     autoBrief: { type: "boolean", label: "Write the plain-English brief when a review is first opened at a new head", default: true },
+    helperModel: { type: "string", label: "Model for the helper thread (brief, notes); empty uses the project's default", default: "" },
   });
-  const { defaultProvider, hideSeatThreads, autoBrief } = await settings.get();
+  const { defaultProvider, hideSeatThreads, autoBrief, helperModel } = await settings.get();
 
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
@@ -829,10 +859,57 @@ export default async function plugin(bb: BbPluginApi) {
       notes: q.notes.all(row.id).map(toNote),
       notesRunning: q.helper.get(row.id)?.job === "notes",
       notesError: notesErrors.get(row.id) ?? null,
+      seen: seenState(row),
       chatProjectId: await chatProjectId(row),
     };
   }
   const notesErrors = new Map<string, string>();
+
+  function seenState(row: ReviewRow): { prevHead: string | null; seenHead: string | null } {
+    const s = q.seen.get(row.id);
+    return { prevHead: s?.prev_head_sha ?? null, seenHead: s?.seen_head_sha ?? null };
+  }
+
+  /** Called when the review page opens. A new head moves the old one into prevHead, which marks "new since you last looked". */
+  function markSeen(row: ReviewRow): { prevHead: string | null; seenHead: string | null } {
+    const s = q.seen.get(row.id);
+    if (s === undefined) q.upsertSeen.run(row.id, row.head_sha, null, Date.now());
+    else if (s.seen_head_sha !== row.head_sha) q.upsertSeen.run(row.id, row.head_sha, s.seen_head_sha, Date.now());
+    return seenState(row);
+  }
+
+  // -- commits -----------------------------------------------------------------
+
+  const commitCache = new Map<string, CommitInfo>();
+
+  async function commitInfo(row: ReviewRow, sha: string): Promise<CommitInfo> {
+    const key = `${row.id}:${sha}`;
+    const cached = commitCache.get(key);
+    if (cached !== undefined) return cached;
+    const info = await host.call("git_commit", { worktree: row.worktree, sha }, hostOptions(row));
+    commitCache.set(key, info);
+    return info;
+  }
+
+  async function commitRange(row: ReviewRow, to: string, from: string | undefined, inclusive: boolean) {
+    const info = await commitInfo(row, to);
+    let base: string;
+    if (from === undefined) base = info.parents[0] ?? row.base_sha;
+    else if (inclusive) base = (await commitInfo(row, from)).parents[0] ?? row.base_sha;
+    else base = from;
+    const files = await host.call("git_files", { worktree: row.worktree, baseSha: base, headSha: info.sha }, hostOptions(row));
+    // The PR's commit list, oldest first, tells which commits the range covers.
+    const list = parseJson<Review["commits"]>(row.commits_json, []);
+    const toIndex = list.findIndex((c) => c.sha === info.sha || c.sha.startsWith(to) || info.sha.startsWith(c.sha));
+    let commits: CommitInfo[] = [info];
+    if (from !== undefined && toIndex !== -1) {
+      const fromIndex = list.findIndex((c) => c.sha === from || c.sha.startsWith(from) || from.startsWith(c.sha));
+      const start = fromIndex === -1 ? 0 : inclusive ? fromIndex : fromIndex + 1;
+      const slice = list.slice(Math.min(start, toIndex), toIndex + 1);
+      commits = await Promise.all(slice.map((c) => commitInfo(row, c.sha)));
+    }
+    return { base, head: info.sha, info, commits, files: files.files };
+  }
 
   // -- chat seats ------------------------------------------------------------
 
@@ -865,12 +942,15 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function excerpt(row: ReviewRow, selection: SelectionRef): Promise<string> {
-    const sha = selection.side === "old" ? row.base_sha : row.head_sha;
-    const result = await host.call("git_show", { worktree: row.worktree, sha, path: selection.path }, hostOptions(row));
+    return excerptAt(row, selection.side === "old" ? row.base_sha : row.head_sha, selection.path, selection.startLine, selection.endLine);
+  }
+
+  async function excerptAt(row: ReviewRow, sha: string, path: string, startLine: number, endLine: number): Promise<string> {
+    const result = await host.call("git_show", { worktree: row.worktree, sha, path }, hostOptions(row));
     if (result.content === null) return "(file content unavailable)";
     const lines = result.content.split("\n");
-    const start = Math.min(selection.startLine, selection.endLine);
-    const end = Math.max(selection.startLine, selection.endLine);
+    const start = Math.min(startLine, endLine);
+    const end = Math.max(startLine, endLine);
     const from = Math.max(1, start - 6);
     const to = Math.min(lines.length, end + 6);
     const width = String(to).length;
@@ -1131,8 +1211,16 @@ export default async function plugin(bb: BbPluginApi) {
     const prScore = Math.max(matchScore("pr description", query, 8), matchScore("description", query, 8), matchScore(row.title, query, 4));
     groups.push(prScore > 0 ? [scored({ kind: "pr", reviewId: row.id }, "PR description", row.title, "Info", prScore)] : []);
 
+    const commitItems: ScoredItem[] = [];
+    for (const c of parseJson<Review["commits"]>(row.commits_json, [])) {
+      const s = Math.max(query.length >= 4 && c.sha.startsWith(query) ? 30 : 0, matchScore(c.title, query, 5), matchScore("commit", query, 2));
+      if (s === 0) continue;
+      commitItems.push(scored({ kind: "commit", reviewId: row.id, sha: c.sha }, `${c.sha.slice(0, 7)} ${c.title}`.slice(0, 80), `commit by ${c.author}`, "GitPullRequest", s));
+    }
+    groups.push(commitItems);
+
     // Browsing (empty query) shows a mix; a query ranks everything together.
-    const caps = browsing ? [3, 8, 6, 4, 1] : [5, 40, 40, 40, 1];
+    const caps = browsing ? [3, 8, 6, 4, 1, 3] : [5, 40, 40, 40, 1, 10];
     const items = groups.flatMap((group, i) => group.sort((a, b) => b.score - a.score).slice(0, caps[i]));
     if (!browsing) items.sort((a, b) => b.score - a.score);
     return items.slice(0, 24).map(({ score: _score, ...rest }) => rest);
@@ -1200,6 +1288,37 @@ export default async function plugin(bb: BbPluginApi) {
       }
       case "pr":
         return [`${prefix}: ${row.title}`, `by ${row.author ?? "unknown"} · ${row.base_ref} ← ${row.head_ref} · ${row.state}`, "", row.body.trim() === "" ? "(no description)" : row.body.trim().slice(0, 12_000)].join("\n");
+      case "commit": {
+        const range = await commitRange(row, ref.sha, undefined, false);
+        const parts = [
+          `${prefix} — commit ${short(range.info.sha)} by ${range.info.author} (${range.info.date}): ${range.info.title}`,
+          range.info.body === "" ? "" : range.info.body,
+          "",
+          `Files (${range.files.length}):`,
+          ...range.files.map((f) => `  ${f.status.padEnd(8)} ${f.path} (+${f.additions} -${f.deletions})`),
+        ];
+        let budget = 400;
+        for (const f of range.files) {
+          if (budget <= 0 || f.binary) break;
+          const patch = await host.call("git_patch", { worktree: row.worktree, baseSha: range.base, headSha: range.head, path: f.path, oldPath: f.oldPath }, hostOptions(row));
+          const lines = patch.patch.split("\n");
+          const take = lines.slice(0, budget);
+          parts.push("", `--- ${f.path}`, "```diff", take.join("\n"), ...(lines.length > take.length ? [`... ${lines.length - take.length} more lines`] : []), "```");
+          budget -= take.length;
+        }
+        if (budget <= 0) parts.push("", `(patch truncated; run: git show ${range.info.sha})`);
+        return parts.filter((p, i) => i !== 1 || p !== "").join("\n");
+      }
+      case "crange": {
+        const startLine = Math.min(ref.startLine, ref.endLine);
+        const endLine = Math.max(ref.startLine, ref.endLine);
+        return [
+          `${prefix} — ${ref.path} lines ${startLine}-${endLine} as of commit ${short(ref.sha)}. Lines marked > are the ones the reviewer selected in that commit's diff; the file may differ at the PR head.`,
+          "```",
+          await excerptAt(row, ref.sha, ref.path, startLine, endLine),
+          "```",
+        ].join("\n");
+      }
     }
   }
 
@@ -1254,6 +1373,7 @@ export default async function plugin(bb: BbPluginApi) {
         : { type: "host", hostId: row.host_id, workspace: { type: "unmanaged", path: row.worktree } },
       providerId,
       ...(permissionMode ? { permissionMode } : {}),
+      ...(helperModel.trim() !== "" ? { model: helperModel.trim() } : {}),
       title: `Review Desk ${row.owner}/${row.repo}#${row.number}: helper`,
       visibility: hideSeatThreads ? "hidden" : "visible",
       input: [{ type: "text", text: helperIntro(row), mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
@@ -1851,6 +1971,16 @@ export default async function plugin(bb: BbPluginApi) {
       const pending = q.pendingById.get(pendingId);
       if (pending === undefined) throw new Error("pending vanished");
       return { pending: toPending(pending) };
+    },
+    review_seen: ({ reviewId }) => markSeen(requireReview(reviewId)),
+    commit_get: ({ reviewId, to, from, inclusive }) => commitRange(requireReview(reviewId), to, from, inclusive === true),
+    commit_patch: async ({ reviewId, base, head, path, oldPath }) => {
+      const row = requireReview(reviewId);
+      return host.call("git_patch", { worktree: row.worktree, baseSha: base, headSha: head, path, oldPath }, hostOptions(row));
+    },
+    commit_file: ({ reviewId, sha, path }) => {
+      const row = requireReview(reviewId);
+      return host.call("git_show", { worktree: row.worktree, sha, path }, hostOptions(row));
     },
     notes_clear: ({ reviewId, source, dismissedOnly }) => {
       requireReview(reviewId);

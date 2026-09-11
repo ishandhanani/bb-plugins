@@ -31,7 +31,8 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { FileDiff, type DiffLineAnnotation, type FileDiffMetadata, type SelectedLineRange } from "@pierre/diffs/react";
 import { parsePatchFiles } from "@pierre/diffs";
-import type { BriefState, CodemapState, FileEntry, Note, NoteKind, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, rpcContract } from "./server";
+import type { BriefState, CodemapState, CommitInfo, FileEntry, Note, NoteKind, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, rpcContract } from "./server";
+import type { ChangedFile } from "./host-contract";
 import type { Codemap, GhThread } from "./host-contract";
 import type { Brief, BriefEvidence, ClaimVerdict } from "./brief-spec";
 import type { Evidence as SlopEvidence, SlopReport } from "./slop";
@@ -219,8 +220,34 @@ interface ReviewDetail {
   notes: Note[];
   notesRunning: boolean;
   notesError: string | null;
+  seen: { prevHead: string | null; seenHead: string | null };
   chatProjectId: string;
 }
+
+/** A commit view target parsed from the sub-path: `sha`, or `from..to` meaning the commits from `from` through `to` inclusive. */
+interface CommitTarget {
+  to: string;
+  from: string | null;
+  inclusive: boolean;
+}
+function parseCommitTarget(text: string): CommitTarget | null {
+  let decoded = text;
+  try {
+    decoded = decodeURIComponent(text);
+  } catch {
+    // keep the raw text
+  }
+  const m = /^([0-9a-f]{4,40})(?:\.\.([0-9a-f]{4,40}))?$/i.exec(decoded);
+  if (m === null) return null;
+  if (m[2] === undefined) return { to: m[1], from: null, inclusive: false };
+  return { to: m[2], from: m[1], inclusive: true };
+}
+function commitPath(reviewId: string, target: CommitTarget): string {
+  return `${reviewId}/commits/${target.from === null ? target.to : `${target.from}..${target.to}`}`;
+}
+
+/** A jump requested from another view (the commit view) to run once the PR diff is on screen. */
+let pendingJump: { reviewId: string; path: string; line: number | null; side: "old" | "new" } | null = null;
 
 // ---------------------------------------------------------------------------
 // Data hooks
@@ -700,9 +727,14 @@ function toSelectionRef(selection: Selection): SelectionRef {
   };
 }
 
+/** Where a file card's diff comes from: the PR (base..head) or an arbitrary commit range. */
+type DiffSource = { kind: "pr" } | { kind: "range"; base: string; head: string };
+
 interface FileCardProps {
   review: Review;
   file: FileEntry;
+  /** Commit view: no GitHub threads, notes, viewed marks, or comment composer. */
+  source?: DiffSource;
   threads: GhThread[];
   pending: PendingComment[];
   notes: Note[];
@@ -724,6 +756,8 @@ interface FileCardProps {
 
 function FileCard(props: FileCardProps) {
   const { review, file, expanded, onToggle, selection, diffStyle, theme, actions, rpc } = props;
+  const source: DiffSource = props.source ?? { kind: "pr" };
+  const inCommit = source.kind === "range";
   const [patch, setPatch] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [visible, setVisible] = useState(false);
@@ -739,14 +773,18 @@ function FileCard(props: FileCardProps) {
     return () => observer.disconnect();
   }, []);
 
+  const sourceKey = source.kind === "pr" ? `pr:${review.headSha}` : `range:${source.base}..${source.head}`;
   useEffect(() => {
     if (!expanded || !visible || patch !== null || file.binary) return;
-    rpc.call("review_patch", { reviewId: review.id, path: file.path }).then((r) => setPatch(r.patch), (c: unknown) => setError(describeError(c)));
-  }, [expanded, visible, patch, file.binary, file.path, review.id, rpc]);
+    const request = source.kind === "pr"
+      ? rpc.call("review_patch", { reviewId: review.id, path: file.path })
+      : rpc.call("commit_patch", { reviewId: review.id, base: source.base, head: source.head, path: file.path, oldPath: file.oldPath });
+    request.then((r) => setPatch(r.patch), (c: unknown) => setError(describeError(c)));
+  }, [expanded, visible, patch, file.binary, file.path, file.oldPath, review.id, rpc, source]);
 
   useEffect(() => {
     setPatch(null);
-  }, [review.headSha]);
+  }, [sourceKey]);
 
   const fileDiff = useMemo<FileDiffMetadata | null>(() => {
     if (patch === null || patch.trim() === "") return null;
@@ -773,16 +811,21 @@ function FileCard(props: FileCardProps) {
   const selected = selection?.path === file.path ? selection.range : null;
   const loadDiffFiles = useCallback(
     async (meta: FileDiffMetadata) => {
-      const [oldSide, newSide] = await Promise.all([
-        rpc.call("review_file", { reviewId: review.id, path: file.path, side: "old" }),
-        rpc.call("review_file", { reviewId: review.id, path: file.path, side: "new" }),
-      ]);
+      const [oldSide, newSide] = source.kind === "pr"
+        ? await Promise.all([
+            rpc.call("review_file", { reviewId: review.id, path: file.path, side: "old" }),
+            rpc.call("review_file", { reviewId: review.id, path: file.path, side: "new" }),
+          ])
+        : await Promise.all([
+            rpc.call("commit_file", { reviewId: review.id, sha: source.base, path: file.oldPath ?? file.path }),
+            rpc.call("commit_file", { reviewId: review.id, sha: source.head, path: file.path }),
+          ]);
       return {
         oldFile: { name: meta.prevName ?? meta.name, contents: oldSide.content ?? "" },
         newFile: { name: meta.name, contents: newSide.content ?? "" },
       };
     },
-    [rpc, review.id, file.path],
+    [rpc, review.id, file.path, file.oldPath, source],
   );
 
   return (
@@ -800,9 +843,11 @@ function FileCard(props: FileCardProps) {
         {file.pendingCount > 0 ? <span className="rounded-full border border-dashed border-foreground/40 px-1.5 text-[10px]">{file.pendingCount} pending</span> : null}
         {props.notes.filter((n) => n.state === "open" || n.state === "stale").length > 0 ? <span className="rounded-full border border-dashed border-amber-500/60 bg-amber-500/10 px-1.5 text-[10px] text-amber-800 dark:text-amber-200">{props.notes.filter((n) => n.state === "open" || n.state === "stale").length} notes</span> : null}
         <span className="font-mono"><span className="text-primary">+{file.additions}</span> <span className="ml-1 text-destructive">-{file.deletions}</span></span>
-        <Button variant="ghost" size="sm" className={cn("h-6 px-2 text-xs", file.viewed && "text-primary")} onClick={() => props.onViewed(!file.viewed)}>
-          {file.viewed ? <><Icon name="Check" className="size-3" />Viewed</> : "Mark as viewed"}
-        </Button>
+        {inCommit ? null : (
+          <Button variant="ghost" size="sm" className={cn("h-6 px-2 text-xs", file.viewed && "text-primary")} onClick={() => props.onViewed(!file.viewed)}>
+            {file.viewed ? <><Icon name="Check" className="size-3" />Viewed</> : "Mark as viewed"}
+          </Button>
+        )}
         <span className="relative">
           <Button variant="ghost" size="sm" className="h-6 w-6 px-0" onClick={() => setMenu((m) => !m)} aria-label="File actions" aria-expanded={menu}><Icon name="MoreHorizontal" className="size-3.5" /></Button>
           {menu ? (
@@ -823,7 +868,7 @@ function FileCard(props: FileCardProps) {
           <Button type="button" size="sm" className="h-7 text-xs" onClick={() => props.onAttach(toSelectionRef({ path: file.path, range: selected }))} title="Put these lines in the chat as a pill, then ask (shortcut: a)">
             <Icon name="Brain" className="size-3.5" />Add to chat<kbd className="ml-1 rounded border border-primary-foreground/40 px-1 font-mono text-[10px] opacity-80">a</kbd>
           </Button>
-          <Button type="button" variant="outline" size="sm" className="h-7 text-xs" onClick={() => props.onOpenComposer(file.path, selected)}><Icon name="Edit" className="size-3.5" />Comment</Button>
+          <Button type="button" variant="outline" size="sm" className="h-7 text-xs" onClick={() => props.onOpenComposer(file.path, selected)} title={inCommit ? "Comments live on the PR diff; this jumps to the same file and line at the PR head" : undefined}><Icon name="Edit" className="size-3.5" />{inCommit ? "Comment at head" : "Comment"}</Button>
           <Button type="button" variant="outline" size="sm" className="h-7 text-xs" onClick={() => props.onCouncil(`${review.owner}/${review.repo}#${review.number} · ${file.path}:${Math.min(selected.start, selected.end)}-${Math.max(selected.start, selected.end)} (head ${shortSha(review.headSha)})\n\nPlease look at this range.`)} title="Send this range to a Roundtable room"><Icon name="MessageSquare" className="size-3.5" />Council</Button>
           <span className="flex-1" />
           <Button type="button" variant="ghost" size="sm" className="h-7 w-7 px-0" onClick={() => props.onSelect(null)} aria-label="Clear selection"><Icon name="X" className="size-3.5" /></Button>
@@ -1000,18 +1045,198 @@ function Discussion({ reviewId, threads }: { reviewId: string; threads: GhThread
   );
 }
 
-function Commits({ review }: { review: Review }) {
+/** The commit last opened per review; a later shift-click diffs from it. Survives leaving and returning to the tab. */
+const lastCommitOpened = new Map<string, string>();
+
+function Commits({ review, seen, onOpen }: { review: Review; seen: { prevHead: string | null; seenHead: string | null }; onOpen: (target: CommitTarget) => void }) {
+  const [anchor, setAnchorState] = useState<string | null>(() => lastCommitOpened.get(review.id) ?? null);
+  const setAnchor = (sha: string) => {
+    lastCommitOpened.set(review.id, sha);
+    setAnchorState(sha);
+  };
   if (review.commits.length === 0) return <p className="text-sm text-muted-foreground">No commits.</p>;
+  const ordered = review.commits; // oldest first, as GitHub lists them
+  const prevIndex = seen.prevHead === null ? -1 : ordered.findIndex((c) => c.sha === seen.prevHead);
+  const newCount = prevIndex === -1 ? 0 : ordered.length - 1 - prevIndex;
+  const click = (sha: string, shift: boolean) => {
+    if (shift && anchor !== null && anchor !== sha) {
+      const a = ordered.findIndex((c) => c.sha === anchor);
+      const b = ordered.findIndex((c) => c.sha === sha);
+      const [from, to] = a < b ? [anchor, sha] : [sha, anchor];
+      onOpen({ from, to, inclusive: true });
+      return;
+    }
+    setAnchor(sha);
+    onOpen({ to: sha, from: null, inclusive: false });
+  };
   return (
-    <ul className="divide-y divide-border/60 rounded-lg border border-border text-sm">
-      {[...review.commits].reverse().map((c) => (
-        <li key={c.sha} className="flex items-center gap-3 px-3 py-2">
-          <UrlLink href={`${review.url.replace(/\/pull\/\d+$/, "")}/commit/${c.sha}`} className="shrink-0 font-mono text-xs text-muted-foreground hover:text-foreground">{shortSha(c.sha)}</UrlLink>
-          <span className="min-w-0 flex-1 truncate">{c.title}</span>
-          <span className="shrink-0 text-xs text-muted-foreground">{c.author} · {timeAgo(c.date)}</span>
-        </li>
-      ))}
-    </ul>
+    <div className="space-y-2 text-sm">
+      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+        <span>Click a commit for its diff.{anchor !== null ? <> Shift-click another to diff it together with <span className="font-mono">{shortSha(anchor)}</span>.</> : " Shift-click a second one for the range between them."}</span>
+        {newCount > 0 && seen.prevHead !== null ? (
+          <Button variant="outline" size="sm" className="ml-auto h-6 text-xs" onClick={() => onOpen({ from: ordered[prevIndex + 1].sha, to: ordered[ordered.length - 1].sha, inclusive: true })}>
+            Diff the {newCount} new commit{newCount === 1 ? "" : "s"} since you last looked
+          </Button>
+        ) : seen.prevHead !== null && prevIndex === -1 ? <span className="ml-auto">History was rewritten since you last looked; the old head is not in this list.</span> : null}
+      </div>
+      <ul className="divide-y divide-border/60 rounded-lg border border-border">
+        {[...ordered].reverse().map((c, i) => {
+          const index = ordered.length - 1 - i;
+          const isNew = prevIndex !== -1 && index > prevIndex;
+          return (
+            <li key={c.sha}>
+              {prevIndex !== -1 && index === prevIndex && newCount > 0 ? (
+                <div className="flex items-center gap-2 bg-primary/5 px-3 py-1 text-[11px] text-primary"><span className="h-px flex-1 bg-primary/40" />you last looked here<span className="h-px flex-1 bg-primary/40" /></div>
+              ) : null}
+              <button type="button" onClick={(e) => click(c.sha, e.shiftKey)} className={cn("flex w-full items-center gap-3 px-3 py-2 text-left hover:bg-state-hover", anchor === c.sha && "bg-state-active")} title="Open this commit's diff">
+                <span className="shrink-0 font-mono text-xs text-muted-foreground">{shortSha(c.sha)}</span>
+                <span className="min-w-0 flex-1 truncate">{c.title}</span>
+                {isNew ? <span className="shrink-0 rounded-full border border-primary/40 bg-primary/10 px-1.5 text-[10px] text-primary">new</span> : null}
+                <span className="shrink-0 text-xs text-muted-foreground">{c.author} · {timeAgo(c.date)}</span>
+                <UrlLink href={`${review.url.replace(/\/pull\/\d+$/, "")}/commit/${c.sha}`} className="shrink-0 text-muted-foreground hover:text-foreground" title="Open on GitHub" onClick={(e) => e.stopPropagation()}><Icon name="ExternalLink" className="size-3.5" /></UrlLink>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Commit view: one commit or a range of the PR as a diff, read-only apart
+// from the chat. Comments, threads, notes, and viewed marks belong to the
+// PR head diff and are not shown here.
+// ---------------------------------------------------------------------------
+
+interface CommitData {
+  base: string;
+  head: string;
+  info: CommitInfo;
+  commits: CommitInfo[];
+  files: ChangedFile[];
+}
+
+function CommitView({ reviewId, review, target, theme, diffStyle, selection, onSelect, actions, rpc, onAttachAt, onSummarizeCommit, onCouncil, onCommentAtHead, onNavigate }: {
+  reviewId: string;
+  review: Review;
+  target: CommitTarget;
+  theme: { dark: string; light: string; mode: "dark" | "light" };
+  diffStyle: "unified" | "split";
+  selection: Selection | null;
+  onSelect(selection: Selection | null): void;
+  actions: AnnoActions;
+  rpc: ReturnType<typeof useRpc<Contract>>;
+  onAttachAt(sha: string, selection: SelectionRef): void;
+  onSummarizeCommit(sha: string, path: string): void;
+  onCouncil(text: string): void;
+  onCommentAtHead(path: string, line: number, side: "old" | "new"): void;
+  onNavigate(target: CommitTarget | null): void;
+}) {
+  const [data, setData] = useState<CommitData | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [showMessage, setShowMessage] = useState(false);
+  const key = commitPath(reviewId, target);
+  useEffect(() => {
+    setData(null);
+    setError(null);
+    rpc.call("commit_get", { reviewId, to: target.to, ...(target.from === null ? {} : { from: target.from, inclusive: target.inclusive }) }).then(setData, (c: unknown) => setError(describeError(c)));
+  }, [rpc, reviewId, key, target.to, target.from, target.inclusive]);
+
+  if (error) return <div className="p-6"><p role="alert" className="text-sm text-destructive">{error}</p></div>;
+  if (data === null) return <div className="p-6"><EmptyState>Loading commit…</EmptyState></div>;
+
+  const list = review.commits;
+  const index = list.findIndex((c) => c.sha === data.head);
+  const single = target.from === null;
+  const prev = single && index > 0 ? list[index - 1] : null;
+  const next = single && index !== -1 && index < list.length - 1 ? list[index + 1] : null;
+  const additions = data.files.reduce((n, f) => n + f.additions, 0);
+  const deletions = data.files.reduce((n, f) => n + f.deletions, 0);
+  const repoUrl = review.url.replace(/\/pull\/\d+$/, "");
+  const source: DiffSource = { kind: "range", base: data.base, head: data.head };
+
+  return (
+    <div className="mx-auto w-full max-w-5xl px-6 pb-16 pt-6">
+      <button type="button" onClick={() => onNavigate(null)} className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"><Icon name="ChevronLeft" className="size-3.5" />Back to the pull request</button>
+      <div className="mt-3 rounded-lg border border-border bg-card p-4">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          {single ? (
+            <span className="rounded-md border border-border bg-background px-1.5 py-0.5 font-mono">{shortSha(data.head)}</span>
+          ) : (
+            <span className="rounded-md border border-border bg-background px-1.5 py-0.5 font-mono" title={`diff ${data.base.slice(0, 10)}..${data.head.slice(0, 10)}`}>{shortSha(target.from ?? data.base)}..{shortSha(data.head)}</span>
+          )}
+          {single && index !== -1 ? <span className="text-muted-foreground">commit {index + 1} of {list.length}</span> : <span className="text-muted-foreground">{data.commits.length} commit{data.commits.length === 1 ? "" : "s"}</span>}
+          <span className="text-muted-foreground">· {data.files.length} files · <span className="text-primary">+{additions}</span> <span className="text-destructive">-{deletions}</span></span>
+          <span className="ml-auto flex items-center gap-1">
+            {single ? (
+              <>
+                <Button variant="ghost" size="sm" className="h-7 text-xs" disabled={prev === null} onClick={() => prev && onNavigate({ to: prev.sha, from: null, inclusive: false })} title="Older commit"><Icon name="ChevronLeft" className="size-3.5" />Older</Button>
+                <Button variant="ghost" size="sm" className="h-7 text-xs" disabled={next === null} onClick={() => next && onNavigate({ to: next.sha, from: null, inclusive: false })} title="Newer commit">Newer<Icon name="ChevronRight" className="size-3.5" /></Button>
+              </>
+            ) : null}
+            <UrlLink href={single ? `${repoUrl}/commit/${data.head}` : `${repoUrl}/compare/${data.base}...${data.head}`} className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground hover:text-foreground"><Icon name="ExternalLink" className="size-3.5" />GitHub</UrlLink>
+          </span>
+        </div>
+        <h2 className="mt-2 text-lg font-semibold leading-tight">{single ? data.info.title : `${data.commits.length} commits`}</h2>
+        {single ? (
+          <>
+            <div className="mt-1 text-xs text-muted-foreground">{data.info.author} · {timeAgo(data.info.date)}{data.info.parents.length > 1 ? " · merge commit, diffed against its first parent" : ""}</div>
+            {data.info.body ? (
+              <div className="mt-2">
+                <button type="button" className="text-xs text-muted-foreground hover:text-foreground" onClick={() => setShowMessage((v) => !v)}>{showMessage ? "Hide message" : "Read the full message"}</button>
+                {showMessage ? <div className={cn(PROSE, "mt-1 rounded-md border border-border/60 bg-background/60 p-3 text-sm")}><Markdown content={data.info.body} /></div> : null}
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <ul className="mt-2 divide-y divide-border/60 rounded-md border border-border/60 text-xs">
+            {[...data.commits].reverse().map((c) => (
+              <li key={c.sha} className="flex items-center gap-3 px-3 py-1.5">
+                <button type="button" onClick={() => onNavigate({ to: c.sha, from: null, inclusive: false })} className="shrink-0 font-mono text-muted-foreground hover:underline">{shortSha(c.sha)}</button>
+                <span className="min-w-0 flex-1 truncate">{c.title}</span>
+                <span className="shrink-0 text-muted-foreground">{c.author} · {timeAgo(c.date)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="mt-3 text-xs text-muted-foreground">Threads, pending comments, notes, and viewed marks live on the pull request diff and are not shown here. Select lines to ask the analyst about them as they were at this commit; Comment at head jumps to the same lines in the PR diff.</div>
+      </div>
+
+      <div className="mt-6 flex flex-col gap-3">
+        {data.files.length === 0 ? <EmptyState>No file changes in this range.</EmptyState> : null}
+        {data.files.map((f, i) => {
+          const entry: FileEntry = { ...f, viewed: false, threadCount: 0, unresolvedCount: 0, pendingCount: 0 };
+          const expanded = !collapsed.has(f.path) && i < 40 && f.additions + f.deletions <= 800;
+          return (
+            <FileCard
+              key={`${key}:${f.path}`}
+              review={review}
+              file={entry}
+              source={source}
+              threads={[]}
+              pending={[]}
+              notes={[]}
+              composer={null}
+              selection={selection}
+              onSelect={onSelect}
+              onOpenComposer={(path, range) => onCommentAtHead(path, Math.max(range.start, range.end), (range.side ?? "additions") === "deletions" ? "old" : "new")}
+              expanded={expanded}
+              onToggle={() => setCollapsed((s) => { const n = new Set(s); if (n.has(f.path)) n.delete(f.path); else n.add(f.path); return n; })}
+              onViewed={() => undefined}
+              diffStyle={diffStyle}
+              theme={theme}
+              actions={actions}
+              rpc={rpc}
+              onAttach={(sel) => onAttachAt(data.head, sel)}
+              onSummarize={() => onSummarizeCommit(data.head, f.path)}
+              onCouncil={onCouncil}
+            />
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -1204,11 +1429,16 @@ function BriefPanel({ reviewId, onJump, signalNotes, onToggleSignal }: { reviewI
 
 type Tab = "brief" | "description" | "discussion" | "commits";
 
-function ReviewView({ reviewId }: { reviewId: string }) {
+function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarget | null }) {
   const { rpc, detail, error, refetch } = useReview(reviewId);
   const panel = useAppPanel();
   const navigate = useBbNavigate();
   const codeTheme = useCodeTheme();
+
+  // Remember the head this review is being looked at, so Commits can mark what is new next time.
+  useEffect(() => {
+    rpc.call("review_seen", { reviewId }).then(() => refetch(), () => undefined);
+  }, [rpc, reviewId, refetch]);
   const [tab, setTab] = useState<Tab>("brief");
   const [diffStyle, setDiffStyle] = useState<"unified" | "split">("unified");
   const [selection, setSelectionState] = useState<Selection | null>(null);
@@ -1296,6 +1526,8 @@ function ReviewView({ reviewId }: { reviewId: string }) {
   }, [setSelection]);
 
   // `a` with lines selected drops them into the chat; ignored while typing.
+  // In a commit view the pill points at the lines as they were at that commit.
+  const commitHead = useRef<string | null>(null);
   useEffect(() => {
     if (selection === null) return;
     const onKey = (e: KeyboardEvent) => {
@@ -1303,16 +1535,75 @@ function ReviewView({ reviewId }: { reviewId: string }) {
       const target = e.target as HTMLElement | null;
       if (target && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
       e.preventDefault();
-      attachToChat(selectionPill(reviewId, toSelectionRef(selection)));
+      const sel = toSelectionRef(selection);
+      const sha = commit === null ? null : commitHead.current;
+      attachToChat(sha === null ? selectionPill(reviewId, sel) : pill({ kind: "crange", reviewId, sha, path: sel.path, startLine: sel.startLine, endLine: sel.endLine }));
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selection, reviewId, attachToChat]);
+  }, [selection, reviewId, attachToChat, commit]);
+
+  const openCommit = useCallback((target: CommitTarget | null) => {
+    setSelection(null);
+    navigate.toPluginPanel(PANEL_PATH, { subPath: target === null ? reviewId : commitPath(reviewId, target) });
+  }, [navigate, reviewId, setSelection]);
+
+  // A jump queued by the commit view runs once the PR diff is on screen.
+  useEffect(() => {
+    if (commit !== null || detail === null || pendingJump === null || pendingJump.reviewId !== reviewId) return;
+    const jump = pendingJump;
+    pendingJump = null;
+    setTimeout(() => jumpToLine(jump.path, jump.line, jump.side), 100);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [commit, detail === null, reviewId]);
 
   if (error !== null) return <div className="p-6"><p role="alert" className="text-sm text-destructive">{error}</p></div>;
   if (detail === null) return <div className="p-6"><EmptyState>Loading review…</EmptyState></div>;
 
   const { review, files, threads, pending } = detail;
+  const topBar = (
+    <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-xs">
+      <Button variant="ghost" size="sm" className="h-7 px-1.5" onClick={() => (commit === null ? navigate.toPluginPanel(PANEL_PATH) : openCommit(null))} aria-label={commit === null ? "Back to reviews" : "Back to the pull request"}><Icon name="ChevronLeft" className="size-4" /></Button>
+      <Icon name="GitPullRequest" className="size-3.5 text-muted-foreground" />
+      <span className="min-w-0 truncate"><span className="text-muted-foreground">#{review.number}</span> <span className="font-medium">{review.title}</span> <span className="text-muted-foreground">{review.repo}</span>{commit !== null ? <span className="text-muted-foreground"> › {commit.from === null ? `commit ${shortSha(commit.to)}` : `${shortSha(commit.from)}..${shortSha(commit.to)}`}</span> : null}</span>
+      <span className="ml-auto flex items-center gap-1.5">
+        <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => void run("sync", async () => { await rpc.call("reviews_sync", { reviewId }); refetch(); toast.success("Synced with GitHub"); })} disabled={busy !== null} title="Refresh PR metadata, head, and threads">
+          <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", busy === "sync" && "animate-spin")} />Sync
+        </Button>
+        <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: CODEMAP_TAB, target: { reviewId } })}><Icon name="Layers" className="size-3.5" />Codemap</Button>
+        <Button variant="outline" size="sm" className="h-7 text-xs" onClick={openChat}><Icon name="Brain" className="size-3.5" />Chat</Button>
+        <Button size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: INFO_TAB, target: { reviewId } })}>
+          <Icon name="Github" className="size-3.5" />Review{pending.length > 0 ? ` · ${pending.length}` : ""}
+        </Button>
+      </span>
+    </div>
+  );
+  if (commit !== null) {
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        {topBar}
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <CommitView
+            reviewId={reviewId}
+            review={review}
+            target={commit}
+            theme={theme}
+            diffStyle={diffStyle}
+            selection={selection}
+            onSelect={setSelection}
+            actions={actions}
+            rpc={rpc}
+            onAttachAt={(sha, sel) => { commitHead.current = sha; attachToChat(pill({ kind: "crange", reviewId, sha, path: sel.path, startLine: sel.startLine, endLine: sel.endLine })); }}
+            onSummarizeCommit={(sha, path) => attachToChat(pill({ kind: "commit", reviewId, sha }), `Summarize what ${path} changes in this commit and why.`)}
+            onCouncil={(text) => setRoomText(text)}
+            onCommentAtHead={(path, line, side) => { pendingJump = { reviewId, path, line, side }; openCommit(null); }}
+            onNavigate={openCommit}
+          />
+        </div>
+        {roomText !== null ? <RoomSender text={roomText} onClose={() => setRoomText(null)} /> : null}
+      </div>
+    );
+  }
   const threadsByPath = new Map<string, GhThread[]>();
   for (const t of threads) threadsByPath.set(t.path, [...(threadsByPath.get(t.path) ?? []), t]);
   const pendingByPath = new Map<string, PendingComment[]>();
@@ -1363,21 +1654,7 @@ function ReviewView({ reviewId }: { reviewId: string }) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-xs">
-        <Button variant="ghost" size="sm" className="h-7 px-1.5" onClick={() => navigate.toPluginPanel(PANEL_PATH)} aria-label="Back to reviews"><Icon name="ChevronLeft" className="size-4" /></Button>
-        <Icon name="GitPullRequest" className="size-3.5 text-muted-foreground" />
-        <span className="min-w-0 truncate"><span className="text-muted-foreground">#{review.number}</span> <span className="font-medium">{review.title}</span> <span className="text-muted-foreground">{review.repo}</span></span>
-        <span className="ml-auto flex items-center gap-1.5">
-          <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => void run("sync", async () => { await rpc.call("reviews_sync", { reviewId }); refetch(); toast.success("Synced with GitHub"); })} disabled={busy !== null} title="Refresh PR metadata, head, and threads">
-            <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", busy === "sync" && "animate-spin")} />Sync
-          </Button>
-          <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: CODEMAP_TAB, target: { reviewId } })}><Icon name="Layers" className="size-3.5" />Codemap</Button>
-          <Button variant="outline" size="sm" className="h-7 text-xs" onClick={openChat}><Icon name="Brain" className="size-3.5" />Chat</Button>
-          <Button size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: INFO_TAB, target: { reviewId } })}>
-            <Icon name="Github" className="size-3.5" />Review{pending.length > 0 ? ` · ${pending.length}` : ""}
-          </Button>
-        </span>
-      </div>
+      {topBar}
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-5xl px-6 pb-16 pt-8">
@@ -1407,7 +1684,7 @@ function ReviewView({ reviewId }: { reviewId: string }) {
             ))}
           </div>
           <div className="mt-4">
-            {tab === "brief" ? <BriefPanel reviewId={reviewId} onJump={jumpToLine} signalNotes={signalNotes} onToggleSignal={toggleSignalNotes} /> : tab === "description" ? <Description body={review.body} /> : tab === "discussion" ? <Discussion reviewId={reviewId} threads={threads} /> : <Commits review={review} />}
+            {tab === "brief" ? <BriefPanel reviewId={reviewId} onJump={jumpToLine} signalNotes={signalNotes} onToggleSignal={toggleSignalNotes} /> : tab === "description" ? <Description body={review.body} /> : tab === "discussion" ? <Discussion reviewId={reviewId} threads={threads} /> : <Commits review={review} seen={detail.seen} onOpen={openCommit} />}
           </div>
 
           <div className="mt-10 flex flex-wrap items-center gap-3">
@@ -1847,9 +2124,10 @@ function ReviewsPage({ subPath }: { subPath: string }) {
   const [ref, setRef] = useState("");
   const [opening, setOpening] = useState(false);
   const [openError, setOpenError] = useState<string | null>(null);
-  const [head] = subPath.split("/");
+  const [head, section, target] = subPath.split("/");
   const reviewId = head !== "" ? head : null;
-  if (reviewId !== null) return <ReviewView key={reviewId} reviewId={reviewId} />;
+  const commit = section === "commits" && target !== undefined ? parseCommitTarget(target) : null;
+  if (reviewId !== null) return <ReviewView key={reviewId} reviewId={reviewId} commit={commit} />;
   const open = async (e: FormEvent) => {
     e.preventDefault();
     if (ref.trim() === "") return;
