@@ -31,11 +31,9 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { FileDiff, type DiffLineAnnotation, type FileDiffMetadata, type SelectedLineRange } from "@pierre/diffs/react";
 import { parsePatchFiles } from "@pierre/diffs";
-import type { CodemapState, DiagramRecord, DiagramTarget, FileEntry, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, rpcContract } from "./server";
+import type { CodemapState, FileEntry, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, rpcContract } from "./server";
 import type { Codemap, GhThread } from "./host-contract";
 import { MENTION_PROVIDER_ID, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
-import { PRESET_LABELS, type DiagramPreset, type DiagramRef, type DiagramSpec } from "./diagram-spec";
-import { DiagramCanvas, changeMapSpec, type ViewMode } from "./diagram";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
@@ -81,20 +79,6 @@ function drainAttaches(reviewId: string): Attach[] {
   const list = pendingAttaches.get(reviewId) ?? [];
   pendingAttaches.delete(reviewId);
   return list;
-}
-
-/** Diagram nodes ask the review page to show a place in the diff. */
-const JUMP_EVENT = "review-desk:jump";
-function jumpTo(reviewId: string, ref: DiagramRef): void {
-  window.dispatchEvent(new CustomEvent(JUMP_EVENT, { detail: { reviewId, ref } }));
-}
-
-/** A pill for a diagram node: a symbol when the ref names one, else the file or range. */
-function refPill(reviewId: string, ref: DiagramRef): PluginComposerMention {
-  if (ref.startLine === null) return pill({ kind: "file", reviewId, path: ref.path });
-  const range = { reviewId, path: ref.path, startLine: ref.startLine, endLine: ref.endLine ?? ref.startLine, side: ref.side };
-  const looksLikeRange = /:\d+(-\d+)?$/.test(ref.label);
-  return looksLikeRange ? pill({ kind: "range", ...range }) : pill({ kind: "symbol", qualified: ref.label, ...range });
 }
 
 /** Review whose "new chat" composer is on screen; that composer scope has no thread id yet. */
@@ -154,7 +138,6 @@ function isReviewTarget(value: JsonValue): value is ReviewTarget {
 const INFO_TAB: ExperimentalPluginFixedTabReference<ReviewTarget> = { panelId: PANEL_ID, id: "info", experimental_target: { validate: isReviewTarget } };
 const CHAT_TAB: ExperimentalPluginFixedTabReference<ReviewTarget> = { panelId: PANEL_ID, id: "chat", experimental_target: { validate: isReviewTarget } };
 const CODEMAP_TAB: ExperimentalPluginFixedTabReference<ReviewTarget> = { panelId: PANEL_ID, id: "codemap", experimental_target: { validate: isReviewTarget } };
-const DIAGRAMS_TAB: ExperimentalPluginFixedTabReference<ReviewTarget> = { panelId: PANEL_ID, id: "diagrams", experimental_target: { validate: isReviewTarget } };
 
 const SHIKI_THEMES = new Set([
   "andromeeda", "aurora-x", "ayu-dark", "catppuccin-frappe", "catppuccin-latte", "catppuccin-macchiato", "catppuccin-mocha", "dark-plus", "dracula", "dracula-soft",
@@ -312,24 +295,6 @@ function useCodemap(reviewId: string | null, enabled: boolean) {
     return () => clearInterval(timer);
   }, [state?.status, load]);
   return { state, error, refresh: () => load(true) };
-}
-
-function useDiagrams(reviewId: string | null) {
-  const rpc = useRpc<Contract>();
-  const [diagrams, setDiagrams] = useState<DiagramRecord[] | null>(null);
-  const load = useCallback(() => {
-    if (reviewId === null) return;
-    rpc.call("diagrams_list", { reviewId }).then((r) => setDiagrams(r.diagrams), () => undefined);
-  }, [rpc, reviewId]);
-  useEffect(() => {
-    setDiagrams(null);
-    load();
-  }, [load]);
-  useRealtime(REVIEW_CHANGED, (payload) => {
-    const p = payloadReview(payload);
-    if (p !== null && p.reviewId === reviewId && (p.what === "diagrams" || p.what === "synced")) load();
-  });
-  return { diagrams, rpc };
 }
 
 function useProviders() {
@@ -564,8 +529,6 @@ interface FileCardProps {
   onAttach(selection: SelectionRef): void;
   onSummarize(): void;
   onCouncil(text: string): void;
-  onDiagram(selection: SelectionRef): void;
-  onDrawFile(): void;
 }
 
 function FileCard(props: FileCardProps) {
@@ -652,7 +615,6 @@ function FileCard(props: FileCardProps) {
           {menu ? (
             <div className="absolute right-0 top-full z-20 mt-1 w-52 rounded-md border border-border bg-card p-1 text-xs shadow-md">
               <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => { setMenu(false); props.onSummarize(); }}><Icon name="Brain" className="size-3.5" />Summarize in chat</button>
-              <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => { setMenu(false); props.onDrawFile(); }}><Icon name="Workflow" className="size-3.5" />Draw what changed</button>
               <FileLink target={{ kind: "host", hostId: review.hostId, path: `${review.worktree}/${file.path}` }} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => setMenu(false)}><Icon name="ExternalLink" className="size-3.5" />Open file at head</FileLink>
               <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => { void navigator.clipboard?.writeText(file.path); setMenu(false); toast.success("Path copied"); }}><Icon name="Copy" className="size-3.5" />Copy path</button>
             </div>
@@ -669,7 +631,6 @@ function FileCard(props: FileCardProps) {
             <Icon name="Brain" className="size-3.5" />Add to chat<kbd className="ml-1 rounded border border-primary-foreground/40 px-1 font-mono text-[10px] opacity-80">a</kbd>
           </Button>
           <Button type="button" variant="outline" size="sm" className="h-7 text-xs" onClick={() => props.onOpenComposer(file.path, selected)}><Icon name="Edit" className="size-3.5" />Comment</Button>
-          <Button type="button" variant="outline" size="sm" className="h-7 text-xs" onClick={() => props.onDiagram(toSelectionRef({ path: file.path, range: selected }))} title="Draw the control flow through these lines"><Icon name="Workflow" className="size-3.5" />Diagram</Button>
           <Button type="button" variant="outline" size="sm" className="h-7 text-xs" onClick={() => props.onCouncil(`${review.owner}/${review.repo}#${review.number} · ${file.path}:${Math.min(selected.start, selected.end)}-${Math.max(selected.start, selected.end)} (head ${shortSha(review.headSha)})\n\nPlease look at this range.`)} title="Send this range to a Roundtable room"><Icon name="MessageSquare" className="size-3.5" />Council</Button>
           <span className="flex-1" />
           <Button type="button" variant="ghost" size="sm" className="h-7 w-7 px-0" onClick={() => props.onSelect(null)} aria-label="Clear selection"><Icon name="X" className="size-3.5" /></Button>
@@ -923,66 +884,19 @@ function ReviewView({ reviewId }: { reviewId: string }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reviewId]);
 
-  const openDiagrams = useCallback(() => panel.openFixedTab({ surface: { kind: "current" }, tab: DIAGRAMS_TAB, target: { reviewId } }), [panel, reviewId]);
-
-  /** Queue a drawing and show the Diagrams tab, which picks the newest request. */
-  const requestDiagram = useCallback((preset: DiagramPreset, target: DiagramTarget) => {
-    void rpc.call("diagram_request", { reviewId, preset, target }).then(
-      () => openDiagrams(),
-      (cause: unknown) => toast.error(describeError(cause)),
-    );
-  }, [rpc, reviewId, openDiagrams]);
-
-  // Keys while not typing: `a` puts the selected lines in the chat, `d` opens Diagrams.
+  // `a` with lines selected drops them into the chat; ignored while typing.
   useEffect(() => {
+    if (selection === null) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+      if (e.key !== "a" || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
       const target = e.target as HTMLElement | null;
       if (target && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
-      if (e.key === "a" && selection !== null) {
-        e.preventDefault();
-        attachToChat(selectionPill(reviewId, toSelectionRef(selection)));
-      } else if (e.key === "d") {
-        e.preventDefault();
-        openDiagrams();
-      }
+      e.preventDefault();
+      attachToChat(selectionPill(reviewId, toSelectionRef(selection)));
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selection, reviewId, attachToChat, openDiagrams]);
-
-  // Diagram nodes jump here: expand the file, select the lines, scroll to them.
-  useEffect(() => {
-    const onJump = (e: Event) => {
-      const detail = (e as CustomEvent<{ reviewId: string; ref: DiagramRef }>).detail;
-      if (detail.reviewId !== reviewId) return;
-      const { ref } = detail;
-      setFilter("");
-      setCollapsed((s) => { const n = new Set(s); n.delete(ref.path); return n; });
-      setExpandedOverride((s) => new Set(s).add(ref.path));
-      if (ref.startLine !== null) {
-        setSelection({ path: ref.path, range: { start: ref.startLine, end: ref.endLine ?? ref.startLine, side: ref.side === "old" ? "deletions" : "additions" } });
-      }
-      // Diffs above the target load lazily and push it down, so settle the
-      // scroll a few times; for a line ref, then center the line itself.
-      const wanted = ref.startLine === null ? null : String(ref.startLine);
-      let tries = 0;
-      const settle = () => {
-        const card = document.getElementById(fileAnchorId(ref.path));
-        const host = card ? Array.from(card.querySelectorAll("*")).find((el) => el.shadowRoot !== null) : undefined;
-        const cell = wanted !== null && host?.shadowRoot ? Array.from(host.shadowRoot.querySelectorAll("[data-line-number-content]")).find((el) => el.textContent?.trim() === wanted) : undefined;
-        if (cell) {
-          cell.scrollIntoView({ block: "center" });
-          return;
-        }
-        card?.scrollIntoView({ block: "start" });
-        if (++tries < 10) setTimeout(settle, tries < 4 ? 300 : 600);
-      };
-      settle();
-    };
-    window.addEventListener(JUMP_EVENT, onJump);
-    return () => window.removeEventListener(JUMP_EVENT, onJump);
-  }, [reviewId, setSelection]);
+  }, [selection, reviewId, attachToChat]);
 
   if (error !== null) return <div className="p-6"><p role="alert" className="text-sm text-destructive">{error}</p></div>;
   if (detail === null) return <div className="p-6"><EmptyState>Loading review…</EmptyState></div>;
@@ -1024,7 +938,6 @@ function ReviewView({ reviewId }: { reviewId: string }) {
             <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", busy === "sync" && "animate-spin")} />Sync
           </Button>
           <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: CODEMAP_TAB, target: { reviewId } })}><Icon name="Layers" className="size-3.5" />Codemap</Button>
-          <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={openDiagrams} title="Change map and drawn diagrams (shortcut: d)"><Icon name="Workflow" className="size-3.5" />Diagrams</Button>
           <Button variant="outline" size="sm" className="h-7 text-xs" onClick={openChat}><Icon name="Brain" className="size-3.5" />Chat</Button>
           <Button size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: INFO_TAB, target: { reviewId } })}>
             <Icon name="Github" className="size-3.5" />Review{pending.length > 0 ? ` · ${pending.length}` : ""}
@@ -1108,8 +1021,6 @@ function ReviewView({ reviewId }: { reviewId: string }) {
                   onAttach={(sel) => attachToChat(selectionPill(reviewId, sel))}
                   onSummarize={() => attachToChat(pill({ kind: "file", reviewId, path: f.path }), "Summarize these changes and why they matter for this PR.")}
                   onCouncil={(text) => setRoomText(text)}
-                  onDiagram={(sel) => requestDiagram("flow", { selection: sel })}
-                  onDrawFile={() => requestDiagram("file", { path: f.path })}
                 />
               );
             })}
@@ -1462,172 +1373,6 @@ function CodemapTab() {
 }
 
 // ---------------------------------------------------------------------------
-// Diagrams tab: the change map (from the codemap, no model) plus diagrams
-// drawn on request by the illustrator seat. Every node jumps to the diff.
-// ---------------------------------------------------------------------------
-
-const CHANGE_MAP = "change-map";
-
-function DiagramsTab() {
-  const target = useFixedTabTarget(DIAGRAMS_TAB);
-  const reviewId = target?.target.reviewId ?? null;
-  const { detail } = useReview(reviewId);
-  const { state: codemap, refresh: refreshCodemap } = useCodemap(reviewId, reviewId !== null);
-  const { diagrams, rpc } = useDiagrams(reviewId);
-  const panel = useAppPanel();
-  const selection = useSelectionRef(reviewId);
-  const [selected, setSelected] = useState<string>(CHANGE_MAP);
-  const [level, setLevel] = useState<"module" | "file">("module");
-  const [mode, setMode] = useState<ViewMode>("both");
-  const [hideUnchanged, setHideUnchanged] = useState(false);
-  const [drawOpen, setDrawOpen] = useState(false);
-  const [custom, setCustom] = useState("");
-  const [filePick, setFilePick] = useState("");
-  const [busy, setBusy] = useState(false);
-  const newest = useRef<number>(0);
-
-  // A request made from the diff arrives here as the newest row: show it.
-  useEffect(() => {
-    if (diagrams === null) return;
-    const latest = diagrams.reduce((best, d) => (d.createdAt > (best?.createdAt ?? 0) ? d : best), null as DiagramRecord | null);
-    if (latest === null) return;
-    if (latest.createdAt > newest.current) {
-      newest.current = latest.createdAt;
-      if (latest.status === "queued" || latest.status === "drawing" || Date.now() - latest.createdAt < 10_000) setSelected(latest.id);
-    }
-  }, [diagrams]);
-
-  const files = detail?.files ?? [];
-  const changeMap = useMemo<DiagramSpec | null>(
-    () => (codemap?.status === "ready" && codemap.codemap !== null ? changeMapSpec(codemap.codemap, files, level) : null),
-    [codemap, files, level],
-  );
-
-  if (reviewId === null) return <div className="p-4"><EmptyState>Open a review and press Diagrams (or <kbd className="rounded border border-border px-1 font-mono">d</kbd>) to see it drawn here.</EmptyState></div>;
-
-  const current = selected === CHANGE_MAP ? null : (diagrams ?? []).find((d) => d.id === selected) ?? null;
-  if (selected !== CHANGE_MAP && current === null && diagrams !== null) setSelected(CHANGE_MAP);
-  const spec: DiagramSpec | null = selected === CHANGE_MAP ? changeMap : ((current?.spec as unknown as DiagramSpec | null) ?? null);
-
-  const request = async (preset: DiagramPreset, t: DiagramTarget) => {
-    setBusy(true);
-    try {
-      const r = await rpc.call("diagram_request", { reviewId, preset, target: t });
-      newest.current = r.diagram.createdAt;
-      setSelected(r.diagram.id);
-      setDrawOpen(false);
-      setCustom("");
-    } catch (cause) {
-      toast.error(describeError(cause));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const onJump = (ref: DiagramRef) => jumpTo(reviewId, ref);
-  const onPill = (ref: DiagramRef) => {
-    queueAttach(reviewId, { mention: refPill(reviewId, ref) });
-    panel.openFixedTab({ surface: { kind: "current" }, tab: CHAT_TAB, target: { reviewId } });
-  };
-  const statusDot = (d: DiagramRecord) =>
-    d.status === "ready" ? (d.stale ? "bg-muted-foreground/60" : "bg-primary") : d.status === "failed" ? "bg-destructive" : "bg-foreground/40 animate-pulse";
-
-  return (
-    <div className="flex h-full min-h-0 flex-col text-xs">
-      <div className="flex flex-wrap items-center gap-1 border-b border-border px-2 py-1.5">
-        <button type="button" onClick={() => setSelected(CHANGE_MAP)} className={cn("inline-flex items-center gap-1.5 rounded-md px-2 py-1", selected === CHANGE_MAP ? "bg-state-active font-medium" : "text-muted-foreground hover:bg-state-hover")}>
-          <Icon name="Layers" className="size-3.5" />Change map
-        </button>
-        {(diagrams ?? []).map((d) => (
-          <button key={d.id} type="button" onClick={() => setSelected(d.id)} className={cn("inline-flex max-w-48 items-center gap-1.5 rounded-md px-2 py-1", selected === d.id ? "bg-state-active font-medium" : "text-muted-foreground hover:bg-state-hover")} title={d.error ?? d.title}>
-            <span className={cn("size-1.5 shrink-0 rounded-full", statusDot(d))} />
-            <span className="truncate">{d.title}</span>
-          </button>
-        ))}
-        <span className="relative ml-auto">
-          <Button size="sm" variant={drawOpen ? "default" : "outline"} className="h-7 text-xs" onClick={() => setDrawOpen((v) => !v)} aria-expanded={drawOpen}>
-            <Icon name="Plus" className="size-3.5" />Draw
-          </Button>
-          {drawOpen ? (
-            <div className="absolute right-0 top-full z-20 mt-1 w-80 space-y-1 rounded-md border border-border bg-card p-2 shadow-md">
-              <div className="px-1 pb-1 text-[11px] text-muted-foreground">The illustrator reads the code first. About a minute each; one at a time.</div>
-              <button type="button" disabled={busy} className="flex w-full flex-col rounded px-2 py-1.5 text-left hover:bg-state-hover disabled:opacity-50" onClick={() => void request("architecture", {})}>
-                <span className="font-medium">{PRESET_LABELS.architecture}</span>
-                <span className="text-muted-foreground">Components and how they depend on each other, removed and added in one picture.</span>
-              </button>
-              <button type="button" disabled={busy || selection === null} className="flex w-full flex-col rounded px-2 py-1.5 text-left hover:bg-state-hover disabled:opacity-50" onClick={() => selection && void request("flow", { selection })}>
-                <span className="font-medium">{PRESET_LABELS.flow}</span>
-                <span className="text-muted-foreground">{selection ? `Sequence from caller to callee through ${splitPath(selection.path).name}:${selection.startLine}${selection.endLine !== selection.startLine ? `-${selection.endLine}` : ""}.` : "Select lines in the diff first."}</span>
-              </button>
-              <button type="button" disabled={busy} className="flex w-full flex-col rounded px-2 py-1.5 text-left hover:bg-state-hover disabled:opacity-50" onClick={() => void request("data", {})}>
-                <span className="font-medium">{PRESET_LABELS.data}</span>
-                <span className="text-muted-foreground">Types, structs, enums, tables, and how they relate.</span>
-              </button>
-              <div className="rounded px-2 py-1.5">
-                <div className="font-medium">{PRESET_LABELS.file}</div>
-                <div className="mt-1 flex items-center gap-1">
-                  <Input list="rd-diagram-files" value={filePick} onChange={(e) => setFilePick(e.target.value)} placeholder="path in this PR" className="h-7 flex-1 font-mono text-xs" aria-label="File to draw" />
-                  <datalist id="rd-diagram-files">{files.map((f) => <option key={f.path} value={f.path} />)}</datalist>
-                  <Button size="sm" className="h-7 text-xs" disabled={busy || !files.some((f) => f.path === filePick)} onClick={() => void request("file", { path: filePick })}>Draw</Button>
-                </div>
-              </div>
-              <div className="rounded px-2 py-1.5">
-                <div className="font-medium">{PRESET_LABELS.custom}</div>
-                <TextArea value={custom} onChange={setCustom} rows={2} placeholder="e.g. show how the affinity lease moves between the catalog and the scheduler" />
-                <div className="mt-1 flex items-center justify-between text-muted-foreground">
-                  <span>{selection ? "Includes the selected lines." : ""}</span>
-                  <Button size="sm" className="h-7 text-xs" disabled={busy || custom.trim() === ""} onClick={() => void request("custom", { text: custom.trim(), ...(selection ? { selection } : {}) })}>Draw</Button>
-                </div>
-              </div>
-            </div>
-          ) : null}
-        </span>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-1.5">
-        <span className="min-w-0 truncate text-sm font-semibold">{spec?.title ?? current?.title ?? "Change map"}</span>
-        {selected === CHANGE_MAP ? (
-          <span className="inline-flex rounded-md border border-border p-0.5">
-            {(["module", "file"] as const).map((l) => <button key={l} type="button" onClick={() => setLevel(l)} className={cn("rounded px-1.5 py-0.5", level === l ? "bg-state-active font-medium" : "text-muted-foreground")}>{l === "module" ? "Modules" : "Files"}</button>)}
-          </span>
-        ) : null}
-        <span className="inline-flex rounded-md border border-border p-0.5">
-          {(["before", "both", "after"] as const).map((m) => <button key={m} type="button" onClick={() => setMode(m)} className={cn("rounded px-1.5 py-0.5 capitalize", mode === m ? "bg-state-active font-medium" : "text-muted-foreground")}>{m}</button>)}
-        </span>
-        <label className="inline-flex items-center gap-1 text-muted-foreground"><input type="checkbox" checked={hideUnchanged} onChange={(e) => setHideUnchanged(e.target.checked)} />hide unchanged</label>
-        <span className="ml-auto flex items-center gap-1">
-          {current?.stale ? <span className="rounded-full border border-border px-1.5 text-[10px] text-muted-foreground" title="The PR head moved since this was drawn">stale</span> : null}
-          {current ? <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs" disabled={current.status === "drawing" || current.status === "queued"} onClick={() => void rpc.call("diagram_retry", { id: current.id }).catch((c: unknown) => toast.error(describeError(c)))} title="Draw again at the current head"><Icon name="ArrowReloadHorizontal" className="size-3.5" />Redraw</Button> : null}
-          {current ? <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs text-destructive" onClick={() => void rpc.call("diagram_delete", { id: current.id }).then(() => setSelected(CHANGE_MAP))} aria-label="Delete diagram"><Icon name="X" className="size-3.5" /></Button> : null}
-          {selected === CHANGE_MAP ? <Button variant="ghost" size="sm" className="h-6 px-1.5" onClick={refreshCodemap} aria-label="Rebuild codemap"><Icon name="ArrowReloadHorizontal" className="size-3.5" /></Button> : null}
-        </span>
-      </div>
-      {spec?.summary ? <div className="border-b border-border px-3 py-1.5 text-muted-foreground">{spec.summary}</div> : null}
-
-      <div className="min-h-0 flex-1">
-        {selected === CHANGE_MAP && changeMap === null ? (
-          <p className="inline-flex items-center gap-1.5 p-3 text-muted-foreground"><Icon name="Loading" className="size-3.5 animate-spin" />{codemap?.status === "failed" ? codemap.error ?? "Codemap failed." : "Building the codemap the change map is drawn from…"}</p>
-        ) : current && (current.status === "queued" || current.status === "drawing") ? (
-          <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center text-muted-foreground">
-            <Icon name="Loading" className="size-5 animate-spin" />
-            <p>{current.status === "queued" ? "Queued behind another drawing." : "Drawing. The illustrator reads the code first; this takes about a minute."}</p>
-          </div>
-        ) : current && current.status === "failed" ? (
-          <div className="space-y-2 p-4">
-            <p className="text-destructive">{current.error ?? "The drawing failed."}</p>
-            <Button size="sm" variant="outline" onClick={() => void rpc.call("diagram_retry", { id: current.id })}>Retry</Button>
-          </div>
-        ) : spec ? (
-          <DiagramCanvas spec={spec} mode={mode} hideUnchanged={hideUnchanged} onJump={onJump} onPill={onPill} />
-        ) : (
-          <EmptyState>Nothing to draw yet.</EmptyState>
-        )}
-      </div>
-      <div className="border-t border-border px-3 py-1 text-[11px] text-muted-foreground">Click a node to jump to its lines. Hover for notes; the + on a node adds it to the chat. Wheel to zoom, drag to pan.</div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -1705,7 +1450,6 @@ export default definePluginApp((app) => {
       { ...INFO_TAB, title: "Info", icon: "Info", layout: "flush", component: InfoTab },
       { ...CHAT_TAB, title: "Chat", icon: "Brain", layout: "flush", component: ChatTab },
       { ...CODEMAP_TAB, title: "Codemap", icon: "Layers", layout: "flush", component: CodemapTab },
-      { ...DIAGRAMS_TAB, title: "Diagrams", icon: "Workflow", layout: "flush", component: DiagramsTab },
     ],
   });
   app.composer.customize({

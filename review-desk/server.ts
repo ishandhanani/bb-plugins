@@ -12,7 +12,6 @@ import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi, type PluginMentionItem, type PluginMentionSearchContext } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { MENTION_PROVIDER_ID, decodeMentionRef, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
-import { DIAGRAM_FENCE, DIAGRAM_LIMITS, type ChangeStatus, type DiagramNode, type DiagramPreset, type DiagramRef, type DiagramSpec } from "./diagram-spec";
 import {
   changedFileSchema,
   codemapSchema,
@@ -134,28 +133,6 @@ const providerOptionSchema = z.object({
 });
 export type ProviderOption = z.infer<typeof providerOptionSchema>;
 
-const diagramPresetSchema = z.enum(["architecture", "flow", "data", "file", "custom"]);
-/** What a diagram request points at: a file, a selection, and for custom requests the ask itself. */
-const diagramTargetSchema = z.object({ path: z.string().optional(), selection: selectionSchema.optional(), text: z.string().max(4000).optional() });
-export type DiagramTarget = z.infer<typeof diagramTargetSchema>;
-const diagramRecordSchema = z.object({
-  id: z.string(),
-  reviewId: z.string(),
-  headSha: z.string(),
-  preset: diagramPresetSchema,
-  target: diagramTargetSchema.nullable(),
-  title: z.string(),
-  status: z.enum(["queued", "drawing", "ready", "failed"]),
-  /** A DiagramSpec (see diagram-spec.ts); kept loose on the wire. */
-  spec: z.record(z.string(), z.unknown()).nullable(),
-  error: z.string().nullable(),
-  /** True when the PR head moved after this diagram was drawn. */
-  stale: z.boolean(),
-  createdAt: z.number(),
-  updatedAt: z.number(),
-});
-export type DiagramRecord = z.infer<typeof diagramRecordSchema>;
-
 const okSchema = z.object({ ok: z.literal(true) });
 const reviewIdSchema = z.object({ reviewId: z.string() });
 
@@ -249,16 +226,6 @@ export const rpcContract = defineRpcContract({
     output: okSchema,
   },
   context_providers: { input: z.null(), output: z.object({ providers: z.array(providerOptionSchema), defaultProvider: z.string() }) },
-  /** Drawn diagrams for a review (the change map is built client-side from the codemap). */
-  diagrams_list: { input: reviewIdSchema, output: z.object({ diagrams: z.array(diagramRecordSchema) }) },
-  /** Queue a diagram for the illustrator seat; one draws at a time per review. */
-  diagram_request: {
-    input: z.object({ reviewId: z.string(), preset: diagramPresetSchema, target: diagramTargetSchema.optional() }),
-    output: z.object({ diagram: diagramRecordSchema }),
-  },
-  /** Draw again at the current head (also the way to refresh a stale one). */
-  diagram_retry: { input: z.object({ id: z.string() }), output: z.object({ diagram: diagramRecordSchema }) },
-  diagram_delete: { input: z.object({ id: z.string() }), output: okSchema },
 });
 
 export const REVIEW_CHANGED = "review-changed";
@@ -321,22 +288,6 @@ const MIGRATIONS = [
    )`,
   `CREATE TABLE IF NOT EXISTS seats (review_id TEXT NOT NULL, provider_id TEXT NOT NULL, thread_id TEXT NOT NULL, environment_id TEXT, created_at INTEGER NOT NULL, PRIMARY KEY (review_id, provider_id))`,
   `CREATE TABLE IF NOT EXISTS codemaps (review_id TEXT PRIMARY KEY, head_sha TEXT NOT NULL, status TEXT NOT NULL, json TEXT, error TEXT, updated_at INTEGER NOT NULL)`,
-  `CREATE TABLE IF NOT EXISTS illustrators (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, created_at INTEGER NOT NULL)`,
-  `CREATE TABLE IF NOT EXISTS diagrams (
-     id TEXT PRIMARY KEY,
-     review_id TEXT NOT NULL,
-     head_sha TEXT NOT NULL,
-     preset TEXT NOT NULL,
-     target_json TEXT,
-     prompt TEXT NOT NULL,
-     title TEXT NOT NULL,
-     status TEXT NOT NULL,
-     spec_json TEXT,
-     raw TEXT,
-     error TEXT,
-     created_at INTEGER NOT NULL,
-     updated_at INTEGER NOT NULL
-   )`,
 ];
 
 interface ReviewRow {
@@ -349,11 +300,6 @@ interface PendingRow { id: string; review_id: string; path: string; line: number
 interface SeatRow { review_id: string; provider_id: string; thread_id: string; environment_id: string | null; created_at: number }
 interface CodemapRow { review_id: string; head_sha: string; status: string; json: string | null; error: string | null; updated_at: number }
 interface CacheRow { review_id: string; json: string; fetched_at: number }
-interface IllustratorRow { review_id: string; thread_id: string; provider_id: string; environment_id: string | null; created_at: number }
-interface DiagramRow {
-  id: string; review_id: string; head_sha: string; preset: string; target_json: string | null; prompt: string; title: string; status: string;
-  spec_json: string | null; raw: string | null; error: string | null; created_at: number; updated_at: number;
-}
 
 function newId(): string {
   return randomBytes(6).toString("hex");
@@ -399,26 +345,6 @@ function createStore(db: Database.Database) {
       `INSERT INTO seats (review_id, provider_id, thread_id, environment_id, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(review_id, provider_id) DO UPDATE SET thread_id = excluded.thread_id, environment_id = excluded.environment_id`,
     ),
     deleteSeat: db.prepare<[string, string]>(`DELETE FROM seats WHERE review_id = ? AND provider_id = ?`),
-    illustrator: db.prepare<[string], IllustratorRow>(`SELECT * FROM illustrators WHERE review_id = ?`),
-    illustratorByThread: db.prepare<[string], IllustratorRow>(`SELECT * FROM illustrators WHERE thread_id = ?`),
-    upsertIllustrator: db.prepare<[string, string, string, string | null, number]>(
-      `INSERT INTO illustrators (review_id, thread_id, provider_id, environment_id, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id`,
-    ),
-    deleteIllustrator: db.prepare<[string]>(`DELETE FROM illustrators WHERE review_id = ?`),
-    diagrams: db.prepare<[string], DiagramRow>(`SELECT * FROM diagrams WHERE review_id = ? ORDER BY created_at ASC`),
-    diagramById: db.prepare<[string], DiagramRow>(`SELECT * FROM diagrams WHERE id = ?`),
-    drawingDiagram: db.prepare<[string], DiagramRow>(`SELECT * FROM diagrams WHERE review_id = ? AND status = 'drawing' ORDER BY updated_at ASC LIMIT 1`),
-    nextQueuedDiagram: db.prepare<[string], DiagramRow>(`SELECT * FROM diagrams WHERE review_id = ? AND status = 'queued' ORDER BY created_at ASC LIMIT 1`),
-    reviewsWithQueuedDiagrams: db.prepare<[], { review_id: string }>(`SELECT DISTINCT review_id FROM diagrams WHERE status = 'queued'`),
-    insertDiagram: db.prepare<[string, string, string, string, string | null, string, string, number, number]>(
-      `INSERT INTO diagrams (id, review_id, head_sha, preset, target_json, prompt, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
-    ),
-    setDiagramStatus: db.prepare<[string, number, string]>(`UPDATE diagrams SET status = ?, updated_at = ? WHERE id = ?`),
-    finishDiagram: db.prepare<[string, string | null, string | null, string | null, string, number, string]>(
-      `UPDATE diagrams SET status = ?, spec_json = ?, raw = ?, error = ?, head_sha = ?, updated_at = ? WHERE id = ?`,
-    ),
-    requeueDiagram: db.prepare<[string, number, string]>(`UPDATE diagrams SET status = 'queued', prompt = ?, spec_json = NULL, raw = NULL, error = NULL, updated_at = ? WHERE id = ?`),
-    deleteDiagram: db.prepare<[string]>(`DELETE FROM diagrams WHERE id = ?`),
     codemap: db.prepare<[string], CodemapRow>(`SELECT * FROM codemaps WHERE review_id = ?`),
     setCodemap: db.prepare<[string, string, string, string | null, string | null, number]>(
       `INSERT INTO codemaps (review_id, head_sha, status, json, error, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, status = excluded.status, json = excluded.json, error = excluded.error, updated_at = excluded.updated_at`,
@@ -757,49 +683,6 @@ export default async function plugin(bb: BbPluginApi) {
     return projectId;
   }
 
-  /**
-   * Spawn a hidden thread in the PR worktree. Reuses the review's environment
-   * once one is known; otherwise reports it when bb finishes provisioning.
-   */
-  async function spawnInWorktree(
-    row: ReviewRow,
-    providerId: string,
-    execution: SpawnExecution,
-    title: (providerName: string) => string,
-    input: PromptBlocks,
-    onEnvironment: (threadId: string, environmentId: string) => void,
-  ): Promise<{ threadId: string; environmentId: string | null }> {
-    const providers = await bb.sdk.providers.list();
-    const provider = providers.find((p) => p.id === providerId);
-    if (provider === undefined) throw new Error(`unknown provider ${providerId}`);
-    const modes = provider.capabilities.permissionModes;
-    const permissionMode = execution.permissionMode ?? (modes.includes("auto") ? "auto" : modes.includes("accept-edits") ? "accept-edits" : undefined);
-    const knownEnvironment = row.environment_id ?? q.seats.all(row.id).find((s) => s.environment_id !== null)?.environment_id ?? q.illustrator.get(row.id)?.environment_id ?? null;
-    const projectId = await chatProjectId(row);
-    const thread = await bb.sdk.threads.spawn({
-      projectId,
-      environment: knownEnvironment !== null
-        ? { type: "reuse", environmentId: knownEnvironment }
-        : { type: "host", hostId: row.host_id, workspace: { type: "unmanaged", path: row.worktree } },
-      providerId,
-      ...execution,
-      ...(permissionMode ? { permissionMode } : {}),
-      title: title(provider.displayName),
-      visibility: hideSeatThreads ? "hidden" : "visible",
-      input,
-    });
-    if (knownEnvironment === null) {
-      void (async () => {
-        const environmentId = thread.environmentId ?? (await waitForEnvironment(thread.id));
-        if (environmentId !== null) {
-          q.setEnvironment.run(environmentId, row.id);
-          onEnvironment(thread.id, environmentId);
-        }
-      })();
-    }
-    return { threadId: thread.id, environmentId: knownEnvironment };
-  }
-
   async function chatSend(reviewId: string, providerId: string, model: string | null, text: string, selection: SelectionRef | null): Promise<Seat> {
     const row = requireReview(reviewId);
     const message = await chatMessage(row, text, selection);
@@ -826,22 +709,40 @@ export default async function plugin(bb: BbPluginApi) {
       }
       q.deleteSeat.run(row.id, providerId);
     }
-    // The intro is agent-only context so the chat transcript starts with the
-    // reviewer's own question.
-    const now = Date.now();
-    const spawned = await spawnInWorktree(
-      row,
+    const providers = await bb.sdk.providers.list();
+    const provider = providers.find((p) => p.id === providerId);
+    if (provider === undefined) throw new Error(`unknown provider ${providerId}`);
+    const modes = provider.capabilities.permissionModes;
+    const permissionMode = execution.permissionMode ?? (modes.includes("auto") ? "auto" : modes.includes("accept-edits") ? "accept-edits" : undefined);
+    const knownEnvironment = row.environment_id ?? q.seats.all(row.id).find((s) => s.environment_id !== null)?.environment_id ?? null;
+    const projectId = await chatProjectId(row);
+    const thread = await bb.sdk.threads.spawn({
+      projectId,
+      environment: knownEnvironment !== null
+        ? { type: "reuse", environmentId: knownEnvironment }
+        : { type: "host", hostId: row.host_id, workspace: { type: "unmanaged", path: row.worktree } },
       providerId,
-      execution,
-      (name) => `Review Desk ${row.owner}/${row.repo}#${row.number}: ${name}`,
-      [{ type: "text", text: seatIntro(row), mentions: [], visibility: "agent-only" }, ...blocks],
-      (threadId, environmentId) => {
-        q.upsertSeat.run(row.id, providerId, threadId, environmentId, now);
-        publish(row.id, "seats");
-      },
-    );
-    q.upsertSeat.run(row.id, providerId, spawned.threadId, spawned.environmentId, now);
+      ...execution,
+      ...(permissionMode ? { permissionMode } : {}),
+      title: `Review Desk ${row.owner}/${row.repo}#${row.number}: ${provider.displayName}`,
+      visibility: hideSeatThreads ? "hidden" : "visible",
+      // The intro is agent-only context so the chat transcript starts with the
+      // reviewer's own question.
+      input: [{ type: "text", text: seatIntro(row), mentions: [], visibility: "agent-only" }, ...blocks],
+    });
+    const now = Date.now();
+    q.upsertSeat.run(row.id, providerId, thread.id, knownEnvironment, now);
     publish(row.id, "seats");
+    if (knownEnvironment === null) {
+      void (async () => {
+        const environmentId = thread.environmentId ?? (await waitForEnvironment(thread.id));
+        if (environmentId !== null) {
+          q.upsertSeat.run(row.id, providerId, thread.id, environmentId, now);
+          q.setEnvironment.run(environmentId, row.id);
+          publish(row.id, "seats");
+        }
+      })();
+    }
     const seat = q.seat.get(row.id, providerId);
     if (seat === undefined) throw new Error("seat vanished");
     return toSeat(seat);
@@ -1085,396 +986,6 @@ export default async function plugin(bb: BbPluginApi) {
     resolve: async (itemId) => ({ context: await mentionResolve(itemId) }),
   });
 
-  // -- diagrams (illustrator seat) --------------------------------------------
-  //
-  // Drawn diagrams come from a hidden illustrator thread per review that
-  // answers each request with one fenced review-diagram JSON block. Requests
-  // queue per review and run one at a time; the reply is captured on
-  // thread.idle, parsed, and every node ref is resolved against the PR so
-  // clicking a node always lands on real code.
-
-  const DIAGRAM_PRESETS: DiagramPreset[] = ["architecture", "flow", "data", "file", "custom"];
-
-  function toDiagram(row: DiagramRow, reviewHead: string): DiagramRecord {
-    const status = row.status === "queued" || row.status === "drawing" || row.status === "ready" ? row.status : "failed";
-    return {
-      id: row.id,
-      reviewId: row.review_id,
-      headSha: row.head_sha,
-      preset: DIAGRAM_PRESETS.includes(row.preset as DiagramPreset) ? (row.preset as DiagramPreset) : "custom",
-      target: parseJson<DiagramTarget | null>(row.target_json, null),
-      title: row.title,
-      status,
-      spec: parseJson<Record<string, unknown> | null>(row.spec_json, null),
-      error: row.error,
-      stale: status === "ready" && row.head_sha !== reviewHead,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    };
-  }
-
-  function illustratorIntro(row: ReviewRow): string {
-    return [
-      `You are the illustrator for pull request #${row.number} of ${row.owner}/${row.repo}: "${row.title}". The reviewer asks you for diagrams of this PR. You answer every request with exactly one fenced code block tagged ${DIAGRAM_FENCE} containing JSON, preceded by at most two short sentences. Nothing else.`,
-      `Your working directory is a detached worktree at the PR head ${row.head_sha}; the merge base with ${row.base_ref} is ${row.base_sha}. Full diff: git diff ${row.base_sha} ${row.head_sha}. Never modify files. Read the code before drawing: a diagram that names things not in the code is worse than no diagram.`,
-      "",
-      "JSON shape:",
-      "{",
-      '  "title": string, "kind": "graph" | "layers" | "sequence", "summary": one sentence,',
-      '  "groups": [{ "id": string, "label": string }],                                   // optional boxes around nodes (graph and layers)',
-      '  "nodes": [{ "id": string, "label": string (4 words max), "group"?: string, "tier"?: number (layers only, 0 = top), "ref"?: string, "status"?: string, "note"?: string (one sentence) }],',
-      '  "edges": [{ "from": nodeId, "to": nodeId, "label"?: string (3 words max), "status"?: string }],   // graph and layers',
-      '  "steps": [{ "from": laneId, "to": laneId, "label": string, "ref"?: string, "status"?: string, "note"?: string }]  // sequence only: nodes are the lanes, steps in execution order',
-      "}",
-      'ref: a changed file path, "path:LINE" or "path:START-END" using head line numbers, or the qualified name of a symbol in a changed file (for example SelectionCore::schedule_selection). Every node or step that corresponds to code must carry a ref; the reviewer clicks it to jump to the diff.',
-      'status: "added", "removed", "modified", or "unchanged" for what this PR does to that node, edge, or step. Draw before and after as ONE diagram: things the PR removes get status removed, things it introduces get status added.',
-      `Limits: ${DIAGRAM_LIMITS.nodes} nodes, ${DIAGRAM_LIMITS.groups} groups, ${DIAGRAM_LIMITS.edges} edges, ${DIAGRAM_LIMITS.steps} steps. Aim far lower: a dozen well-named nodes beats forty. No markdown inside labels.`,
-    ].join("\n");
-  }
-
-  async function illustratorSend(row: ReviewRow, text: string): Promise<void> {
-    const existing = q.illustrator.get(row.id);
-    if (existing !== undefined) {
-      try {
-        const thread = await bb.sdk.threads.get({ threadId: existing.thread_id });
-        if (thread.archivedAt === null && thread.deletedAt === null) {
-          await bb.sdk.threads.send({ threadId: existing.thread_id, mode: "auto", input: [{ type: "text", text, mentions: [] }] });
-          return;
-        }
-      } catch {
-        // stale illustrator; respawn below
-      }
-      q.deleteIllustrator.run(row.id);
-    }
-    const providerId = existing?.provider_id ?? defaultProvider;
-    const now = Date.now();
-    const spawned = await spawnInWorktree(
-      row,
-      providerId,
-      {},
-      () => `Review Desk ${row.owner}/${row.repo}#${row.number}: illustrator`,
-      [{ type: "text", text: illustratorIntro(row), mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
-      (threadId, environmentId) => q.upsertIllustrator.run(row.id, threadId, providerId, environmentId, now),
-    );
-    q.upsertIllustrator.run(row.id, spawned.threadId, providerId, spawned.environmentId, now);
-  }
-
-  function codemapSummary(row: ReviewRow, files: ChangedFile[]): string {
-    const lines: string[] = [`Changed files (${files.length}):`];
-    for (const f of files.slice(0, 120)) lines.push(`  ${f.status.padEnd(8)} ${f.path} (+${f.additions} -${f.deletions})`);
-    if (files.length > 120) lines.push(`  ... ${files.length - 120} more`);
-    const state = codemapState(row);
-    if (state.status !== "ready" || state.codemap === null) {
-      lines.push("", "(The codemap is not built yet; read the diff to find the structure.)");
-      return lines.join("\n");
-    }
-    const c = state.codemap;
-    lines.push("", "Reading order (modules):", ...c.readingOrder.map((m, i) => `  ${i + 1}. ${m.module}: ${m.reason}`));
-    lines.push("", "Hotspots:", ...c.hotspots.slice(0, 12).map((h) => `  ${h.path}#${h.qualified} (${h.changedLines} changed lines, fan-in ${h.fanIn})`));
-    const moduleOf = new Map(c.files.map((f) => [f.path, f.module]));
-    const moduleEdges = new Map<string, number>();
-    for (const e of c.edges) {
-      const from = moduleOf.get(e.from.split("#")[0]);
-      const to = moduleOf.get(e.to.split("#")[0]);
-      if (from === undefined || to === undefined || from === to) continue;
-      const k = `${from} -> ${to}`;
-      moduleEdges.set(k, (moduleEdges.get(k) ?? 0) + 1);
-    }
-    lines.push("", "References between modules (changed symbols only):", ...[...moduleEdges.entries()].sort((a, b) => b[1] - a[1]).slice(0, 30).map(([k, n]) => `  ${k} (${n})`));
-    const symbols = [...changedSymbols(row)].sort((a, b) => b.changedLines - a.changedLines).slice(0, 100);
-    lines.push("", "Changed symbols (top by changed lines):", ...symbols.map((s) => `  ${s.status.padEnd(8)} ${s.kind.padEnd(9)} ${s.qualified}  ${s.path}:${s.status === "removed" ? `${s.oldStart}-${s.oldEnd} (base)` : `${s.start}-${s.end}`}`));
-    return lines.join("\n");
-  }
-
-  async function diagramPrompt(row: ReviewRow, preset: DiagramPreset, target: DiagramTarget | null): Promise<{ title: string; prompt: string }> {
-    const files = await filesFor(row);
-    switch (preset) {
-      case "architecture":
-        return {
-          title: "Architecture",
-          prompt: [
-            "Draw the architecture this PR changes: the components or modules involved and how they call or depend on each other, as ONE diagram showing before and after (status removed, added, modified, or unchanged on nodes and edges). Use groups for subsystems. kind: graph. Start from this summary, then read the code to confirm names and relationships:",
-            "",
-            codemapSummary(row, files),
-          ].join("\n"),
-        };
-      case "flow": {
-        const s = target?.selection;
-        if (s === undefined) throw new Error("Select lines in the diff first.");
-        const label = `${baseName(s.path)}:${s.startLine}${s.endLine !== s.startLine ? `-${s.endLine}` : ""}`;
-        return {
-          title: `Flow through ${label}`,
-          prompt: [
-            `Draw the control flow that passes through ${s.path} lines ${s.startLine}-${s.endLine} as a sequence diagram (kind: sequence). Lanes are the components or functions involved, from the outermost caller down to the deepest callee; steps are in execution order, each with a ref to the line where it happens, with status added, removed, or modified where this PR changed that step. Read the callers and callees in the worktree to get the order right.`,
-            "",
-            "Selected lines (> marks the selection):",
-            "```",
-            await excerpt(row, s),
-            "```",
-          ].join("\n"),
-        };
-      }
-      case "data": {
-        const candidates = changedSymbols(row).filter((s) => /^(struct|class|enum|type|typedef|interface|trait|record|table|message|dataclass|protocol|union)$/i.test(s.kind)).slice(0, 80);
-        return {
-          title: "Data model",
-          prompt: [
-            "Draw the data model this PR touches (kind: graph): types, structs, enums, traits or interfaces, tables, and messages, with edges labelled contains, references, implements, or converts to. Mark added, removed, and modified ones with status. Candidates from the codemap (verify in the code):",
-            "",
-            ...(candidates.length === 0 ? ["(no type-like changed symbols found; read the diff)"] : candidates.map((s) => `  ${s.status.padEnd(8)} ${s.kind.padEnd(9)} ${s.qualified}  ${s.path}`)),
-          ].join("\n"),
-        };
-      }
-      case "file": {
-        const path = target?.path;
-        if (path === undefined) throw new Error("Pick a file first.");
-        const file = files.find((f) => f.path === path) ?? null;
-        const patch = await host.call("git_patch", { worktree: row.worktree, baseSha: row.base_sha, headSha: row.head_sha, path, oldPath: file?.oldPath ?? null }, hostOptions(row));
-        const lines = patch.patch.split("\n");
-        const capped = lines.length > 300 ? [...lines.slice(0, 300), `... ${lines.length - 300} more diff lines; read the file for the rest`].join("\n") : patch.patch;
-        const symbols = changedSymbols(row).filter((s) => s.path === path);
-        const state = codemapState(row);
-        const edges = state.status === "ready" && state.codemap !== null ? state.codemap.edges.filter((e) => e.from.startsWith(`${path}#`) || e.to.startsWith(`${path}#`)).slice(0, 60) : [];
-        return {
-          title: `Changes in ${baseName(path)}`,
-          prompt: [
-            `Draw what changed in ${path} (kind: graph): its changed symbols and their immediate callers and callees in this PR, grouped by file. Every node needs a ref.`,
-            "",
-            "Changed symbols in the file:",
-            ...(symbols.length === 0 ? ["  (none parsed; use the diff)"] : symbols.map((s) => `  ${s.status.padEnd(8)} ${s.kind.padEnd(9)} ${s.qualified}  lines ${s.status === "removed" ? `${s.oldStart}-${s.oldEnd} (base)` : `${s.start}-${s.end}`}`)),
-            "",
-            "References touching the file (from the codemap):",
-            ...(edges.length === 0 ? ["  (none)"] : edges.map((e) => `  ${e.from} -> ${e.to}`)),
-            "",
-            "Diff:",
-            "```diff",
-            capped,
-            "```",
-          ].join("\n"),
-        };
-      }
-      case "custom": {
-        const ask = (target?.text ?? "").trim();
-        if (ask === "") throw new Error("Describe the diagram you want.");
-        const parts = [ask];
-        if (target?.selection) parts.push("", "Selected lines (> marks the selection):", "```", await excerpt(row, target.selection), "```");
-        if (target?.path) parts.push("", `File in focus: ${target.path}`);
-        parts.push("", "Choose the kind that fits (graph, layers, or sequence). Every node that corresponds to code needs a ref.");
-        return { title: ask.length > 48 ? `${ask.slice(0, 47)}…` : ask, prompt: parts.join("\n") };
-      }
-    }
-  }
-
-  const changeStatusSchema = z.enum(["added", "modified", "removed", "unchanged"]);
-  const rawDiagramSchema = z.object({
-    title: z.string().optional(),
-    kind: z.enum(["graph", "layers", "sequence"]).optional(),
-    summary: z.string().optional(),
-    groups: z.array(z.object({ id: z.coerce.string(), label: z.string().optional() })).optional(),
-    nodes: z.array(z.object({ id: z.coerce.string(), label: z.string().optional(), group: z.coerce.string().optional(), tier: z.number().optional(), ref: z.string().optional(), status: changeStatusSchema.optional(), note: z.string().optional() })),
-    edges: z.array(z.object({ from: z.coerce.string(), to: z.coerce.string(), label: z.string().optional(), status: changeStatusSchema.optional() })).optional(),
-    steps: z.array(z.object({ from: z.coerce.string(), to: z.coerce.string(), label: z.string().optional(), ref: z.string().optional(), status: changeStatusSchema.optional(), note: z.string().optional() })).optional(),
-  });
-
-  function extractDiagramJson(text: string): string | null {
-    const fenced = new RegExp("```" + DIAGRAM_FENCE + "[^\\n]*\\n([\\s\\S]*?)```", "i").exec(text) ?? /```json[^\n]*\n([\s\S]*?)```/i.exec(text);
-    if (fenced !== null) return fenced[1];
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    return start !== -1 && end > start ? text.slice(start, end + 1) : null;
-  }
-
-  interface AnySymbol { path: string; qualified: string; kind: string; status: ChangeStatus; start: number; end: number; oldStart: number | null; oldEnd: number | null }
-
-  function allSymbols(row: ReviewRow): AnySymbol[] {
-    const state = codemapState(row);
-    if (state.status !== "ready" || state.codemap === null) return [];
-    return state.codemap.files.flatMap((f) => f.symbols.map((s) => ({ path: f.path, qualified: s.qualified.replace(/\s+/g, " "), kind: s.kind, status: s.status, start: s.start, end: s.end, oldStart: s.oldStart, oldEnd: s.oldEnd })));
-  }
-
-  function fileChange(file: ChangedFile | undefined): ChangeStatus {
-    if (file === undefined) return "unchanged";
-    return file.status === "added" ? "added" : file.status === "deleted" ? "removed" : "modified";
-  }
-
-  /** Resolve a model-written ref (path, path:lines, or symbol) to a place in this PR. */
-  function resolveDiagramRef(files: ChangedFile[], symbols: AnySymbol[], ref: string): DiagramRef & { status: ChangeStatus } {
-    const raw = ref.trim().replace(/^(symbol|file|path):/i, "").replace(/^`|`$/g, "");
-    const findFile = (needle: string) => {
-      const n = needle.replace(/^\.\//, "");
-      return files.find((f) => f.path === n) ?? files.find((f) => f.oldPath === n) ?? files.find((f) => f.path.endsWith(`/${n}`)) ?? undefined;
-    };
-    const ranged = /^(.+?)(?::|#L?)(\d+)(?:-L?(\d+))?$/.exec(raw);
-    if (ranged !== null) {
-      const file = findFile(ranged[1]);
-      if (file !== undefined) {
-        const a = Number(ranged[2]);
-        const b = Number(ranged[3] ?? ranged[2]);
-        const startLine = Math.min(a, b);
-        const endLine = Math.max(a, b);
-        return { path: file.path, startLine, endLine, side: file.status === "deleted" ? "old" : "new", label: `${baseName(file.path)}:${startLine}${endLine !== startLine ? `-${endLine}` : ""}`, found: true, status: fileChange(file) };
-      }
-    }
-    const file = findFile(raw);
-    if (file !== undefined) return { path: file.path, startLine: null, endLine: null, side: file.status === "deleted" ? "old" : "new", label: baseName(file.path), found: true, status: fileChange(file) };
-    const lower = raw.toLowerCase();
-    const last = (s: string) => (s.split(/::|\.|#/).pop() ?? s).toLowerCase();
-    const symbol =
-      symbols.find((s) => s.qualified === raw) ??
-      symbols.find((s) => s.qualified.toLowerCase() === lower) ??
-      symbols.find((s) => s.qualified.endsWith(`::${raw}`) || s.qualified.endsWith(`.${raw}`)) ??
-      symbols.find((s) => last(s.qualified) === last(raw) && s.status !== "unchanged") ??
-      symbols.find((s) => last(s.qualified) === last(raw));
-    if (symbol !== undefined) {
-      const removed = symbol.status === "removed" && symbol.oldStart !== null && symbol.oldEnd !== null;
-      return {
-        path: symbol.path,
-        startLine: removed ? symbol.oldStart : symbol.start,
-        endLine: removed ? symbol.oldEnd : symbol.end,
-        side: removed ? "old" : "new",
-        label: symbol.qualified,
-        found: true,
-        status: symbol.status,
-      };
-    }
-    return { path: raw, startLine: null, endLine: null, side: "new", label: raw, found: false, status: "unchanged" };
-  }
-
-  function normalizeDiagram(row: ReviewRow, files: ChangedFile[], raw: unknown, fallbackTitle: string): DiagramSpec {
-    const parsed = rawDiagramSchema.parse(raw);
-    const symbols = allSymbols(row);
-    const kind = parsed.kind ?? ((parsed.steps?.length ?? 0) > 0 ? "sequence" : "graph");
-    const seen = new Set<string>();
-    const nodes: DiagramNode[] = [];
-    for (const n of parsed.nodes) {
-      if (seen.has(n.id) || nodes.length >= DIAGRAM_LIMITS.nodes) continue;
-      seen.add(n.id);
-      const resolved = n.ref ? resolveDiagramRef(files, symbols, n.ref) : null;
-      const file = resolved?.found && resolved.startLine === null ? files.find((f) => f.path === resolved.path) : undefined;
-      const node: DiagramNode = {
-        id: n.id,
-        label: (n.label ?? n.id).replace(/\s+/g, " ").trim() || n.id,
-        status: n.status ?? resolved?.status ?? "unchanged",
-        resolved: resolved === null ? null : { path: resolved.path, startLine: resolved.startLine, endLine: resolved.endLine, side: resolved.side, label: resolved.label, found: resolved.found },
-      };
-      if (n.group) node.group = n.group;
-      if (n.tier !== undefined) node.tier = n.tier;
-      if (n.ref) node.ref = n.ref;
-      if (n.note) node.note = n.note.trim();
-      if (file !== undefined) node.stats = { additions: file.additions, deletions: file.deletions };
-      nodes.push(node);
-    }
-    if (nodes.length === 0) throw new Error("the drawing has no nodes");
-    const ids = new Set(nodes.map((n) => n.id));
-    const groups = (parsed.groups ?? []).slice(0, DIAGRAM_LIMITS.groups).map((g) => ({ id: g.id, label: (g.label ?? g.id).trim() || g.id }));
-    const groupIds = new Set(groups.map((g) => g.id));
-    for (const n of nodes) {
-      if (n.group === undefined || groupIds.has(n.group)) continue;
-      if (groups.length < DIAGRAM_LIMITS.groups) {
-        groups.push({ id: n.group, label: n.group });
-        groupIds.add(n.group);
-      } else {
-        delete n.group;
-      }
-    }
-    const edges = (parsed.edges ?? [])
-      .filter((e) => ids.has(e.from) && ids.has(e.to) && e.from !== e.to)
-      .slice(0, DIAGRAM_LIMITS.edges)
-      .map((e) => ({ from: e.from, to: e.to, ...(e.label ? { label: e.label.trim() } : {}), status: e.status ?? "unchanged" }));
-    const spec: DiagramSpec = { title: parsed.title?.trim() || fallbackTitle, kind, groups, nodes, edges };
-    if (parsed.summary) spec.summary = parsed.summary.trim();
-    if (kind === "sequence") {
-      spec.steps = (parsed.steps ?? [])
-        .filter((s) => ids.has(s.from) && ids.has(s.to))
-        .slice(0, DIAGRAM_LIMITS.steps)
-        .map((s) => {
-          const resolved = s.ref ? resolveDiagramRef(files, symbols, s.ref) : null;
-          return {
-            from: s.from,
-            to: s.to,
-            label: (s.label ?? "").trim(),
-            ...(s.ref ? { ref: s.ref } : {}),
-            resolved: resolved === null ? null : { path: resolved.path, startLine: resolved.startLine, endLine: resolved.endLine, side: resolved.side, label: resolved.label, found: resolved.found },
-            status: s.status ?? "unchanged",
-            ...(s.note ? { note: s.note.trim() } : {}),
-          };
-        });
-    }
-    return spec;
-  }
-
-  const pumping = new Set<string>();
-
-  /** Start the next queued diagram for a review if none is drawing. */
-  async function pumpDiagrams(reviewId: string): Promise<void> {
-    if (pumping.has(reviewId) || q.drawingDiagram.get(reviewId) !== undefined) return;
-    const next = q.nextQueuedDiagram.get(reviewId);
-    if (next === undefined) return;
-    pumping.add(reviewId);
-    try {
-      const row = requireReview(reviewId);
-      q.setDiagramStatus.run("drawing", Date.now(), next.id);
-      publish(reviewId, "diagrams");
-      try {
-        await illustratorSend(row, next.prompt);
-      } catch (cause) {
-        q.finishDiagram.run("failed", null, null, errorMessage(cause), row.head_sha, Date.now(), next.id);
-        publish(reviewId, "diagrams");
-        pumping.delete(reviewId);
-        void pumpDiagrams(reviewId);
-      }
-    } finally {
-      pumping.delete(reviewId);
-    }
-  }
-
-  async function completeDiagram(reviewId: string, text: string | null, error: string | null): Promise<void> {
-    const drawing = q.drawingDiagram.get(reviewId);
-    if (drawing === undefined) return;
-    const row = requireReview(reviewId);
-    if (error !== null || text === null) {
-      q.finishDiagram.run("failed", null, text, error ?? "the illustrator returned nothing", row.head_sha, Date.now(), drawing.id);
-    } else {
-      try {
-        const json = extractDiagramJson(text);
-        if (json === null) throw new Error(`no ${DIAGRAM_FENCE} block in the reply`);
-        const spec = normalizeDiagram(row, await filesFor(row), JSON.parse(json), drawing.title);
-        q.finishDiagram.run("ready", JSON.stringify(spec), text, null, row.head_sha, Date.now(), drawing.id);
-      } catch (cause) {
-        q.finishDiagram.run("failed", null, text, `could not read the drawing: ${errorMessage(cause)}`, row.head_sha, Date.now(), drawing.id);
-      }
-    }
-    publish(reviewId, "diagrams");
-    void pumpDiagrams(reviewId);
-  }
-
-  async function requestDiagram(reviewId: string, preset: DiagramPreset, target: DiagramTarget | null): Promise<DiagramRecord> {
-    const row = requireReview(reviewId);
-    const { title, prompt } = await diagramPrompt(row, preset, target);
-    const id = newId();
-    const now = Date.now();
-    q.insertDiagram.run(id, row.id, row.head_sha, preset, target === null ? null : JSON.stringify(target), prompt, title, now, now);
-    publish(row.id, "diagrams");
-    void pumpDiagrams(row.id);
-    const inserted = q.diagramById.get(id);
-    if (inserted === undefined) throw new Error("diagram vanished");
-    return toDiagram(inserted, row.head_sha);
-  }
-
-  bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
-    const illustrator = q.illustratorByThread.get(thread.id);
-    if (illustrator === undefined) return;
-    void completeDiagram(illustrator.review_id, lastAssistantText, null);
-  });
-  bb.events.on("thread.failed", ({ thread, error }) => {
-    const illustrator = q.illustratorByThread.get(thread.id);
-    if (illustrator === undefined) return;
-    void completeDiagram(illustrator.review_id, null, error ?? "the illustrator thread failed");
-  });
-  // Requests queued before a reload resume here; one already drawing completes
-  // through the idle event of its thread.
-  for (const pending of q.reviewsWithQueuedDiagrams.all()) void pumpDiagrams(pending.review_id);
-
   // -- GitHub write paths ----------------------------------------------------
 
   async function submitReview(reviewId: string, event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES", body: string): Promise<{ url: string | null; posted: number }> {
@@ -1631,33 +1142,6 @@ export default async function plugin(bb: BbPluginApi) {
       const state = codemapState(row);
       if (refresh || state.status === "missing") startCodemap(row);
       return codemapState(row);
-    },
-    diagrams_list: ({ reviewId }) => {
-      const row = requireReview(reviewId);
-      return { diagrams: q.diagrams.all(reviewId).map((d) => toDiagram(d, row.head_sha)) };
-    },
-    diagram_request: async ({ reviewId, preset, target }) => ({ diagram: await requestDiagram(reviewId, preset, target ?? null) }),
-    diagram_retry: async ({ id }) => {
-      const existing = q.diagramById.get(id);
-      if (existing === undefined) throw new Error("diagram not found");
-      const row = requireReview(existing.review_id);
-      // Rebuild the prompt so excerpts and the codemap summary reflect the current head.
-      const { prompt } = await diagramPrompt(row, DIAGRAM_PRESETS.includes(existing.preset as DiagramPreset) ? (existing.preset as DiagramPreset) : "custom", parseJson<DiagramTarget | null>(existing.target_json, null));
-      q.requeueDiagram.run(prompt, Date.now(), id);
-      publish(row.id, "diagrams");
-      void pumpDiagrams(row.id);
-      const fresh = q.diagramById.get(id);
-      if (fresh === undefined) throw new Error("diagram vanished");
-      return { diagram: toDiagram(fresh, row.head_sha) };
-    },
-    diagram_delete: ({ id }) => {
-      const existing = q.diagramById.get(id);
-      q.deleteDiagram.run(id);
-      if (existing !== undefined) {
-        publish(existing.review_id, "diagrams");
-        void pumpDiagrams(existing.review_id);
-      }
-      return { ok: true as const };
     },
     rooms_list: async () => {
       try {
