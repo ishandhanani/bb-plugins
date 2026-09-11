@@ -288,6 +288,24 @@ const MIGRATIONS = [
    )`,
   `CREATE TABLE IF NOT EXISTS seats (review_id TEXT NOT NULL, provider_id TEXT NOT NULL, thread_id TEXT NOT NULL, environment_id TEXT, created_at INTEGER NOT NULL, PRIMARY KEY (review_id, provider_id))`,
   `CREATE TABLE IF NOT EXISTS codemaps (review_id TEXT PRIMARY KEY, head_sha TEXT NOT NULL, status TEXT NOT NULL, json TEXT, error TEXT, updated_at INTEGER NOT NULL)`,
+  // Migrations are append-only and hash-checked; these two tables belonged to a
+  // removed diagrams feature and stay declared so existing databases still match.
+  `CREATE TABLE IF NOT EXISTS illustrators (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, created_at INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS diagrams (
+     id TEXT PRIMARY KEY,
+     review_id TEXT NOT NULL,
+     head_sha TEXT NOT NULL,
+     preset TEXT NOT NULL,
+     target_json TEXT,
+     prompt TEXT NOT NULL,
+     title TEXT NOT NULL,
+     status TEXT NOT NULL,
+     spec_json TEXT,
+     raw TEXT,
+     error TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL
+   )`,
 ];
 
 interface ReviewRow {
