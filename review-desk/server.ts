@@ -12,6 +12,8 @@ import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi, type PluginMentionItem, type PluginMentionSearchContext } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { MENTION_PROVIDER_ID, decodeMentionRef, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
+import { computeSlop, type SlopReport } from "./slop";
+import { BRIEF_FENCE, type Brief, type BriefEvidence } from "./brief-spec";
 import {
   changedFileSchema,
   codemapSchema,
@@ -133,6 +135,21 @@ const providerOptionSchema = z.object({
 });
 export type ProviderOption = z.infer<typeof providerOptionSchema>;
 
+/** The Brief tab's state: deterministic slop signals plus the helper-written brief. Payloads stay loose on the wire; app.tsx casts to the shared types. */
+const briefStateSchema = z.object({
+  headSha: z.string(),
+  signalsStatus: z.enum(["missing", "computing", "ready", "failed"]),
+  signals: z.record(z.string(), z.unknown()).nullable(),
+  signalsError: z.string().nullable(),
+  briefStatus: z.enum(["missing", "writing", "ready", "failed"]),
+  brief: z.record(z.string(), z.unknown()).nullable(),
+  briefError: z.string().nullable(),
+  /** The stored brief was written for an older head. */
+  stale: z.boolean(),
+  updatedAt: z.number().nullable(),
+});
+export type BriefState = z.infer<typeof briefStateSchema>;
+
 const okSchema = z.object({ ok: z.literal(true) });
 const reviewIdSchema = z.object({ reviewId: z.string() });
 
@@ -226,6 +243,10 @@ export const rpcContract = defineRpcContract({
     output: okSchema,
   },
   context_providers: { input: z.null(), output: z.object({ providers: z.array(providerOptionSchema), defaultProvider: z.string() }) },
+  /** Signals compute on first call for a head; the brief is written on first call too when autoBrief is on. */
+  brief_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: briefStateSchema },
+  /** (Re)write the plain-English brief at the current head. */
+  brief_write: { input: reviewIdSchema, output: briefStateSchema },
 });
 
 export const REVIEW_CHANGED = "review-changed";
@@ -306,6 +327,21 @@ const MIGRATIONS = [
      created_at INTEGER NOT NULL,
      updated_at INTEGER NOT NULL
    )`,
+  // One hidden helper thread per review runs one-shot jobs (the brief, later notes).
+  `CREATE TABLE IF NOT EXISTS helpers (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS briefs (
+     review_id TEXT PRIMARY KEY,
+     head_sha TEXT NOT NULL,
+     signals_status TEXT NOT NULL DEFAULT 'missing',
+     signals_json TEXT,
+     signals_error TEXT,
+     brief_status TEXT NOT NULL DEFAULT 'missing',
+     brief_head_sha TEXT,
+     brief_json TEXT,
+     brief_raw TEXT,
+     brief_error TEXT,
+     updated_at INTEGER NOT NULL
+   )`,
 ];
 
 interface ReviewRow {
@@ -318,6 +354,11 @@ interface PendingRow { id: string; review_id: string; path: string; line: number
 interface SeatRow { review_id: string; provider_id: string; thread_id: string; environment_id: string | null; created_at: number }
 interface CodemapRow { review_id: string; head_sha: string; status: string; json: string | null; error: string | null; updated_at: number }
 interface CacheRow { review_id: string; json: string; fetched_at: number }
+interface HelperRow { review_id: string; thread_id: string; provider_id: string; environment_id: string | null; job: string | null; created_at: number }
+interface BriefRow {
+  review_id: string; head_sha: string; signals_status: string; signals_json: string | null; signals_error: string | null;
+  brief_status: string; brief_head_sha: string | null; brief_json: string | null; brief_raw: string | null; brief_error: string | null; updated_at: number;
+}
 
 function newId(): string {
   return randomBytes(6).toString("hex");
@@ -363,6 +404,21 @@ function createStore(db: Database.Database) {
       `INSERT INTO seats (review_id, provider_id, thread_id, environment_id, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(review_id, provider_id) DO UPDATE SET thread_id = excluded.thread_id, environment_id = excluded.environment_id`,
     ),
     deleteSeat: db.prepare<[string, string]>(`DELETE FROM seats WHERE review_id = ? AND provider_id = ?`),
+    helper: db.prepare<[string], HelperRow>(`SELECT * FROM helpers WHERE review_id = ?`),
+    helperByThread: db.prepare<[string], HelperRow>(`SELECT * FROM helpers WHERE thread_id = ?`),
+    upsertHelper: db.prepare<[string, string, string, string | null, number]>(
+      `INSERT INTO helpers (review_id, thread_id, provider_id, environment_id, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id`,
+    ),
+    setHelperJob: db.prepare<[string | null, string]>(`UPDATE helpers SET job = ? WHERE review_id = ?`),
+    deleteHelper: db.prepare<[string]>(`DELETE FROM helpers WHERE review_id = ?`),
+    brief: db.prepare<[string], BriefRow>(`SELECT * FROM briefs WHERE review_id = ?`),
+    ensureBrief: db.prepare<[string, string, number]>(`INSERT INTO briefs (review_id, head_sha, updated_at) VALUES (?, ?, ?) ON CONFLICT(review_id) DO NOTHING`),
+    setSignals: db.prepare<[string, string, string | null, string | null, number, string]>(
+      `UPDATE briefs SET head_sha = ?, signals_status = ?, signals_json = ?, signals_error = ?, updated_at = ? WHERE review_id = ?`,
+    ),
+    setBrief: db.prepare<[string, string | null, string | null, string | null, string | null, number, string]>(
+      `UPDATE briefs SET brief_status = ?, brief_head_sha = ?, brief_json = ?, brief_raw = ?, brief_error = ?, updated_at = ? WHERE review_id = ?`,
+    ),
     codemap: db.prepare<[string], CodemapRow>(`SELECT * FROM codemaps WHERE review_id = ?`),
     setCodemap: db.prepare<[string, string, string, string | null, string | null, number]>(
       `INSERT INTO codemaps (review_id, head_sha, status, json, error, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, status = excluded.status, json = excluded.json, error = excluded.error, updated_at = excluded.updated_at`,
@@ -469,8 +525,9 @@ export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     defaultProvider: { type: "string", label: "Default AI provider id for the PR chat", default: "claude-code" },
     hideSeatThreads: { type: "boolean", label: "Hide analyst threads from the sidebar", default: true },
+    autoBrief: { type: "boolean", label: "Write the plain-English brief when a review is first opened at a new head", default: true },
   });
-  const { defaultProvider, hideSeatThreads } = await settings.get();
+  const { defaultProvider, hideSeatThreads, autoBrief } = await settings.get();
 
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
@@ -1004,6 +1061,282 @@ export default async function plugin(bb: BbPluginApi) {
     resolve: async (itemId) => ({ context: await mentionResolve(itemId) }),
   });
 
+  // -- helper thread: one-shot jobs in the PR worktree -----------------------
+  //
+  // A hidden thread per review that takes one job per message and answers
+  // with a single fenced block. Used for the brief; kept separate from the
+  // chat seats so the conversation stays the reviewer's.
+
+  function helperIntro(row: ReviewRow): string {
+    return [
+      `You are the helper for pull request #${row.number} of ${row.owner}/${row.repo}: "${row.title}". You get one job per message. Each job names the fenced block tag it wants; answer with exactly one fenced block of that tag containing JSON, and nothing else before or after it.`,
+      `Your working directory is a detached worktree at the PR head ${row.head_sha}; the merge base with ${row.base_ref} is ${row.base_sha}. Full diff: git diff ${row.base_sha} ${row.head_sha}. One file: git diff ${row.base_sha} ${row.head_sha} -- <path>. Base version: git show ${row.base_sha}:<path>.`,
+      "You are read-only: never modify files, never commit, never push. Read the code before writing; every line number you cite must exist in the diff.",
+    ].join("\n");
+  }
+
+  async function helperSend(row: ReviewRow, job: string, text: string): Promise<void> {
+    const existing = q.helper.get(row.id);
+    if (existing !== undefined) {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: existing.thread_id });
+        if (thread.archivedAt === null && thread.deletedAt === null) {
+          q.setHelperJob.run(job, row.id);
+          await bb.sdk.threads.send({ threadId: existing.thread_id, mode: "auto", input: [{ type: "text", text, mentions: [] }] });
+          return;
+        }
+      } catch {
+        // stale helper; respawn below
+      }
+      q.deleteHelper.run(row.id);
+    }
+    const providerId = existing?.provider_id ?? defaultProvider;
+    const providers = await bb.sdk.providers.list();
+    const provider = providers.find((p) => p.id === providerId);
+    if (provider === undefined) throw new Error(`unknown provider ${providerId}`);
+    const modes = provider.capabilities.permissionModes;
+    const permissionMode = modes.includes("auto") ? "auto" : modes.includes("accept-edits") ? "accept-edits" : undefined;
+    const knownEnvironment = row.environment_id ?? q.seats.all(row.id).find((s) => s.environment_id !== null)?.environment_id ?? null;
+    const now = Date.now();
+    const thread = await bb.sdk.threads.spawn({
+      projectId: await chatProjectId(row),
+      environment: knownEnvironment !== null
+        ? { type: "reuse", environmentId: knownEnvironment }
+        : { type: "host", hostId: row.host_id, workspace: { type: "unmanaged", path: row.worktree } },
+      providerId,
+      ...(permissionMode ? { permissionMode } : {}),
+      title: `Review Desk ${row.owner}/${row.repo}#${row.number}: helper`,
+      visibility: hideSeatThreads ? "hidden" : "visible",
+      input: [{ type: "text", text: helperIntro(row), mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
+    });
+    q.upsertHelper.run(row.id, thread.id, providerId, knownEnvironment, now);
+    q.setHelperJob.run(job, row.id);
+    if (knownEnvironment === null) {
+      void (async () => {
+        const environmentId = thread.environmentId ?? (await waitForEnvironment(thread.id));
+        if (environmentId !== null) {
+          q.setEnvironment.run(environmentId, row.id);
+          q.upsertHelper.run(row.id, thread.id, providerId, environmentId, now);
+        }
+      })();
+    }
+  }
+
+  function extractFenced(text: string, tag: string): string | null {
+    const fenced = new RegExp("```" + tag + "[^\\n]*\\n([\\s\\S]*?)```", "i").exec(text) ?? /```json[^\n]*\n([\s\S]*?)```/i.exec(text);
+    if (fenced !== null) return fenced[1];
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    return start !== -1 && end > start ? text.slice(start, end + 1) : null;
+  }
+
+  // -- brief: slop signals + plain-English summary ---------------------------
+
+  const signalRuns = new Set<string>();
+
+  function briefState(row: ReviewRow): BriefState {
+    const b = q.brief.get(row.id);
+    const signalsCurrent = b !== undefined && b.head_sha === row.head_sha;
+    const signalsStatus = signalRuns.has(row.id) ? "computing" : !signalsCurrent ? "missing" : b.signals_status === "ready" || b.signals_status === "failed" ? b.signals_status : "missing";
+    const briefStatus = b === undefined ? "missing" : b.brief_status === "writing" || b.brief_status === "ready" || b.brief_status === "failed" ? b.brief_status : "missing";
+    return {
+      headSha: row.head_sha,
+      signalsStatus,
+      signals: signalsCurrent && b.signals_status === "ready" ? parseJson<Record<string, unknown> | null>(b.signals_json, null) : null,
+      signalsError: signalsCurrent ? b.signals_error : null,
+      briefStatus,
+      brief: b?.brief_status === "ready" ? parseJson<Record<string, unknown> | null>(b.brief_json, null) : null,
+      briefError: b?.brief_error ?? null,
+      stale: b?.brief_status === "ready" && b.brief_head_sha !== row.head_sha,
+      updatedAt: b?.updated_at ?? null,
+    };
+  }
+
+  async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+    const out: R[] = new Array(items.length);
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (next < items.length) {
+          const i = next++;
+          out[i] = await fn(items[i]);
+        }
+      }),
+    );
+    return out;
+  }
+
+  function startSignals(row: ReviewRow): void {
+    if (signalRuns.has(row.id)) return;
+    signalRuns.add(row.id);
+    q.ensureBrief.run(row.id, row.head_sha, Date.now());
+    publish(row.id, "brief");
+    void (async () => {
+      try {
+        const files = (await filesFor(row)).filter((f) => !f.binary && f.additions + f.deletions > 0);
+        const patches = new Map<string, string>();
+        await mapLimit(files, 8, async (f) => {
+          const result = await host.call("git_patch", { worktree: row.worktree, baseSha: row.base_sha, headSha: row.head_sha, path: f.path, oldPath: f.oldPath }, hostOptions(row));
+          patches.set(f.path, result.patch);
+        });
+        const codemap = codemapState(row);
+        const moduleOf = codemap.status === "ready" && codemap.codemap !== null ? new Map(codemap.codemap.files.map((f) => [f.path, f.module])) : null;
+        const report = computeSlop({ files: await filesFor(row), patches, title: row.title, body: row.body, moduleOf });
+        q.setSignals.run(row.head_sha, "ready", JSON.stringify(report), null, Date.now(), row.id);
+      } catch (cause) {
+        q.setSignals.run(row.head_sha, "failed", null, errorMessage(cause), Date.now(), row.id);
+      } finally {
+        signalRuns.delete(row.id);
+        publish(row.id, "brief");
+      }
+    })();
+  }
+
+  function signalsSummary(report: SlopReport | null): string {
+    if (report === null) return "(not computed)";
+    if (report.signals.length === 0) return "none";
+    return report.signals.map((s) => `- ${s.label} (${s.count}): ${s.evidence.slice(0, 3).map((e) => (e.line === null ? e.note : `${e.path}:${e.line} ${e.note}`)).join("; ")}`).join("\n");
+  }
+
+  function codemapDigest(row: ReviewRow): string {
+    const state = codemapState(row);
+    if (state.status !== "ready" || state.codemap === null) return "(codemap not built yet)";
+    const c = state.codemap;
+    return [
+      "Reading order:",
+      ...c.readingOrder.map((m, i) => `  ${i + 1}. ${m.module} (${m.paths.length} files): ${m.reason}`),
+      "Hotspots:",
+      ...c.hotspots.slice(0, 10).map((h) => `  ${h.path}#${h.qualified} (${h.changedLines} changed lines, fan-in ${h.fanIn})`),
+      "Changed symbols (top 60 by changed lines):",
+      ...[...changedSymbols(row)].sort((a, b) => b.changedLines - a.changedLines).slice(0, 60).map((s) => `  ${s.status.padEnd(8)} ${s.kind.padEnd(9)} ${s.qualified}  ${s.path}:${s.status === "removed" ? `${s.oldStart}-${s.oldEnd} (base)` : `${s.start}-${s.end}`}`),
+    ].join("\n");
+  }
+
+  async function briefPrompt(row: ReviewRow): Promise<string> {
+    const files = await filesFor(row);
+    const state = briefState(row);
+    const report = state.signals as unknown as SlopReport | null;
+    return [
+      `Job: write the brief for this PR. Reply with exactly one fenced block tagged ${BRIEF_FENCE} containing this JSON:`,
+      "{",
+      '  "summary": string,',
+      '  "areas": [{ "module": string, "what": string, "path": string }],',
+      '  "claims": [{ "claim": string, "verdict": "matches" | "partly" | "no-evidence" | "contradicted", "evidence": [{ "path": string, "line": number }], "note": string }],',
+      '  "ai": { "score": number, "reasons": [{ "reason": string, "evidence": [{ "path": string, "line": number }] }] }',
+      "}",
+      "",
+      "summary: plain English for a reader who knows this codebase but has not read the diff. Say what the code does now that it did not do before, and what changes for callers or operators. 5 to 10 sentences, each under 20 words, active voice, everyday words. Name code by its identifiers. No marketing words (robust, seamless, comprehensive, leverage, enhance). Describe the diff, not the description.",
+      "areas: one entry per module touched, at most 8, what changed there in one sentence, path = the file that matters most.",
+      "claims: every concrete claim the PR description makes, at most 12. Check each against the diff and the code. verdict: matches, partly, no-evidence (the diff has nothing for it), or contradicted. evidence: head line numbers in changed files. note: one sentence when the verdict is not matches, else empty.",
+      "ai.score: how much this PR reads like unedited AI output, 0 = clearly written and edited by a person, 100 = raw generation. Judge the comments, naming, defensive noise, tests, and description shape from the code itself. Give exactly 3 reasons with evidence lines. The deterministic signals below are for orientation; verify before agreeing with them.",
+      "",
+      `Deterministic signals (score ${report?.score ?? "n/a"}):`,
+      signalsSummary(report),
+      "",
+      `PR title: ${row.title}`,
+      "PR description:",
+      row.body.trim() === "" ? "(none)" : row.body.trim().slice(0, 8000),
+      "",
+      `Changed files (${files.length}):`,
+      ...files.slice(0, 150).map((f) => `  ${f.status.padEnd(8)} ${f.path} (+${f.additions} -${f.deletions})`),
+      ...(files.length > 150 ? [`  ... ${files.length - 150} more`] : []),
+      "",
+      codemapDigest(row),
+    ].join("\n");
+  }
+
+  const rawBriefSchema = z.object({
+    summary: z.string().optional(),
+    areas: z.array(z.object({ module: z.coerce.string(), what: z.string().optional(), path: z.string().nullable().optional() })).optional(),
+    claims: z.array(z.object({ claim: z.string(), verdict: z.string().optional(), evidence: z.array(z.object({ path: z.string(), line: z.coerce.number().nullable().optional() })).optional(), note: z.string().nullable().optional() })).optional(),
+    ai: z.object({ score: z.coerce.number().optional(), reasons: z.array(z.object({ reason: z.string(), evidence: z.array(z.object({ path: z.string(), line: z.coerce.number().nullable().optional() })).optional() })).optional() }).optional(),
+  });
+
+  function normalizeBrief(raw: unknown, files: ChangedFile[]): Brief {
+    const parsed = rawBriefSchema.parse(raw);
+    const paths = new Set(files.map((f) => f.path));
+    const resolvePath = (p: string): string | null => {
+      const clean = p.trim().replace(/^\.\//, "");
+      if (paths.has(clean)) return clean;
+      return files.find((f) => f.path.endsWith(`/${clean}`))?.path ?? null;
+    };
+    const evidence = (list: { path: string; line?: number | null }[] | undefined): BriefEvidence[] =>
+      (list ?? []).slice(0, 6).map((e) => {
+        const resolved = resolvePath(e.path);
+        return { path: resolved ?? e.path, line: typeof e.line === "number" && e.line > 0 ? Math.round(e.line) : null, found: resolved !== null };
+      });
+    const verdicts = new Set(["matches", "partly", "no-evidence", "contradicted"]);
+    return {
+      summary: (parsed.summary ?? "").trim(),
+      areas: (parsed.areas ?? []).slice(0, 8).map((a) => ({ module: a.module, what: (a.what ?? "").trim(), path: a.path ? resolvePath(a.path) : null })),
+      claims: (parsed.claims ?? []).slice(0, 12).map((c) => ({
+        claim: c.claim.trim(),
+        verdict: (verdicts.has((c.verdict ?? "").toLowerCase()) ? (c.verdict ?? "").toLowerCase() : "no-evidence") as Brief["claims"][number]["verdict"],
+        evidence: evidence(c.evidence),
+        note: (c.note ?? "").trim(),
+      })),
+      ai: {
+        score: Math.max(0, Math.min(100, Math.round(parsed.ai?.score ?? 0))),
+        reasons: (parsed.ai?.reasons ?? []).slice(0, 4).map((r) => ({ reason: r.reason.trim(), evidence: evidence(r.evidence) })),
+      },
+    };
+  }
+
+  async function writeBrief(row: ReviewRow): Promise<void> {
+    q.ensureBrief.run(row.id, row.head_sha, Date.now());
+    const current = q.brief.get(row.id);
+    if (current?.brief_status === "writing") return;
+    q.setBrief.run("writing", row.head_sha, null, null, null, Date.now(), row.id);
+    publish(row.id, "brief");
+    try {
+      await helperSend(row, "brief", await briefPrompt(row));
+    } catch (cause) {
+      q.setBrief.run("failed", row.head_sha, null, null, errorMessage(cause), Date.now(), row.id);
+      publish(row.id, "brief");
+    }
+  }
+
+  async function completeBrief(reviewId: string, text: string | null, error: string | null): Promise<void> {
+    const row = q.review.get(reviewId);
+    const current = q.brief.get(reviewId);
+    if (row === undefined || current === undefined || current.brief_status !== "writing") return;
+    if (error !== null || text === null) {
+      q.setBrief.run("failed", current.brief_head_sha, null, text, error ?? "the helper returned nothing", Date.now(), reviewId);
+    } else {
+      try {
+        const json = extractFenced(text, BRIEF_FENCE);
+        if (json === null) throw new Error(`no ${BRIEF_FENCE} block in the reply`);
+        const brief = normalizeBrief(JSON.parse(json), await filesFor(row));
+        if (brief.summary === "") throw new Error("the brief has no summary");
+        q.setBrief.run("ready", current.brief_head_sha, JSON.stringify(brief), text, null, Date.now(), reviewId);
+      } catch (cause) {
+        q.setBrief.run("failed", current.brief_head_sha, null, text, `could not read the brief: ${errorMessage(cause)}`, Date.now(), reviewId);
+      }
+    }
+    publish(reviewId, "brief");
+  }
+
+  bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
+    const helper = q.helperByThread.get(thread.id);
+    if (helper === undefined) return;
+    if (helper.job === "brief") void completeBrief(helper.review_id, lastAssistantText, null);
+    q.setHelperJob.run(null, helper.review_id);
+  });
+  bb.events.on("thread.failed", ({ thread, error }) => {
+    const helper = q.helperByThread.get(thread.id);
+    if (helper === undefined) return;
+    if (helper.job === "brief") void completeBrief(helper.review_id, null, error ?? "the helper thread failed");
+    q.setHelperJob.run(null, helper.review_id);
+  });
+
+  /** Signals for the head, computing when missing or on refresh; the brief starts once per review when autoBrief is on. Rewrites go through brief_write. */
+  function briefGet(row: ReviewRow, refresh: boolean): BriefState {
+    const state = briefState(row);
+    if (refresh || state.signalsStatus === "missing") startSignals(row);
+    if (autoBrief && state.briefStatus === "missing") void writeBrief(row);
+    return briefState(row);
+  }
+
   // -- GitHub write paths ----------------------------------------------------
 
   async function submitReview(reviewId: string, event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES", body: string): Promise<{ url: string | null; posted: number }> {
@@ -1160,6 +1493,13 @@ export default async function plugin(bb: BbPluginApi) {
       const state = codemapState(row);
       if (refresh || state.status === "missing") startCodemap(row);
       return codemapState(row);
+    },
+    brief_get: ({ reviewId, refresh }) => briefGet(requireReview(reviewId), refresh === true),
+    brief_write: async ({ reviewId }) => {
+      const row = requireReview(reviewId);
+      if (briefState(row).signalsStatus === "missing") startSignals(row);
+      await writeBrief(row);
+      return briefState(row);
     },
     rooms_list: async () => {
       try {

@@ -2,6 +2,7 @@ Review a GitHub pull request inside bb the way you would online, with a chat par
 
 ## What you get
 
+- A **Brief** first: a plain-English account of what the PR really does, written from the diff by a helper that reads the code, each description claim checked against the code, and a slop meter that scores how much the PR reads like unedited AI output, with every signal pointing at its lines.
 - A **PR page**: state, title, author and branches, then Description, Discussion, and Commits, then the changes as file cards with syntax-highlighted diffs, expandable context, viewed marks, and a lines-left counter.
 - **GitHub threads inline** on their lines, with reply and resolve. Checks, reviewers, assignees, and labels live in the Info tab.
 - **Comments from the diff**: select lines, write Markdown, keep them pending, then submit one review to GitHub as comment, approve, or request changes.

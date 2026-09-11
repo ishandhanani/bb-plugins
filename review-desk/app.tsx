@@ -31,8 +31,10 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { FileDiff, type DiffLineAnnotation, type FileDiffMetadata, type SelectedLineRange } from "@pierre/diffs/react";
 import { parsePatchFiles } from "@pierre/diffs";
-import type { CodemapState, FileEntry, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, rpcContract } from "./server";
+import type { BriefState, CodemapState, FileEntry, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, rpcContract } from "./server";
 import type { Codemap, GhThread } from "./host-contract";
+import type { Brief, BriefEvidence, ClaimVerdict } from "./brief-spec";
+import type { Evidence as SlopEvidence, SlopReport } from "./slop";
 import { MENTION_PROVIDER_ID, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
@@ -295,6 +297,44 @@ function useCodemap(reviewId: string | null, enabled: boolean) {
     return () => clearInterval(timer);
   }, [state?.status, load]);
   return { state, error, refresh: () => load(true) };
+}
+
+function useBrief(reviewId: string | null) {
+  const rpc = useRpc<Contract>();
+  const [state, setState] = useState<BriefState | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(
+    (refresh = false) => {
+      if (reviewId === null) return;
+      rpc.call("brief_get", { reviewId, refresh }).then(
+        (result) => {
+          setState(result);
+          setError(null);
+        },
+        (cause: unknown) => setError(describeError(cause)),
+      );
+    },
+    [rpc, reviewId],
+  );
+  useEffect(() => {
+    setState(null);
+    load();
+  }, [load]);
+  useRealtime(REVIEW_CHANGED, (payload) => {
+    const p = payloadReview(payload);
+    if (p !== null && p.reviewId === reviewId && (p.what === "brief" || p.what === "synced" || p.what === "codemap")) load();
+  });
+  const busy = state !== null && (state.signalsStatus === "computing" || state.briefStatus === "writing");
+  useEffect(() => {
+    if (!busy) return;
+    const timer = setInterval(() => load(), 6000);
+    return () => clearInterval(timer);
+  }, [busy, load]);
+  const rewrite = useCallback(() => {
+    if (reviewId === null) return;
+    rpc.call("brief_write", { reviewId }).then(setState, (cause: unknown) => toast.error(describeError(cause)));
+  }, [rpc, reviewId]);
+  return { state, error, refresh: () => load(true), rewrite };
 }
 
 function useProviders() {
@@ -898,14 +938,193 @@ function Commits({ review }: { review: Review }) {
   );
 }
 
-type Tab = "description" | "discussion" | "commits";
+// ---------------------------------------------------------------------------
+// Brief: slop meter from deterministic signals, plus the helper's plain-English
+// summary, areas, claims checked against the diff, and its own AI read.
+// ---------------------------------------------------------------------------
+
+type JumpFn = (path: string, line: number | null, side: "old" | "new") => void;
+
+function scoreTone(score: number): string {
+  return score < 20 ? "text-primary" : score < 45 ? "text-amber-600 dark:text-amber-400" : score < 70 ? "text-orange-600 dark:text-orange-400" : "text-destructive";
+}
+
+const VERDICT_STYLE: Record<ClaimVerdict, { label: string; className: string }> = {
+  matches: { label: "matches", className: "border-primary/40 bg-primary/10 text-primary" },
+  partly: { label: "partly", className: "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300" },
+  "no-evidence": { label: "no evidence", className: "border-border bg-muted text-muted-foreground" },
+  contradicted: { label: "contradicted", className: "border-destructive/50 bg-destructive/10 text-destructive" },
+};
+
+function EvidenceLink({ path, line, side, note, onJump }: { path: string; line: number | null; side: "old" | "new"; note?: string; onJump: JumpFn }) {
+  if (path === "") return <span className="text-muted-foreground">{note}</span>;
+  return (
+    <span className="inline-flex min-w-0 flex-wrap items-baseline gap-x-1.5">
+      <button type="button" onClick={() => onJump(path, line, side)} className="shrink-0 font-mono text-[11px] text-foreground hover:underline" title={path}>
+        {splitPath(path).name}{line !== null ? `:${line}` : ""}
+      </button>
+      {note ? <span className="min-w-0 text-muted-foreground">{note}</span> : null}
+    </span>
+  );
+}
+
+function SlopMeter({ report, aiScore, onJump, onRecompute, computing }: { report: SlopReport | null; aiScore: number | null; onJump: JumpFn; onRecompute: () => void; computing: boolean }) {
+  const [open, setOpen] = useState<string | null>(null);
+  const det = report?.score ?? null;
+  const combined = det === null ? aiScore : aiScore === null ? det : Math.round(0.6 * det + 0.4 * aiScore);
+  const verdict = combined === null ? "" : combined < 20 ? "Reads hand-made" : combined < 45 ? "Some polish needed" : combined < 70 ? "Heavy AI residue" : "Reads like unedited generation";
+  const maxScore = Math.max(1, ...(report?.signals.map((s) => s.score) ?? [1]));
+  return (
+    <section className="rounded-lg border border-border bg-card p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-sm font-semibold">Slop meter</span>
+        <span className="text-xs text-muted-foreground">a heuristic, every number opens its evidence</span>
+        {report?.aiAttributed ? <span className="rounded-full border border-violet-500/40 bg-violet-500/10 px-1.5 text-[10px] text-violet-700 dark:text-violet-300">description credits an AI</span> : null}
+        <Button variant="ghost" size="sm" className="ml-auto h-6 px-1.5 text-xs" onClick={onRecompute} disabled={computing} title="Recompute the signals from the diff">
+          <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", computing && "animate-spin")} />
+        </Button>
+      </div>
+      {report === null ? (
+        <p className="mt-3 inline-flex items-center gap-1.5 text-xs text-muted-foreground"><Icon name="Loading" className="size-3.5 animate-spin" />Reading every changed line…</p>
+      ) : (
+        <>
+          <div className="mt-3 flex items-center gap-4">
+            <div className={cn("text-4xl font-semibold tabular-nums leading-none", scoreTone(combined ?? 0))}>{combined}</div>
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium">{verdict}</div>
+              <div className="relative mt-1.5 h-2 rounded-full bg-gradient-to-r from-primary/40 via-amber-400/60 to-destructive/70">
+                <div className="absolute -top-0.5 size-3 -translate-x-1/2 rounded-full border-2 border-background bg-foreground shadow" style={{ left: `${combined ?? 0}%` }} />
+              </div>
+              <div className="mt-1 flex justify-between text-[10px] text-muted-foreground"><span>hand-made</span><span>unedited generation</span></div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                signals {det}{aiScore !== null ? ` · helper's read ${aiScore} · shown 60/40` : " · helper's read pending"} · {report.stats.addedLines.toLocaleString()} added lines in {report.stats.codeFiles} code files
+              </div>
+            </div>
+          </div>
+          {report.signals.length === 0 ? <p className="mt-3 text-xs text-muted-foreground">No signals fired.</p> : (
+            <ul className="mt-3 divide-y divide-border/60 rounded-md border border-border/60">
+              {report.signals.map((s) => (
+                <li key={s.id}>
+                  <button type="button" onClick={() => setOpen((o) => (o === s.id ? null : s.id))} className="flex w-full items-center gap-3 px-3 py-2 text-left text-xs hover:bg-state-hover" aria-expanded={open === s.id}>
+                    <Icon name={open === s.id ? "ChevronDown" : "ChevronRight"} className="size-3.5 shrink-0 text-muted-foreground" />
+                    <span className="w-44 shrink-0 font-medium">{s.label}</span>
+                    <span className="w-10 shrink-0 rounded-full bg-foreground/10 px-1.5 text-center tabular-nums">{s.count}</span>
+                    <span className="min-w-0 flex-1 truncate text-muted-foreground">{s.description}</span>
+                    <span className="h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-border"><span className="block h-full rounded-full bg-amber-500/80" style={{ width: `${Math.round((100 * s.score) / maxScore)}%` }} /></span>
+                  </button>
+                  {open === s.id ? (
+                    <ul className="space-y-1 border-t border-border/60 bg-background/60 px-3 py-2 text-xs">
+                      {s.evidence.map((e: SlopEvidence, i) => (
+                        <li key={i} className="flex gap-2"><span className="w-3 shrink-0 text-muted-foreground">·</span><EvidenceLink path={e.path} line={e.line} side={e.side} note={e.note} onJump={onJump} /></li>
+                      ))}
+                      {s.count > s.evidence.length ? <li className="text-muted-foreground">and {s.count - s.evidence.length} more</li> : null}
+                    </ul>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function BriefPanel({ reviewId, onJump }: { reviewId: string; onJump: JumpFn }) {
+  const { state, error, refresh, rewrite } = useBrief(reviewId);
+  if (error) return <p className="text-sm text-destructive">{error}</p>;
+  const report = (state?.signalsStatus === "ready" ? (state.signals as unknown as SlopReport | null) : null) ?? null;
+  const brief = (state?.briefStatus === "ready" ? (state.brief as unknown as Brief | null) : null) ?? null;
+  const writing = state?.briefStatus === "writing";
+  const evidenceList = (list: BriefEvidence[]) => (
+    <span className="inline-flex flex-wrap gap-x-2">
+      {list.map((e, i) => (e.found ? <EvidenceLink key={i} path={e.path} line={e.line} side="new" onJump={onJump} /> : <span key={i} className="font-mono text-[11px] text-muted-foreground line-through" title="not in this diff">{splitPath(e.path).name}{e.line !== null ? `:${e.line}` : ""}</span>))}
+    </span>
+  );
+  return (
+    <div className="space-y-4 text-sm">
+      <SlopMeter report={report} aiScore={brief?.ai.score ?? null} onJump={onJump} onRecompute={refresh} computing={state?.signalsStatus === "computing"} />
+      {state?.signalsStatus === "failed" ? <p className="text-xs text-destructive">Signals failed: {state.signalsError}</p> : null}
+
+      <section className="rounded-lg border border-border bg-card p-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm font-semibold">What it does</span>
+          <span className="text-xs text-muted-foreground">written from the diff, not the description</span>
+          {state?.stale ? <span className="rounded-full border border-border px-1.5 text-[10px] text-muted-foreground" title="The head moved since this was written">stale</span> : null}
+          <Button variant="ghost" size="sm" className="ml-auto h-6 px-1.5 text-xs" onClick={rewrite} disabled={writing} title="Write the brief again at the current head">
+            <Icon name={writing ? "Loading" : "ArrowReloadHorizontal"} className={cn("size-3.5", writing && "animate-spin")} />{brief ? "Rewrite" : "Write"}
+          </Button>
+        </div>
+        {brief === null ? (
+          <p className="mt-3 text-xs text-muted-foreground">
+            {writing ? "The helper is reading the diff and writing. A minute for small PRs, several for large ones." : state?.briefStatus === "failed" ? `Failed: ${state.briefError ?? "unknown error"}` : state === null ? "Loading…" : "Press Write to get a plain-English brief of this PR."}
+          </p>
+        ) : (
+          <>
+            <div className={cn(PROSE, "mt-3 text-sm")}><Markdown content={brief.summary} /></div>
+            {brief.areas.length > 0 ? (
+              <ul className="mt-4 divide-y divide-border/60 rounded-md border border-border/60 text-xs">
+                {brief.areas.map((a) => (
+                  <li key={a.module} className="flex items-baseline gap-3 px-3 py-1.5">
+                    {a.path ? <button type="button" onClick={() => onJump(a.path ?? "", null, "new")} className="w-48 shrink-0 truncate text-left font-mono hover:underline" title={a.path}>{a.module}</button> : <span className="w-48 shrink-0 truncate font-mono">{a.module}</span>}
+                    <span className="min-w-0 text-foreground">{a.what}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </>
+        )}
+      </section>
+
+      {brief !== null && brief.claims.length > 0 ? (
+        <section className="rounded-lg border border-border bg-card p-4">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold">Claims versus diff</span>
+            <span className="text-xs text-muted-foreground">
+              {brief.claims.filter((c) => c.verdict === "matches").length} of {brief.claims.length} hold up
+            </span>
+          </div>
+          <ul className="mt-3 space-y-2 text-xs">
+            {brief.claims.map((c, i) => (
+              <li key={i} className="flex gap-3 rounded-md border border-border/60 px-3 py-2">
+                <span className={cn("mt-0.5 h-fit shrink-0 rounded-full border px-1.5 text-[10px] font-medium", VERDICT_STYLE[c.verdict].className)}>{VERDICT_STYLE[c.verdict].label}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="text-foreground">{c.claim}</span>
+                  {c.note ? <span className="block text-muted-foreground">{c.note}</span> : null}
+                  {c.evidence.length > 0 ? <span className="mt-0.5 block">{evidenceList(c.evidence)}</span> : null}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {brief !== null && brief.ai.reasons.length > 0 ? (
+        <section className="rounded-lg border border-border bg-card p-4">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold">The helper's read</span>
+            <span className={cn("text-sm font-semibold tabular-nums", scoreTone(brief.ai.score))}>{brief.ai.score}</span>
+            <span className="text-xs text-muted-foreground">how much this reads like unedited AI output, from the code itself</span>
+          </div>
+          <ul className="mt-3 space-y-1.5 text-xs">
+            {brief.ai.reasons.map((r, i) => (
+              <li key={i} className="flex gap-2"><span className="w-3 shrink-0 text-muted-foreground">·</span><span className="min-w-0"><span className="text-foreground">{r.reason}</span>{r.evidence.length > 0 ? <span className="ml-2">{evidenceList(r.evidence)}</span> : null}</span></li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+type Tab = "brief" | "description" | "discussion" | "commits";
 
 function ReviewView({ reviewId }: { reviewId: string }) {
   const { rpc, detail, error, refetch } = useReview(reviewId);
   const panel = useAppPanel();
   const navigate = useBbNavigate();
   const codeTheme = useCodeTheme();
-  const [tab, setTab] = useState<Tab>("description");
+  const [tab, setTab] = useState<Tab>("brief");
   const [diffStyle, setDiffStyle] = useState<"unified" | "split">("unified");
   const [selection, setSelectionState] = useState<Selection | null>(null);
   const [composer, setComposer] = useState<Extract<Anno, { kind: "composer" }> | null>(null);
@@ -961,6 +1180,28 @@ function ReviewView({ reviewId }: { reviewId: string }) {
     openChat();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reviewId]);
+
+  /** Show a place in the diff: expand the file, select the line, and settle the scroll onto it. */
+  const jumpToLine = useCallback<JumpFn>((path, line, side) => {
+    setFilter("");
+    setCollapsed((s) => { const n = new Set(s); n.delete(path); return n; });
+    setExpandedOverride((s) => new Set(s).add(path));
+    if (line !== null) setSelection({ path, range: { start: line, end: line, side: side === "old" ? "deletions" : "additions" } });
+    const wanted = line === null ? null : String(line);
+    let tries = 0;
+    const settle = () => {
+      const card = document.getElementById(fileAnchorId(path));
+      const host = card ? Array.from(card.querySelectorAll("*")).find((el) => el.shadowRoot !== null) : undefined;
+      const cell = wanted !== null && host?.shadowRoot ? Array.from(host.shadowRoot.querySelectorAll("[data-line-number-content]")).find((el) => el.textContent?.trim() === wanted) : undefined;
+      if (cell) {
+        cell.scrollIntoView({ block: "center" });
+        return;
+      }
+      card?.scrollIntoView({ block: "start" });
+      if (++tries < 10) setTimeout(settle, tries < 4 ? 300 : 600);
+    };
+    settle();
+  }, [setSelection]);
 
   // `a` with lines selected drops them into the chat; ignored while typing.
   useEffect(() => {
@@ -1044,14 +1285,14 @@ function ReviewView({ reviewId }: { reviewId: string }) {
           </div>
 
           <div className="mt-6 flex items-center gap-1 border-b border-border text-sm">
-            {([["description", "Description", null], ["discussion", "Discussion", openThreads], ["commits", "Commits", review.commits.length]] as const).map(([id, label, count]) => (
+            {([["brief", "Brief", null], ["description", "Description", null], ["discussion", "Discussion", openThreads], ["commits", "Commits", review.commits.length]] as const).map(([id, label, count]) => (
               <button key={id} type="button" onClick={() => setTab(id)} className={cn("-mb-px border-b-2 px-3 py-2", tab === id ? "border-foreground font-medium" : "border-transparent text-muted-foreground hover:text-foreground")}>
                 {label}{count !== null && count > 0 ? <span className="ml-1.5 rounded-full bg-foreground/10 px-1.5 text-[11px]">{count}</span> : null}
               </button>
             ))}
           </div>
           <div className="mt-4">
-            {tab === "description" ? <Description body={review.body} /> : tab === "discussion" ? <Discussion reviewId={reviewId} threads={threads} /> : <Commits review={review} />}
+            {tab === "brief" ? <BriefPanel reviewId={reviewId} onJump={jumpToLine} /> : tab === "description" ? <Description body={review.body} /> : tab === "discussion" ? <Discussion reviewId={reviewId} threads={threads} /> : <Commits review={review} />}
           </div>
 
           <div className="mt-10 flex flex-wrap items-center gap-3">
