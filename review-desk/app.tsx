@@ -1344,6 +1344,8 @@ function ReviewView({ reviewId }: { reviewId: string }) {
     if (collapsed.has(f.path)) return false;
     if (expandedOverride.has(f.path)) return true;
     if (allCollapsed) return false;
+    // Files carrying your notes or pending comments stay open wherever they sit in the list.
+    if ((notesByPath.get(f.path)?.length ?? 0) > 0 || (pendingByPath.get(f.path)?.length ?? 0) > 0) return true;
     return !f.viewed && index < 60 && f.additions + f.deletions <= 800;
   };
   const toggle = (path: string, expanded: boolean) => {
