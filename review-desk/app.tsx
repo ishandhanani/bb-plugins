@@ -377,6 +377,8 @@ type Anno =
   | { kind: "composer"; path: string; line: number; startLine: number | null; side: "LEFT" | "RIGHT"; initial: string };
 
 interface AnnoActions {
+  /** The PR author's login, to color their comments. */
+  prAuthor: string | null;
   reply(commentId: number, body: string): Promise<void>;
   resolve(threadId: string, resolve: boolean): Promise<void>;
   savePending(input: { path: string; line: number; startLine: number | null; side: "LEFT" | "RIGHT"; body: string }): Promise<void>;
@@ -398,18 +400,88 @@ function TextArea({ value, onChange, rows, placeholder, autoFocus }: { value: st
   );
 }
 
+// Annotations are slotted into Pierre's diff container and inherit its
+// monospace font and `white-space: pre`, which is why comment bodies used to
+// run off the right edge. These classes reset that and tame Markdown output.
+const PROSE = cn(
+  "font-sans text-[13px] leading-relaxed whitespace-normal text-foreground [overflow-wrap:anywhere] min-w-0 max-w-full",
+  "[&_p]:my-1.5 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-0.5 [&_h1]:my-2 [&_h1]:text-sm [&_h2]:my-2 [&_h2]:text-sm [&_h3]:my-1.5 [&_h3]:text-[13px] [&_blockquote]:border-l-2 [&_blockquote]:border-border [&_blockquote]:pl-2 [&_blockquote]:text-muted-foreground",
+  "[&_pre]:my-1.5 [&_pre]:overflow-x-auto [&_pre]:whitespace-pre [&_pre]:rounded-md [&_pre]:text-[12px] [&_code]:text-[12px] [&_:not(pre)>code]:whitespace-pre-wrap [&_:not(pre)>code]:[overflow-wrap:anywhere]",
+  "[&_table]:my-1.5 [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto [&_table]:text-[12px] [&_img]:max-w-full [&_a]:underline [&_a]:decoration-border [&_hr]:my-2",
+);
+
+const BOT_LOGINS = new Set(["coderabbitai", "github-actions", "copilot", "copilot-pull-request-reviewer", "dependabot", "codecov", "greptile", "greptile-apps", "cursor", "devin-ai-integration", "sourcery-ai", "ellipsis-dev", "gemini-code-assist", "claude", "codex", "renovate", "sonarcloud", "graphite-app"]);
+function isBot(login: string): boolean {
+  return /\[bot\]$/i.test(login) || BOT_LOGINS.has(login.toLowerCase().replace(/\[bot\]$/i, ""));
+}
+
+const SEVERITIES: { test: RegExp; label: string; className: string }[] = [
+  { test: /\b(critical|blocker|p0)\b/i, label: "critical", className: "border-destructive/50 bg-destructive/10 text-destructive" },
+  { test: /\b(major|p1|high|important)\b/i, label: "major", className: "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300" },
+  { test: /\b(minor|p2|medium|suggestion)\b/i, label: "minor", className: "border-sky-500/50 bg-sky-500/10 text-sky-700 dark:text-sky-300" },
+  { test: /\b(nit|nitpick|p3|low|trivial|style)\b/i, label: "nit", className: "border-border bg-muted text-muted-foreground" },
+];
+/** Severity and finding id from the first line of a comment, e.g. "**R1-19 · Major — …**". */
+function commentTags(body: string): { severity: { label: string; className: string } | null; id: string | null } {
+  const head = body.split("\n")[0].slice(0, 160);
+  const severity = SEVERITIES.find((s) => s.test.test(head)) ?? null;
+  const id = /\b([A-Z]{1,3}\d*-\d{1,3})\b/.exec(head)?.[1] ?? null;
+  return { severity: severity ? { label: severity.label, className: severity.className } : null, id };
+}
+
+function AuthorChip({ login, prAuthor, when }: { login: string; prAuthor: string | null; when?: string }) {
+  const bot = isBot(login);
+  const author = prAuthor !== null && login.toLowerCase() === prAuthor.toLowerCase();
+  const tone = bot ? "border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300" : author ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-foreground/5 text-foreground";
+  const name = login.replace(/\[bot\]$/i, "");
+  return (
+    <span className="inline-flex min-w-0 items-center gap-1.5 font-sans text-xs">
+      <span className={cn("inline-flex size-5 shrink-0 items-center justify-center rounded-full border text-[10px] font-semibold uppercase", tone)}>{name[0] ?? "?"}</span>
+      <span className="truncate font-medium text-foreground">{name}</span>
+      {bot ? <span className="rounded-full border border-violet-500/40 px-1.5 text-[10px] text-violet-700 dark:text-violet-300">bot</span> : author ? <span className="rounded-full border border-primary/40 px-1.5 text-[10px] text-primary">author</span> : null}
+      {when ? <span className="text-muted-foreground">· {timeAgo(when)}</span> : null}
+    </span>
+  );
+}
+
+/** GitHub comment Markdown: HTML comments dropped, `<details>` rendered as real collapsibles. */
+function CommentBody({ body, className }: { body: string; className?: string }) {
+  const cleaned = body.replace(/<!--[\s\S]*?-->/g, "");
+  const parts: ReactNode[] = [];
+  const re = /<details[^>]*>\s*(?:<summary[^>]*>([\s\S]*?)<\/summary>)?([\s\S]*?)<\/details>/gi;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let i = 0;
+  while ((m = re.exec(cleaned)) !== null) {
+    if (m.index > last) parts.push(<Markdown key={`t${i}`} content={cleaned.slice(last, m.index)} />);
+    parts.push(
+      <details key={`d${i}`} className="my-1.5 rounded-md border border-border/70 bg-background/60 px-2 py-1">
+        <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">{(m[1] ?? "Details").replace(/<[^>]+>/g, "").trim() || "Details"}</summary>
+        <div className="pt-1"><Markdown content={m[2].trim()} /></div>
+      </details>,
+    );
+    last = m.index + m[0].length;
+    i++;
+  }
+  if (last < cleaned.length) parts.push(<Markdown key={`t${i}`} content={cleaned.slice(last)} />);
+  return <div className={cn(PROSE, className)}>{parts}</div>;
+}
+
 function ThreadCard({ thread, actions }: { thread: GhThread; actions: AnnoActions }) {
   const [reply, setReply] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const first = thread.comments[0];
+  const tags = first ? commentTags(first.body) : { severity: null, id: null };
   return (
-    <div className={cn("my-1.5 rounded-lg border bg-card text-xs shadow-sm", thread.isResolved ? "border-border/60 opacity-70" : "border-border")}>
+    <div className={cn("my-1.5 rounded-lg border bg-card font-sans text-xs shadow-sm", thread.isResolved ? "border-border/60 opacity-70" : "border-border")}>
       <div className="flex flex-wrap items-center gap-2 border-b border-border/60 px-3 py-1.5">
-        <Icon name="Github" className="size-3.5 text-muted-foreground" />
-        <span className="font-medium">{first?.author ?? "thread"}</span>
+        <Icon name="Github" className="size-3.5 shrink-0 text-muted-foreground" />
+        {first ? <AuthorChip login={first.author} prAuthor={actions.prAuthor} /> : <span className="font-medium">thread</span>}
         {thread.comments.length > 1 ? <span className="text-muted-foreground">+{thread.comments.length - 1}</span> : null}
-        {thread.isResolved ? <span className="rounded-full border border-border px-1.5 text-[10px]">resolved</span> : null}
-        {thread.isOutdated ? <span className="rounded-full border border-border px-1.5 text-[10px]">outdated</span> : null}
+        {tags.id ? <span className="rounded-full border border-border px-1.5 font-mono text-[10px]">{tags.id}</span> : null}
+        {tags.severity ? <span className={cn("rounded-full border px-1.5 text-[10px] font-medium", tags.severity.className)}>{tags.severity.label}</span> : null}
+        {thread.isResolved ? <span className="inline-flex items-center gap-0.5 rounded-full border border-primary/40 px-1.5 text-[10px] text-primary"><Icon name="Check" className="size-3" />resolved</span> : null}
+        {thread.isOutdated ? <span className="rounded-full border border-border px-1.5 text-[10px] text-muted-foreground">outdated</span> : null}
         <span className="ml-auto flex items-center gap-1">
           {first?.url ? <UrlLink href={first.url} className="text-muted-foreground hover:text-foreground" title="Open on GitHub"><Icon name="ExternalLink" className="size-3.5" /></UrlLink> : null}
           <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => setReply((r) => (r === null ? "" : null))}>Reply</Button>
@@ -419,10 +491,10 @@ function ThreadCard({ thread, actions }: { thread: GhThread; actions: AnnoAction
         </span>
       </div>
       <div className="divide-y divide-border/60">
-        {thread.comments.map((c) => (
+        {thread.comments.map((c, index) => (
           <div key={c.id} className="px-3 py-2">
-            <div className="mb-1 text-muted-foreground"><span className="font-medium text-foreground">{c.author}</span> · {timeAgo(c.createdAt)}</div>
-            <div className="text-sm"><Markdown content={c.body} /></div>
+            {index > 0 ? <div className="mb-1"><AuthorChip login={c.author} prAuthor={actions.prAuthor} when={c.createdAt} /></div> : <div className="mb-1 text-muted-foreground">{timeAgo(c.createdAt)}</div>}
+            <CommentBody body={c.body} />
           </div>
         ))}
       </div>
@@ -442,7 +514,7 @@ function ThreadCard({ thread, actions }: { thread: GhThread; actions: AnnoAction
 function PendingCard({ pending, actions }: { pending: PendingComment; actions: AnnoActions }) {
   const [editing, setEditing] = useState<string | null>(null);
   return (
-    <div className="my-1.5 rounded-lg border border-dashed border-foreground/40 bg-card text-xs shadow-sm">
+    <div className="my-1.5 rounded-lg border border-dashed border-foreground/40 bg-card font-sans text-xs shadow-sm">
       <div className="flex items-center gap-2 border-b border-border/60 px-3 py-1.5">
         <Icon name="Edit" className="size-3.5 text-muted-foreground" />
         <span className="font-medium">Pending comment</span>
@@ -453,7 +525,7 @@ function PendingCard({ pending, actions }: { pending: PendingComment; actions: A
         </span>
       </div>
       {editing === null ? (
-        <div className="px-3 py-2 text-sm"><Markdown content={pending.body} /></div>
+        <CommentBody body={pending.body} className="px-3 py-2" />
       ) : (
         <form className="flex flex-col gap-1.5 px-3 py-2" onSubmit={async (e: FormEvent) => { e.preventDefault(); if (editing.trim() === "") return; await actions.updatePending(pending.id, editing.trim()); setEditing(null); }}>
           <TextArea value={editing} onChange={setEditing} rows={4} autoFocus />
@@ -471,7 +543,7 @@ function ComposerCard({ anno, actions }: { anno: Extract<Anno, { kind: "composer
   const [body, setBody] = useState(anno.initial);
   const [busy, setBusy] = useState(false);
   return (
-    <form className="my-1.5 flex flex-col gap-1.5 rounded-lg border border-foreground/50 bg-card px-3 py-2 text-xs shadow-sm" onSubmit={async (e: FormEvent) => { e.preventDefault(); if (body.trim() === "") return; setBusy(true); try { await actions.savePending({ path: anno.path, line: anno.line, startLine: anno.startLine, side: anno.side, body: body.trim() }); actions.closeComposer(); } finally { setBusy(false); } }}>
+    <form className="my-1.5 flex flex-col gap-1.5 rounded-lg border border-foreground/50 bg-card px-3 py-2 font-sans text-xs shadow-sm" onSubmit={async (e: FormEvent) => { e.preventDefault(); if (body.trim() === "") return; setBusy(true); try { await actions.savePending({ path: anno.path, line: anno.line, startLine: anno.startLine, side: anno.side, body: body.trim() }); actions.closeComposer(); } finally { setBusy(false); } }}>
       <div className="text-muted-foreground">
         Comment on line{anno.startLine !== null && anno.startLine !== anno.line ? `s ${anno.startLine}–${anno.line}` : ` ${anno.line}`} ({anno.side === "LEFT" ? "base" : "head"}). Stays pending until you submit the review.
       </div>
@@ -485,11 +557,15 @@ function ComposerCard({ anno, actions }: { anno: Extract<Anno, { kind: "composer
 }
 
 function Annotation({ anno, actions }: { anno: Anno; actions: AnnoActions }) {
-  switch (anno.kind) {
-    case "thread": return <ThreadCard thread={anno.thread} actions={actions} />;
-    case "pending": return <PendingCard pending={anno.pending} actions={actions} />;
-    case "composer": return <ComposerCard anno={anno} actions={actions} />;
-  }
+  // The wrapper undoes the diff container's monospace + pre inheritance for everything inside.
+  const card = (() => {
+    switch (anno.kind) {
+      case "thread": return <ThreadCard thread={anno.thread} actions={actions} />;
+      case "pending": return <PendingCard pending={anno.pending} actions={actions} />;
+      case "composer": return <ComposerCard anno={anno} actions={actions} />;
+    }
+  })();
+  return <div className="min-w-0 max-w-full whitespace-normal font-sans [tab-size:4]">{card}</div>;
 }
 
 // ---------------------------------------------------------------------------
@@ -866,14 +942,16 @@ function ReviewView({ reviewId }: { reviewId: string }) {
     }
   };
 
+  const prAuthor = detail?.review.author ?? null;
   const actions = useMemo<AnnoActions>(() => ({
+    prAuthor,
     reply: async (commentId, body) => { await rpc.call("thread_reply", { reviewId, commentId, body }); refetch(); toast.success("Reply posted"); },
     resolve: async (threadId, resolve) => { await rpc.call("thread_resolve", { reviewId, threadId, resolve }); refetch(); },
     savePending: async (input) => { await rpc.call("pending_add", { reviewId, ...input }); refetch(); },
     updatePending: async (id, body) => { await rpc.call("pending_update", { id, body }); refetch(); },
     deletePending: async (id) => { await rpc.call("pending_delete", { id }); refetch(); },
     closeComposer: () => setComposer(null),
-  }), [rpc, reviewId, refetch]);
+  }), [rpc, reviewId, refetch, prAuthor]);
 
   const openChat = () => panel.openFixedTab({ surface: { kind: "current" }, tab: CHAT_TAB, target: { reviewId } });
 
