@@ -31,7 +31,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { FileDiff, type DiffLineAnnotation, type FileDiffMetadata, type SelectedLineRange } from "@pierre/diffs/react";
 import { parsePatchFiles } from "@pierre/diffs";
-import type { BriefState, CodemapState, FileEntry, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, rpcContract } from "./server";
+import type { BriefState, CodemapState, FileEntry, Note, NoteKind, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, rpcContract } from "./server";
 import type { Codemap, GhThread } from "./host-contract";
 import type { Brief, BriefEvidence, ClaimVerdict } from "./brief-spec";
 import type { Evidence as SlopEvidence, SlopReport } from "./slop";
@@ -216,6 +216,9 @@ interface ReviewDetail {
   pending: PendingComment[];
   threads: GhThread[];
   seats: Seat[];
+  notes: Note[];
+  notesRunning: boolean;
+  notesError: string | null;
   chatProjectId: string;
 }
 
@@ -414,6 +417,7 @@ function reviewStateIcon(state: string): "Check" | "CircleX" | "MessageSquare" |
 type Anno =
   | { kind: "thread"; thread: GhThread }
   | { kind: "pending"; pending: PendingComment }
+  | { kind: "note"; note: Note }
   | { kind: "composer"; path: string; line: number; startLine: number | null; side: "LEFT" | "RIGHT"; initial: string };
 
 interface AnnoActions {
@@ -422,9 +426,73 @@ interface AnnoActions {
   reply(commentId: number, body: string): Promise<void>;
   resolve(threadId: string, resolve: boolean): Promise<void>;
   savePending(input: { path: string; line: number; startLine: number | null; side: "LEFT" | "RIGHT"; body: string }): Promise<void>;
+  /** Same shape, but the comment stays a private note. */
+  savePrivate(input: { path: string; line: number; startLine: number | null; side: "LEFT" | "RIGHT"; body: string }): Promise<void>;
   updatePending(id: string, body: string): Promise<void>;
   deletePending(id: string): Promise<void>;
   closeComposer(): void;
+  setNoteState(id: string, state: "open" | "dismissed"): Promise<void>;
+  promoteNote(id: string): Promise<void>;
+  deleteNote(id: string): Promise<void>;
+  noteToChat(note: Note): void;
+  noteToCouncil(text: string): void;
+}
+
+const NOTE_KIND_STYLE: Record<NoteKind, { label: string; className: string }> = {
+  slop: { label: "slop", className: "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300" },
+  cleanup: { label: "cleanup", className: "border-sky-500/50 bg-sky-500/10 text-sky-700 dark:text-sky-300" },
+  risk: { label: "risk", className: "border-destructive/50 bg-destructive/10 text-destructive" },
+  question: { label: "question", className: "border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300" },
+};
+
+function NoteCard({ note, actions }: { note: Note; actions: AnnoActions }) {
+  const [busy, setBusy] = useState(false);
+  const run = async (fn: () => Promise<void>) => {
+    setBusy(true);
+    try {
+      await fn();
+    } catch (cause) {
+      toast.error(describeError(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const kind = NOTE_KIND_STYLE[note.kind];
+  const source = note.source === "signal" ? "from a signal" : note.source === "helper" ? "from the helper" : "yours";
+  if (note.state === "dismissed" || note.state === "promoted") {
+    return (
+      <div className="my-1 flex items-center gap-2 rounded-md border border-dashed border-border/70 px-3 py-1 font-sans text-xs text-muted-foreground">
+        <span className="rounded-full border border-border px-1.5 text-[10px]">{note.state}</span>
+        <span className="min-w-0 truncate">{note.title || note.body.split("\n")[0]}</span>
+        {note.state === "dismissed" ? <Button variant="ghost" size="sm" className="ml-auto h-5 px-1.5 text-[11px]" disabled={busy} onClick={() => void run(() => actions.setNoteState(note.id, "open"))}>Restore</Button> : null}
+        <Button variant="ghost" size="sm" className={cn("h-5 px-1.5 text-[11px] text-destructive", note.state !== "dismissed" && "ml-auto")} disabled={busy} onClick={() => void run(() => actions.deleteNote(note.id))}>Delete</Button>
+      </div>
+    );
+  }
+  return (
+    <div className={cn("my-1.5 rounded-lg border border-dashed bg-amber-500/[0.04] font-sans text-xs shadow-sm", note.state === "stale" ? "border-border" : "border-amber-500/60")}>
+      <div className="flex flex-wrap items-center gap-1.5 border-b border-amber-500/20 px-3 py-1.5">
+        <span className="rounded-full border border-amber-500/60 bg-amber-500/15 px-1.5 text-[10px] font-medium text-amber-800 dark:text-amber-200" title="Only you can see this. Promote it to make it a real comment.">private</span>
+        <span className={cn("rounded-full border px-1.5 text-[10px] font-medium", kind.className)}>{kind.label}</span>
+        {note.severity !== "low" ? <span className={cn("rounded-full border px-1.5 text-[10px]", note.severity === "high" ? "border-destructive/50 text-destructive" : "border-border text-muted-foreground")}>{note.severity}</span> : null}
+        {note.state === "stale" ? <span className="rounded-full border border-border px-1.5 text-[10px] text-muted-foreground" title="The line this note was written against is gone after a push">stale</span> : null}
+        <span className="text-muted-foreground">{source}</span>
+        <span className="ml-auto flex flex-wrap items-center gap-0.5">
+          <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" disabled={busy} onClick={() => actions.noteToChat(note)} title="Put these lines and the note into the chat">Ask</Button>
+          <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" disabled={busy} onClick={() => actions.noteToCouncil(`${note.path}:${note.line}\n\n${note.title}\n${note.body}`)} title="Send to a Roundtable room">Council</Button>
+          <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" disabled={busy} onClick={() => void run(() => actions.promoteNote(note.id))} title="Make this a pending GitHub comment">Promote</Button>
+          <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" disabled={busy} onClick={() => void run(() => actions.setNoteState(note.id, "dismissed"))}>Dismiss</Button>
+        </span>
+      </div>
+      <div className="px-3 py-2">
+        {note.title ? <div className="mb-0.5 font-medium text-foreground">{note.title}</div> : null}
+        {note.body ? <CommentBody body={note.body} /> : null}
+        {note.suggestion ? (
+          <pre className="mt-1.5 overflow-x-auto rounded-md border border-primary/30 bg-primary/5 p-2 text-[12px] leading-relaxed"><code>{note.suggestion}</code></pre>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 function TextArea({ value, onChange, rows, placeholder, autoFocus }: { value: string; onChange: (v: string) => void; rows: number; placeholder?: string; autoFocus?: boolean }) {
@@ -582,15 +650,20 @@ function PendingCard({ pending, actions }: { pending: PendingComment; actions: A
 function ComposerCard({ anno, actions }: { anno: Extract<Anno, { kind: "composer" }>; actions: AnnoActions }) {
   const [body, setBody] = useState(anno.initial);
   const [busy, setBusy] = useState(false);
+  const [isPrivate, setPrivate] = useState(false);
+  const input = () => ({ path: anno.path, line: anno.line, startLine: anno.startLine, side: anno.side, body: body.trim() });
   return (
-    <form className="my-1.5 flex flex-col gap-1.5 rounded-lg border border-foreground/50 bg-card px-3 py-2 font-sans text-xs shadow-sm" onSubmit={async (e: FormEvent) => { e.preventDefault(); if (body.trim() === "") return; setBusy(true); try { await actions.savePending({ path: anno.path, line: anno.line, startLine: anno.startLine, side: anno.side, body: body.trim() }); actions.closeComposer(); } finally { setBusy(false); } }}>
+    <form className={cn("my-1.5 flex flex-col gap-1.5 rounded-lg border bg-card px-3 py-2 font-sans text-xs shadow-sm", isPrivate ? "border-dashed border-amber-500/60" : "border-foreground/50")} onSubmit={async (e: FormEvent) => { e.preventDefault(); if (body.trim() === "") return; setBusy(true); try { await (isPrivate ? actions.savePrivate(input()) : actions.savePending(input())); actions.closeComposer(); } catch (cause) { toast.error(describeError(cause)); } finally { setBusy(false); } }}>
       <div className="text-muted-foreground">
-        Comment on line{anno.startLine !== null && anno.startLine !== anno.line ? `s ${anno.startLine}–${anno.line}` : ` ${anno.line}`} ({anno.side === "LEFT" ? "base" : "head"}). Stays pending until you submit the review.
+        {isPrivate ? "Private note" : "Comment"} on line{anno.startLine !== null && anno.startLine !== anno.line ? `s ${anno.startLine}–${anno.line}` : ` ${anno.line}`} ({anno.side === "LEFT" ? "base" : "head"}).{" "}
+        {isPrivate ? "Only you see it here, until you promote it." : "Stays pending until you submit the review."}
       </div>
-      <TextArea value={body} onChange={setBody} rows={4} placeholder="Write the comment (Markdown)…" autoFocus />
-      <div className="flex justify-end gap-1.5">
+      <TextArea value={body} onChange={setBody} rows={4} placeholder={isPrivate ? "Note to self (Markdown)…" : "Write the comment (Markdown)…"} autoFocus />
+      <div className="flex items-center gap-1.5">
+        <label className="inline-flex items-center gap-1.5 text-muted-foreground"><input type="checkbox" checked={isPrivate} onChange={(e) => setPrivate(e.target.checked)} />Keep private</label>
+        <span className="flex-1" />
         <Button type="button" variant="ghost" size="sm" className="h-7" onClick={actions.closeComposer}>Cancel</Button>
-        <Button type="submit" size="sm" className="h-7" disabled={busy || body.trim() === ""}>Add pending comment</Button>
+        <Button type="submit" size="sm" className="h-7" disabled={busy || body.trim() === ""}>{isPrivate ? "Add note" : "Add pending comment"}</Button>
       </div>
     </form>
   );
@@ -602,6 +675,7 @@ function Annotation({ anno, actions }: { anno: Anno; actions: AnnoActions }) {
     switch (anno.kind) {
       case "thread": return <ThreadCard thread={anno.thread} actions={actions} />;
       case "pending": return <PendingCard pending={anno.pending} actions={actions} />;
+      case "note": return <NoteCard note={anno.note} actions={actions} />;
       case "composer": return <ComposerCard anno={anno} actions={actions} />;
     }
   })();
@@ -631,6 +705,7 @@ interface FileCardProps {
   file: FileEntry;
   threads: GhThread[];
   pending: PendingComment[];
+  notes: Note[];
   composer: Extract<Anno, { kind: "composer" }> | null;
   selection: Selection | null;
   onSelect(selection: Selection | null): void;
@@ -690,9 +765,10 @@ function FileCard(props: FileCardProps) {
       list.push({ side: thread.side === "LEFT" ? "deletions" : "additions", lineNumber: line, metadata: { kind: "thread", thread } });
     }
     for (const pending of props.pending) list.push({ side: pending.side === "LEFT" ? "deletions" : "additions", lineNumber: pending.line, metadata: { kind: "pending", pending } });
+    for (const note of props.notes) list.push({ side: note.side === "LEFT" ? "deletions" : "additions", lineNumber: note.line, metadata: { kind: "note", note } });
     if (props.composer) list.push({ side: props.composer.side === "LEFT" ? "deletions" : "additions", lineNumber: props.composer.line, metadata: props.composer });
     return list;
-  }, [props.threads, props.pending, props.composer]);
+  }, [props.threads, props.pending, props.notes, props.composer]);
 
   const selected = selection?.path === file.path ? selection.range : null;
   const loadDiffFiles = useCallback(
@@ -722,6 +798,7 @@ function FileCard(props: FileCardProps) {
         </span>
         {file.unresolvedCount > 0 ? <span className="inline-flex items-center gap-1 text-muted-foreground" title={`${file.unresolvedCount} open GitHub thread${file.unresolvedCount === 1 ? "" : "s"}`}><Icon name="Github" className="size-3" />{file.unresolvedCount}</span> : null}
         {file.pendingCount > 0 ? <span className="rounded-full border border-dashed border-foreground/40 px-1.5 text-[10px]">{file.pendingCount} pending</span> : null}
+        {props.notes.filter((n) => n.state === "open" || n.state === "stale").length > 0 ? <span className="rounded-full border border-dashed border-amber-500/60 bg-amber-500/10 px-1.5 text-[10px] text-amber-800 dark:text-amber-200">{props.notes.filter((n) => n.state === "open" || n.state === "stale").length} notes</span> : null}
         <span className="font-mono"><span className="text-primary">+{file.additions}</span> <span className="ml-1 text-destructive">-{file.deletions}</span></span>
         <Button variant="ghost" size="sm" className={cn("h-6 px-2 text-xs", file.viewed && "text-primary")} onClick={() => props.onViewed(!file.viewed)}>
           {file.viewed ? <><Icon name="Check" className="size-3" />Viewed</> : "Mark as viewed"}
@@ -968,7 +1045,7 @@ function EvidenceLink({ path, line, side, note, onJump }: { path: string; line: 
   );
 }
 
-function SlopMeter({ report, aiScore, onJump, onRecompute, computing }: { report: SlopReport | null; aiScore: number | null; onJump: JumpFn; onRecompute: () => void; computing: boolean }) {
+function SlopMeter({ report, aiScore, onJump, onRecompute, computing, signalNotes, onToggleSignal }: { report: SlopReport | null; aiScore: number | null; onJump: JumpFn; onRecompute: () => void; computing: boolean; signalNotes: Set<string>; onToggleSignal: (signalId: string, show: boolean) => void }) {
   const [open, setOpen] = useState<string | null>(null);
   const det = report?.score ?? null;
   const combined = det === null ? aiScore : aiScore === null ? det : Math.round(0.6 * det + 0.4 * aiScore);
@@ -1014,6 +1091,14 @@ function SlopMeter({ report, aiScore, onJump, onRecompute, computing }: { report
                   </button>
                   {open === s.id ? (
                     <ul className="space-y-1 border-t border-border/60 bg-background/60 px-3 py-2 text-xs">
+                      {s.evidence.some((e: SlopEvidence) => e.line !== null) ? (
+                        <li className="flex items-center gap-2 pb-1">
+                          <Button variant={signalNotes.has(s.id) ? "default" : "outline"} size="sm" className="h-6 text-xs" onClick={() => onToggleSignal(s.id, !signalNotes.has(s.id))}>
+                            {signalNotes.has(s.id) ? "Hide notes in the diff" : "Show as notes in the diff"}
+                          </Button>
+                          <span className="text-muted-foreground">private notes on each line, promote the ones worth a comment</span>
+                        </li>
+                      ) : null}
                       {s.evidence.map((e: SlopEvidence, i) => (
                         <li key={i} className="flex gap-2"><span className="w-3 shrink-0 text-muted-foreground">·</span><EvidenceLink path={e.path} line={e.line} side={e.side} note={e.note} onJump={onJump} /></li>
                       ))}
@@ -1030,7 +1115,7 @@ function SlopMeter({ report, aiScore, onJump, onRecompute, computing }: { report
   );
 }
 
-function BriefPanel({ reviewId, onJump }: { reviewId: string; onJump: JumpFn }) {
+function BriefPanel({ reviewId, onJump, signalNotes, onToggleSignal }: { reviewId: string; onJump: JumpFn; signalNotes: Set<string>; onToggleSignal: (signalId: string, show: boolean) => void }) {
   const { state, error, refresh, rewrite } = useBrief(reviewId);
   if (error) return <p className="text-sm text-destructive">{error}</p>;
   const report = (state?.signalsStatus === "ready" ? (state.signals as unknown as SlopReport | null) : null) ?? null;
@@ -1043,7 +1128,7 @@ function BriefPanel({ reviewId, onJump }: { reviewId: string; onJump: JumpFn }) 
   );
   return (
     <div className="space-y-4 text-sm">
-      <SlopMeter report={report} aiScore={brief?.ai.score ?? null} onJump={onJump} onRecompute={refresh} computing={state?.signalsStatus === "computing"} />
+      <SlopMeter report={report} aiScore={brief?.ai.score ?? null} onJump={onJump} onRecompute={refresh} computing={state?.signalsStatus === "computing"} signalNotes={signalNotes} onToggleSignal={onToggleSignal} />
       {state?.signalsStatus === "failed" ? <p className="text-xs text-destructive">Signals failed: {state.signalsError}</p> : null}
 
       <section className="rounded-lg border border-border bg-card p-4">
@@ -1134,6 +1219,8 @@ function ReviewView({ reviewId }: { reviewId: string }) {
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [roomText, setRoomText] = useState<string | null>(null);
+  const [noteFilter, setNoteFilter] = useState<{ kinds: Set<NoteKind>; showDismissed: boolean }>({ kinds: new Set<NoteKind>(["slop", "cleanup", "risk", "question"]), showDismissed: false });
+  const [notesMenu, setNotesMenu] = useState(false);
 
   const setSelection = useCallback((next: Selection | null) => {
     setSelectionState(next);
@@ -1161,25 +1248,30 @@ function ReviewView({ reviewId }: { reviewId: string }) {
     }
   };
 
+  const openChat = useCallback(() => panel.openFixedTab({ surface: { kind: "current" }, tab: CHAT_TAB, target: { reviewId } }), [panel, reviewId]);
+
+  /** Put a pill (and optional text) in the chat composer, opening the Chat tab so its composer is on screen to receive it. */
+  const attachToChat = useCallback((mention: PluginComposerMention, text?: string) => {
+    queueAttach(reviewId, text === undefined ? { mention } : { mention, text });
+    openChat();
+  }, [reviewId, openChat]);
+
   const prAuthor = detail?.review.author ?? null;
   const actions = useMemo<AnnoActions>(() => ({
     prAuthor,
     reply: async (commentId, body) => { await rpc.call("thread_reply", { reviewId, commentId, body }); refetch(); toast.success("Reply posted"); },
     resolve: async (threadId, resolve) => { await rpc.call("thread_resolve", { reviewId, threadId, resolve }); refetch(); },
     savePending: async (input) => { await rpc.call("pending_add", { reviewId, ...input }); refetch(); },
+    savePrivate: async (input) => { await rpc.call("note_add", { reviewId, ...input }); refetch(); },
     updatePending: async (id, body) => { await rpc.call("pending_update", { id, body }); refetch(); },
     deletePending: async (id) => { await rpc.call("pending_delete", { id }); refetch(); },
     closeComposer: () => setComposer(null),
-  }), [rpc, reviewId, refetch, prAuthor]);
-
-  const openChat = () => panel.openFixedTab({ surface: { kind: "current" }, tab: CHAT_TAB, target: { reviewId } });
-
-  /** Put a pill (and optional text) in the chat composer, opening the Chat tab so its composer is on screen to receive it. */
-  const attachToChat = useCallback((mention: PluginComposerMention, text?: string) => {
-    queueAttach(reviewId, text === undefined ? { mention } : { mention, text });
-    openChat();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reviewId]);
+    setNoteState: async (id, state) => { await rpc.call("note_update", { id, state }); refetch(); },
+    promoteNote: async (id) => { await rpc.call("note_promote", { id }); refetch(); toast.success("Now a pending comment; it posts with your review"); },
+    deleteNote: async (id) => { await rpc.call("note_delete", { id }); refetch(); },
+    noteToChat: (note) => attachToChat(pill({ kind: "range", reviewId, path: note.path, startLine: note.startLine ?? note.line, endLine: note.line, side: note.side === "LEFT" ? "old" : "new" }), `Note: ${note.title ? `${note.title}. ` : ""}${note.body.split("\n")[0]} Is this right, and what would you change?`),
+    noteToCouncil: (text) => setRoomText(text),
+  }), [rpc, reviewId, refetch, prAuthor, attachToChat]);
 
   /** Show a place in the diff: expand the file, select the line, and settle the scroll onto it. */
   const jumpToLine = useCallback<JumpFn>((path, line, side) => {
@@ -1225,6 +1317,27 @@ function ReviewView({ reviewId }: { reviewId: string }) {
   for (const t of threads) threadsByPath.set(t.path, [...(threadsByPath.get(t.path) ?? []), t]);
   const pendingByPath = new Map<string, PendingComment[]>();
   for (const p of pending) pendingByPath.set(p.path, [...(pendingByPath.get(p.path) ?? []), p]);
+  const { notes, notesRunning, notesError } = detail;
+  const notesByPath = new Map<string, Note[]>();
+  for (const n of notes) {
+    if (!noteFilter.kinds.has(n.kind)) continue;
+    if (!noteFilter.showDismissed && (n.state === "dismissed" || n.state === "promoted")) continue;
+    notesByPath.set(n.path, [...(notesByPath.get(n.path) ?? []), n]);
+  }
+  const openNotes = notes.filter((n) => n.state === "open" || n.state === "stale").length;
+  const signalNotes = new Set(notes.filter((n) => n.signalId !== null).map((n) => n.signalId as string));
+  const toggleSignalNotes = (signalId: string, show: boolean) =>
+    void run("notes", async () => {
+      const r = await rpc.call("notes_from_signal", { reviewId, signalId, show });
+      refetch();
+      toast.success(show ? `${r.count} private note${r.count === 1 ? "" : "s"} added to the diff` : "Notes removed from the diff");
+    });
+  const findNotes = () =>
+    void run("notes", async () => {
+      await rpc.call("notes_find", { reviewId });
+      refetch();
+      toast.success("The helper is reading the diff for slop and cleanups. Notes appear as it finishes.");
+    });
   const viewedCount = files.filter((f) => f.viewed).length;
   const linesLeft = files.filter((f) => !f.viewed).reduce((n, f) => n + f.additions + f.deletions, 0);
   const isExpanded = (f: FileEntry, index: number) => {
@@ -1292,7 +1405,7 @@ function ReviewView({ reviewId }: { reviewId: string }) {
             ))}
           </div>
           <div className="mt-4">
-            {tab === "brief" ? <BriefPanel reviewId={reviewId} onJump={jumpToLine} /> : tab === "description" ? <Description body={review.body} /> : tab === "discussion" ? <Discussion reviewId={reviewId} threads={threads} /> : <Commits review={review} />}
+            {tab === "brief" ? <BriefPanel reviewId={reviewId} onJump={jumpToLine} signalNotes={signalNotes} onToggleSignal={toggleSignalNotes} /> : tab === "description" ? <Description body={review.body} /> : tab === "discussion" ? <Discussion reviewId={reviewId} threads={threads} /> : <Commits review={review} />}
           </div>
 
           <div className="mt-10 flex flex-wrap items-center gap-3">
@@ -1301,6 +1414,35 @@ function ReviewView({ reviewId }: { reviewId: string }) {
             <Progress value={viewedCount} total={files.length} className="w-24" />
             <span className="text-xs text-muted-foreground">{linesLeft.toLocaleString()} lines left</span>
             <span className="ml-auto flex items-center gap-1.5">
+              <span className="relative">
+                <Button variant="outline" size="sm" className={cn("h-7 text-xs", openNotes > 0 && "border-amber-500/60 text-amber-800 dark:text-amber-200")} onClick={() => setNotesMenu((m) => !m)} aria-expanded={notesMenu} title="Private notes: slop, cleanups, and notes to self that only you see">
+                  <Icon name={notesRunning ? "Loading" : "MessageSquarePlus"} className={cn("size-3.5", notesRunning && "animate-spin")} />Notes{openNotes > 0 ? ` · ${openNotes}` : ""}
+                </Button>
+                {notesMenu ? (
+                  <div className="absolute right-0 top-full z-20 mt-1 w-80 space-y-1 rounded-md border border-border bg-card p-2 text-xs shadow-md">
+                    <div className="px-1 text-[11px] text-muted-foreground">Private notes live only here. Promote one to make it a pending GitHub comment.</div>
+                    <button type="button" disabled={notesRunning} className="flex w-full flex-col rounded px-2 py-1.5 text-left hover:bg-state-hover disabled:opacity-60" onClick={() => { setNotesMenu(false); findNotes(); }}>
+                      <span className="font-medium">{notesRunning ? "The helper is reading the diff…" : "Find slop and cleanups"}</span>
+                      <span className="text-muted-foreground">The helper reads the diff and leaves up to 25 notes on the lines. A few minutes on big PRs.</span>
+                    </button>
+                    {notesError ? <div className="px-2 text-destructive">{notesError}</div> : null}
+                    <div className="border-t border-border/60 px-2 pt-1.5">
+                      <div className="mb-1 text-[11px] text-muted-foreground">Show</div>
+                      <div className="flex flex-wrap gap-x-3 gap-y-1">
+                        {(["slop", "cleanup", "risk", "question"] as const).map((k) => (
+                          <label key={k} className="inline-flex items-center gap-1"><input type="checkbox" checked={noteFilter.kinds.has(k)} onChange={(e) => setNoteFilter((f) => { const kinds = new Set(f.kinds); if (e.target.checked) kinds.add(k); else kinds.delete(k); return { ...f, kinds }; })} />{k}<span className="text-muted-foreground">{notes.filter((n) => n.kind === k && (n.state === "open" || n.state === "stale")).length}</span></label>
+                        ))}
+                      </div>
+                      <label className="mt-1 inline-flex items-center gap-1 text-muted-foreground"><input type="checkbox" checked={noteFilter.showDismissed} onChange={(e) => setNoteFilter((f) => ({ ...f, showDismissed: e.target.checked }))} />dismissed and promoted too</label>
+                    </div>
+                    <div className="flex flex-wrap gap-1 border-t border-border/60 px-1 pt-1.5">
+                      <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => void run("notes", async () => { await rpc.call("notes_clear", { reviewId, source: "helper" }); refetch(); })}>Clear helper notes</Button>
+                      <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => void run("notes", async () => { await rpc.call("notes_clear", { reviewId, source: "signal" }); refetch(); })}>Clear signal notes</Button>
+                      <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => void run("notes", async () => { await rpc.call("notes_clear", { reviewId, dismissedOnly: true }); refetch(); })}>Clear dismissed</Button>
+                    </div>
+                  </div>
+                ) : null}
+              </span>
               <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Find a file…" className="h-7 w-44 text-xs" aria-label="Filter files" />
               <select value={diffStyle} onChange={(e) => setDiffStyle(e.target.value as "unified" | "split")} className="h-7 rounded-md border border-input bg-background px-1.5 text-xs" aria-label="Diff style">
                 <option value="unified">Unified</option>
@@ -1322,6 +1464,7 @@ function ReviewView({ reviewId }: { reviewId: string }) {
                   file={f}
                   threads={threadsByPath.get(f.path) ?? []}
                   pending={pendingByPath.get(f.path) ?? []}
+                  notes={notesByPath.get(f.path) ?? []}
                   composer={composer?.path === f.path ? composer : null}
                   selection={selection}
                   onSelect={setSelection}

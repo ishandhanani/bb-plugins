@@ -150,6 +150,29 @@ const briefStateSchema = z.object({
 });
 export type BriefState = z.infer<typeof briefStateSchema>;
 
+/** A private note: visible only here until promoted to a pending GitHub comment. */
+const noteKindSchema = z.enum(["slop", "cleanup", "risk", "question"]);
+const noteSeveritySchema = z.enum(["low", "medium", "high"]);
+const noteSchema = z.object({
+  id: z.string(),
+  reviewId: z.string(),
+  path: z.string(),
+  line: z.number(),
+  startLine: z.number().nullable(),
+  side: z.enum(["LEFT", "RIGHT"]),
+  kind: noteKindSchema,
+  severity: noteSeveritySchema,
+  title: z.string(),
+  body: z.string(),
+  suggestion: z.string().nullable(),
+  source: z.enum(["signal", "helper", "me"]),
+  signalId: z.string().nullable(),
+  state: z.enum(["open", "dismissed", "promoted", "stale"]),
+  createdAt: z.number(),
+});
+export type Note = z.infer<typeof noteSchema>;
+export type NoteKind = z.infer<typeof noteKindSchema>;
+
 const okSchema = z.object({ ok: z.literal(true) });
 const reviewIdSchema = z.object({ reviewId: z.string() });
 
@@ -164,6 +187,10 @@ export const rpcContract = defineRpcContract({
       pending: z.array(pendingSchema),
       threads: z.array(ghThreadSchema),
       seats: z.array(seatSchema),
+      notes: z.array(noteSchema),
+      /** The helper is currently looking for slop and cleanups. */
+      notesRunning: z.boolean(),
+      notesError: z.string().nullable(),
       /** Project the analyst threads are created in (the composer needs one). */
       chatProjectId: z.string(),
     }),
@@ -247,6 +274,19 @@ export const rpcContract = defineRpcContract({
   brief_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: briefStateSchema },
   /** (Re)write the plain-English brief at the current head. */
   brief_write: { input: reviewIdSchema, output: briefStateSchema },
+  /** Put one slop signal's evidence lines into the diff as notes (or take them out again). */
+  notes_from_signal: { input: z.object({ reviewId: z.string(), signalId: z.string(), show: z.boolean() }), output: z.object({ count: z.number() }) },
+  /** Ask the helper to find slop and cleanups; notes arrive over realtime. */
+  notes_find: { input: reviewIdSchema, output: okSchema },
+  note_add: {
+    input: z.object({ reviewId: z.string(), path: z.string(), line: z.number().int().min(1), startLine: z.number().int().min(1).nullable().optional(), side: z.enum(["LEFT", "RIGHT"]), body: z.string().trim().min(1).max(20_000), kind: noteKindSchema.optional() }),
+    output: z.object({ note: noteSchema }),
+  },
+  note_update: { input: z.object({ id: z.string(), state: z.enum(["open", "dismissed"]).optional(), body: z.string().trim().min(1).max(20_000).optional() }), output: z.object({ note: noteSchema }) },
+  note_delete: { input: z.object({ id: z.string() }), output: okSchema },
+  /** Turn a note into a pending GitHub comment; the note is kept as promoted. */
+  note_promote: { input: z.object({ id: z.string() }), output: z.object({ pending: pendingSchema }) },
+  notes_clear: { input: z.object({ reviewId: z.string(), source: z.enum(["signal", "helper", "me"]).optional(), dismissedOnly: z.boolean().optional() }), output: z.object({ removed: z.number() }) },
 });
 
 export const REVIEW_CHANGED = "review-changed";
@@ -342,6 +382,27 @@ const MIGRATIONS = [
      brief_error TEXT,
      updated_at INTEGER NOT NULL
    )`,
+  `CREATE TABLE IF NOT EXISTS notes (
+     id TEXT PRIMARY KEY,
+     review_id TEXT NOT NULL,
+     head_sha TEXT NOT NULL,
+     path TEXT NOT NULL,
+     line INTEGER NOT NULL,
+     start_line INTEGER,
+     side TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     severity TEXT NOT NULL,
+     title TEXT NOT NULL,
+     body TEXT NOT NULL,
+     suggestion TEXT,
+     source TEXT NOT NULL,
+     signal_id TEXT,
+     state TEXT NOT NULL,
+     anchor_hash TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS notes_review ON notes (review_id)`,
 ];
 
 interface ReviewRow {
@@ -355,6 +416,10 @@ interface SeatRow { review_id: string; provider_id: string; thread_id: string; e
 interface CodemapRow { review_id: string; head_sha: string; status: string; json: string | null; error: string | null; updated_at: number }
 interface CacheRow { review_id: string; json: string; fetched_at: number }
 interface HelperRow { review_id: string; thread_id: string; provider_id: string; environment_id: string | null; job: string | null; created_at: number }
+interface NoteRow {
+  id: string; review_id: string; head_sha: string; path: string; line: number; start_line: number | null; side: string; kind: string; severity: string; title: string; body: string;
+  suggestion: string | null; source: string; signal_id: string | null; state: string; anchor_hash: string | null; created_at: number; updated_at: number;
+}
 interface BriefRow {
   review_id: string; head_sha: string; signals_status: string; signals_json: string | null; signals_error: string | null;
   brief_status: string; brief_head_sha: string | null; brief_json: string | null; brief_raw: string | null; brief_error: string | null; updated_at: number;
@@ -419,6 +484,21 @@ function createStore(db: Database.Database) {
     setBrief: db.prepare<[string, string | null, string | null, string | null, string | null, number, string]>(
       `UPDATE briefs SET brief_status = ?, brief_head_sha = ?, brief_json = ?, brief_raw = ?, brief_error = ?, updated_at = ? WHERE review_id = ?`,
     ),
+    notes: db.prepare<[string], NoteRow>(`SELECT * FROM notes WHERE review_id = ? ORDER BY path ASC, line ASC, created_at ASC`),
+    noteById: db.prepare<[string], NoteRow>(`SELECT * FROM notes WHERE id = ?`),
+    notesBySignal: db.prepare<[string, string], NoteRow>(`SELECT * FROM notes WHERE review_id = ? AND signal_id = ?`),
+    insertNote: db.prepare<[string, string, string, string, number, number | null, string, string, string, string, string, string | null, string, string | null, string | null, number, number]>(
+      `INSERT INTO notes (id, review_id, head_sha, path, line, start_line, side, kind, severity, title, body, suggestion, source, signal_id, anchor_hash, state, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+    ),
+    setNoteState: db.prepare<[string, number, string]>(`UPDATE notes SET state = ?, updated_at = ? WHERE id = ?`),
+    setNoteBody: db.prepare<[string, number, string]>(`UPDATE notes SET body = ?, updated_at = ? WHERE id = ?`),
+    setNoteLine: db.prepare<[number, number | null, string, number, string]>(`UPDATE notes SET line = ?, start_line = ?, head_sha = ?, updated_at = ? WHERE id = ?`),
+    deleteNote: db.prepare<[string]>(`DELETE FROM notes WHERE id = ?`),
+    deleteSignalNotes: db.prepare<[string, string]>(`DELETE FROM notes WHERE review_id = ? AND signal_id = ? AND state IN ('open', 'stale')`),
+    deleteNotesBySource: db.prepare<[string, string]>(`DELETE FROM notes WHERE review_id = ? AND source = ? AND state <> 'promoted'`),
+    deleteDismissedNotes: db.prepare<[string]>(`DELETE FROM notes WHERE review_id = ? AND state = 'dismissed'`),
+    deleteAllNotes: db.prepare<[string]>(`DELETE FROM notes WHERE review_id = ? AND state <> 'promoted'`),
     codemap: db.prepare<[string], CodemapRow>(`SELECT * FROM codemaps WHERE review_id = ?`),
     setCodemap: db.prepare<[string, string, string, string | null, string | null, number]>(
       `INSERT INTO codemaps (review_id, head_sha, status, json, error, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, status = excluded.status, json = excluded.json, error = excluded.error, updated_at = excluded.updated_at`,
@@ -495,6 +575,36 @@ function toPending(row: PendingRow): PendingComment {
 
 function toSeat(row: SeatRow): Seat {
   return { providerId: row.provider_id, threadId: row.thread_id, environmentId: row.environment_id, createdAt: row.created_at };
+}
+
+const NOTE_KINDS = ["slop", "cleanup", "risk", "question"] as const;
+const NOTE_SEVERITIES = ["low", "medium", "high"] as const;
+function toNote(row: NoteRow): Note {
+  return {
+    id: row.id,
+    reviewId: row.review_id,
+    path: row.path,
+    line: row.line,
+    startLine: row.start_line,
+    side: row.side === "LEFT" ? "LEFT" : "RIGHT",
+    kind: (NOTE_KINDS as readonly string[]).includes(row.kind) ? (row.kind as Note["kind"]) : "cleanup",
+    severity: (NOTE_SEVERITIES as readonly string[]).includes(row.severity) ? (row.severity as Note["severity"]) : "low",
+    title: row.title,
+    body: row.body,
+    suggestion: row.suggestion,
+    source: row.source === "signal" || row.source === "helper" ? row.source : "me",
+    signalId: row.signal_id,
+    state: row.state === "dismissed" || row.state === "promoted" || row.state === "stale" ? row.state : "open",
+    createdAt: row.created_at,
+  };
+}
+
+/** Content hash of a line, so notes can follow their line across pushes. */
+function anchorHash(text: string): string {
+  let h = 5381;
+  const t = text.trim();
+  for (let i = 0; i < t.length; i++) h = ((h << 5) + h + t.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(16);
 }
 
 /** owner/repo#N, owner/repo/pull/N, or a full GitHub URL. */
@@ -637,8 +747,43 @@ export default async function plugin(bb: BbPluginApi) {
     const fresh = requireReview(reviewId);
     if (headChanged || cachedFiles(fresh) === null) await refreshFiles(fresh);
     await refreshThreads(fresh).catch((cause: unknown) => bb.log.warn(`threads for ${reviewId}: ${errorMessage(cause)}`));
+    if (headChanged) await reanchorNotes(fresh).catch((cause: unknown) => bb.log.warn(`notes for ${reviewId}: ${errorMessage(cause)}`));
     publish(reviewId, "synced");
     return { review: toReview(fresh), headChanged };
+  }
+
+  /** After a push, move open notes to the line whose content they were written against, or mark them stale. */
+  async function reanchorNotes(row: ReviewRow): Promise<void> {
+    const notes = q.notes.all(row.id).filter((n) => (n.state === "open" || n.state === "stale") && n.head_sha !== row.head_sha);
+    if (notes.length === 0) return;
+    const contents = new Map<string, string[] | null>();
+    const now = Date.now();
+    for (const note of notes) {
+      if (!contents.has(note.path)) {
+        const shown = await host.call("git_show", { worktree: row.worktree, sha: note.side === "LEFT" ? row.base_sha : row.head_sha, path: note.path }, hostOptions(row)).catch(() => ({ content: null }));
+        contents.set(note.path, shown.content === null ? null : shown.content.split("\n"));
+      }
+      const lines = contents.get(note.path) ?? null;
+      let found: number | null = null;
+      if (lines !== null && note.anchor_hash !== null) {
+        const window = 300;
+        let best = Number.POSITIVE_INFINITY;
+        for (let i = Math.max(0, note.line - 1 - window); i < Math.min(lines.length, note.line - 1 + window); i++) {
+          if (anchorHash(lines[i]) === note.anchor_hash && Math.abs(i + 1 - note.line) < best) {
+            best = Math.abs(i + 1 - note.line);
+            found = i + 1;
+          }
+        }
+      }
+      if (found === null) {
+        q.setNoteState.run("stale", now, note.id);
+      } else {
+        const span = note.start_line === null ? null : note.line - note.start_line;
+        q.setNoteLine.run(found, span === null ? null : Math.max(1, found - span), row.head_sha, now, note.id);
+        if (note.state === "stale") q.setNoteState.run("open", now, note.id);
+      }
+    }
+    publish(row.id, "notes");
   }
 
   async function refreshThreads(row: ReviewRow): Promise<GhThread[]> {
@@ -681,9 +826,13 @@ export default async function plugin(bb: BbPluginApi) {
       pending,
       threads,
       seats: q.seats.all(row.id).map(toSeat),
+      notes: q.notes.all(row.id).map(toNote),
+      notesRunning: q.helper.get(row.id)?.job === "notes",
+      notesError: notesErrors.get(row.id) ?? null,
       chatProjectId: await chatProjectId(row),
     };
   }
+  const notesErrors = new Map<string, string>();
 
   // -- chat seats ------------------------------------------------------------
 
@@ -1319,15 +1468,176 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
     const helper = q.helperByThread.get(thread.id);
     if (helper === undefined) return;
-    if (helper.job === "brief") void completeBrief(helper.review_id, lastAssistantText, null);
     q.setHelperJob.run(null, helper.review_id);
+    if (helper.job === "brief") void completeBrief(helper.review_id, lastAssistantText, null);
+    if (helper.job === "notes") void completeNotes(helper.review_id, lastAssistantText, null);
   });
   bb.events.on("thread.failed", ({ thread, error }) => {
     const helper = q.helperByThread.get(thread.id);
     if (helper === undefined) return;
-    if (helper.job === "brief") void completeBrief(helper.review_id, null, error ?? "the helper thread failed");
     q.setHelperJob.run(null, helper.review_id);
+    if (helper.job === "brief") void completeBrief(helper.review_id, null, error ?? "the helper thread failed");
+    if (helper.job === "notes") void completeNotes(helper.review_id, null, error ?? "the helper thread failed");
   });
+
+  // -- private notes ----------------------------------------------------------
+  //
+  // Notes live only in this plugin until promoted to a pending comment. They
+  // come from slop signals (per signal, on request), from the helper's
+  // "find slop and cleanups" job, or from the reviewer marking a comment
+  // private. Each carries a content hash of its line so it follows pushes.
+
+  const NOTES_FENCE = "review-notes";
+
+  async function fileLines(row: ReviewRow, path: string, side: "LEFT" | "RIGHT", cache: Map<string, string[] | null>): Promise<string[] | null> {
+    const key = `${side}:${path}`;
+    if (!cache.has(key)) {
+      const shown = await host.call("git_show", { worktree: row.worktree, sha: side === "LEFT" ? row.base_sha : row.head_sha, path }, hostOptions(row)).catch(() => ({ content: null }));
+      cache.set(key, shown.content === null ? null : shown.content.split("\n"));
+    }
+    return cache.get(key) ?? null;
+  }
+
+  interface NoteInput { path: string; line: number; startLine: number | null; side: "LEFT" | "RIGHT"; kind: Note["kind"]; severity: Note["severity"]; title: string; body: string; suggestion: string | null; source: Note["source"]; signalId: string | null }
+
+  async function insertNotes(row: ReviewRow, inputs: NoteInput[]): Promise<Note[]> {
+    const cache = new Map<string, string[] | null>();
+    const existing = q.notes.all(row.id);
+    const out: Note[] = [];
+    const now = Date.now();
+    for (const n of inputs) {
+      // Same place and title means the same note; do not stack duplicates.
+      if (existing.some((e) => e.path === n.path && e.line === n.line && e.title === n.title && e.state !== "dismissed")) continue;
+      const lines = await fileLines(row, n.path, n.side, cache);
+      if (lines !== null && n.line > lines.length) continue;
+      const anchor = lines === null ? null : anchorHash(lines[n.line - 1] ?? "");
+      const id = newId();
+      q.insertNote.run(id, row.id, row.head_sha, n.path, n.line, n.startLine, n.side, n.kind, n.severity, n.title, n.body, n.suggestion, n.source, n.signalId, anchor, now, now);
+      const inserted = q.noteById.get(id);
+      if (inserted !== undefined) out.push(toNote(inserted));
+    }
+    return out;
+  }
+
+  const SIGNAL_TITLES: Record<string, string> = {
+    "ai-phrasing": "AI phrasing in a comment",
+    "restating-comments": "Comment repeats the code",
+    "defensive-noise": "Defensive noise",
+    "tests-weakened": "Test weakened",
+    stubs: "Stub or deferral",
+    "commented-code": "Commented-out code",
+    duplication: "Duplicated block",
+    scope: "Outside the stated scope",
+    description: "Description shape",
+    "over-commenting": "Over-commented",
+  };
+
+  async function notesFromSignal(row: ReviewRow, signalId: string, show: boolean): Promise<number> {
+    if (!show) {
+      const before = q.notesBySignal.all(row.id, signalId).length;
+      q.deleteSignalNotes.run(row.id, signalId);
+      publish(row.id, "notes");
+      return before;
+    }
+    const report = briefState(row).signals as unknown as SlopReport | null;
+    const signal = report?.signals.find((s) => s.id === signalId);
+    if (signal === undefined) throw new Error("that signal is not in the current report; recompute first");
+    const kind: Note["kind"] = signalId === "tests-weakened" || signalId === "defensive-noise" || signalId === "stubs" ? "risk" : signalId === "scope" ? "question" : "slop";
+    const severity: Note["severity"] = signalId === "tests-weakened" ? "high" : signalId === "stubs" || signalId === "defensive-noise" || signalId === "duplication" ? "medium" : "low";
+    const inputs: NoteInput[] = signal.evidence
+      .filter((e) => e.path !== "" && e.line !== null)
+      .map((e) => ({ path: e.path, line: e.line ?? 1, startLine: null, side: e.side === "old" ? "LEFT" : "RIGHT", kind, severity, title: SIGNAL_TITLES[signalId] ?? signal.label, body: `${e.note}\n\n${signal.description}`, suggestion: null, source: "signal", signalId }));
+    const added = await insertNotes(row, inputs);
+    publish(row.id, "notes");
+    return added.length;
+  }
+
+  async function notesPrompt(row: ReviewRow): Promise<string> {
+    const files = await filesFor(row);
+    const report = briefState(row).signals as unknown as SlopReport | null;
+    return [
+      `Job: find AI slop and cleanups in this PR. Reply with exactly one fenced block tagged ${NOTES_FENCE} containing a JSON array:`,
+      '[{ "path": string, "line": number, "endLine"?: number, "kind": "slop" | "cleanup" | "risk" | "question", "severity": "low" | "medium" | "high", "title": string, "body": string, "suggestion"?: string }]',
+      "",
+      "path and line: a changed file and a head line number that appears in the diff (added or context). endLine when the note covers a range.",
+      "kind: slop = generated residue a person would cut (narrating comments, filler docstrings on private helpers, boilerplate, names that read generated); cleanup = dead or duplicated code, leftovers, stubs, inconsistent patterns; risk = weakened or skipped tests, swallowed errors, defensive noise that hides failures, behavior the description does not mention; question = something the reviewer should ask the author.",
+      "title: at most 12 words. body: one to three plain-English sentences saying what and why, no filler. suggestion: replacement code for the lines only when a concrete rewrite is obvious; leave it out otherwise.",
+      "At most 25 notes, most important first. Skip anything a formatter fixes. Read the diff; do not invent lines. Skip lines that already carry a GitHub review thread if the thread says the same thing.",
+      "",
+      `Deterministic signals for orientation (verify before repeating them):`,
+      signalsSummary(report),
+      "",
+      `PR title: ${row.title}`,
+      `Changed files (${files.length}):`,
+      ...files.slice(0, 150).map((f) => `  ${f.status.padEnd(8)} ${f.path} (+${f.additions} -${f.deletions})`),
+      ...(files.length > 150 ? [`  ... ${files.length - 150} more`] : []),
+      "",
+      "Existing GitHub review threads (path:line by author):",
+      ...cachedThreads(row).filter((t) => !t.isResolved).slice(0, 80).map((t) => `  ${t.path}:${t.line ?? t.originalLine ?? "?"} ${t.comments[0]?.author ?? ""}: ${(t.comments[0]?.body ?? "").split("\n")[0].slice(0, 90)}`),
+    ].join("\n");
+  }
+
+  const rawNotesSchema = z.array(z.object({
+    path: z.string(),
+    line: z.coerce.number(),
+    endLine: z.coerce.number().nullable().optional(),
+    kind: z.string().optional(),
+    severity: z.string().optional(),
+    title: z.string(),
+    body: z.string().optional(),
+    suggestion: z.string().nullable().optional(),
+  }));
+
+  async function findNotes(row: ReviewRow): Promise<void> {
+    if (q.helper.get(row.id)?.job !== null && q.helper.get(row.id)?.job !== undefined) throw new Error("the helper is busy; wait for the current job to finish");
+    notesErrors.delete(row.id);
+    await helperSend(row, "notes", await notesPrompt(row));
+    publish(row.id, "notes");
+  }
+
+  async function completeNotes(reviewId: string, text: string | null, error: string | null): Promise<void> {
+    const row = q.review.get(reviewId);
+    if (row === undefined) return;
+    try {
+      if (error !== null || text === null) throw new Error(error ?? "the helper returned nothing");
+      const json = extractFenced(text, NOTES_FENCE) ?? (text.includes("[") ? text.slice(text.indexOf("["), text.lastIndexOf("]") + 1) : null);
+      if (json === null) throw new Error(`no ${NOTES_FENCE} block in the reply`);
+      const parsed = rawNotesSchema.parse(JSON.parse(json));
+      const files = await filesFor(row);
+      const paths = new Set(files.map((f) => f.path));
+      const inputs: NoteInput[] = [];
+      for (const n of parsed.slice(0, 25)) {
+        const clean = n.path.trim().replace(/^\.\//, "");
+        const path = paths.has(clean) ? clean : files.find((f) => f.path.endsWith(`/${clean}`))?.path;
+        if (path === undefined || !(n.line > 0)) continue;
+        const end = typeof n.endLine === "number" && n.endLine > n.line ? Math.round(n.endLine) : null;
+        inputs.push({
+          path,
+          line: end ?? Math.round(n.line),
+          startLine: end === null ? null : Math.round(n.line),
+          side: "RIGHT",
+          kind: (NOTE_KINDS as readonly string[]).includes(n.kind ?? "") ? (n.kind as Note["kind"]) : "cleanup",
+          severity: (NOTE_SEVERITIES as readonly string[]).includes(n.severity ?? "") ? (n.severity as Note["severity"]) : "low",
+          title: n.title.trim().slice(0, 140),
+          body: (n.body ?? "").trim(),
+          suggestion: n.suggestion ? n.suggestion.replace(/^```\w*\n?|```$/g, "").trimEnd() : null,
+          source: "helper",
+          signalId: null,
+        });
+      }
+      const added = await insertNotes(row, inputs);
+      if (added.length === 0 && inputs.length === 0) notesErrors.set(reviewId, "the helper found nothing it could anchor to the diff");
+    } catch (cause) {
+      notesErrors.set(reviewId, errorMessage(cause));
+    }
+    publish(reviewId, "notes");
+  }
+
+  function noteToComment(note: NoteRow): string {
+    const parts = [note.title.trim() === "" ? note.body.trim() : `**${note.title.trim()}**\n\n${note.body.trim()}`];
+    if (note.suggestion !== null && note.suggestion.trim() !== "") parts.push("```suggestion\n" + note.suggestion.replace(/\n$/, "") + "\n```");
+    return parts.join("\n\n").trim();
+  }
 
   /** Signals for the head, computing when missing or on refresh; the brief starts once per review when autoBrief is on. Rewrites go through brief_write. */
   function briefGet(row: ReviewRow, refresh: boolean): BriefState {
@@ -1500,6 +1810,56 @@ export default async function plugin(bb: BbPluginApi) {
       if (briefState(row).signalsStatus === "missing") startSignals(row);
       await writeBrief(row);
       return briefState(row);
+    },
+    notes_from_signal: async ({ reviewId, signalId, show }) => ({ count: await notesFromSignal(requireReview(reviewId), signalId, show) }),
+    notes_find: async ({ reviewId }) => {
+      await findNotes(requireReview(reviewId));
+      return { ok: true as const };
+    },
+    note_add: async ({ reviewId, path, line, startLine, side, body, kind }) => {
+      const row = requireReview(reviewId);
+      const [note] = await insertNotes(row, [{ path, line, startLine: startLine ?? null, side, kind: kind ?? "question", severity: "medium", title: "", body, suggestion: null, source: "me", signalId: null }]);
+      if (note === undefined) throw new Error("a note with the same text already sits on that line");
+      publish(row.id, "notes");
+      return { note };
+    },
+    note_update: ({ id, state, body }) => {
+      const existing = q.noteById.get(id);
+      if (existing === undefined) throw new Error("note not found");
+      const now = Date.now();
+      if (state !== undefined) q.setNoteState.run(state, now, id);
+      if (body !== undefined) q.setNoteBody.run(body, now, id);
+      publish(existing.review_id, "notes");
+      const fresh = q.noteById.get(id);
+      if (fresh === undefined) throw new Error("note vanished");
+      return { note: toNote(fresh) };
+    },
+    note_delete: ({ id }) => {
+      const existing = q.noteById.get(id);
+      q.deleteNote.run(id);
+      if (existing !== undefined) publish(existing.review_id, "notes");
+      return { ok: true as const };
+    },
+    note_promote: ({ id }) => {
+      const note = q.noteById.get(id);
+      if (note === undefined) throw new Error("note not found");
+      const pendingId = newId();
+      q.insertPending.run(pendingId, note.review_id, note.path, note.line, note.start_line, note.side === "LEFT" ? "LEFT" : "RIGHT", noteToComment(note), Date.now());
+      q.setNoteState.run("promoted", Date.now(), id);
+      publish(note.review_id, "pending");
+      publish(note.review_id, "notes");
+      const pending = q.pendingById.get(pendingId);
+      if (pending === undefined) throw new Error("pending vanished");
+      return { pending: toPending(pending) };
+    },
+    notes_clear: ({ reviewId, source, dismissedOnly }) => {
+      requireReview(reviewId);
+      const before = q.notes.all(reviewId).length;
+      if (dismissedOnly) q.deleteDismissedNotes.run(reviewId);
+      else if (source !== undefined) q.deleteNotesBySource.run(reviewId, source);
+      else q.deleteAllNotes.run(reviewId);
+      publish(reviewId, "notes");
+      return { removed: before - q.notes.all(reviewId).length };
     },
     rooms_list: async () => {
       try {
