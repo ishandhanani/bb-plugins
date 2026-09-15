@@ -5,8 +5,10 @@
 // repository through the host entry (git, gh, tree-sitter). Chat with the PR
 // runs on ordinary hidden bb threads (one per provider per review) spawned into
 // the PR worktree; the UI renders them with bb's own ThreadChat.
-import { existsSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi, type PluginMentionItem, type PluginMentionSearchContext } from "@get-bb/plugin-sdk";
@@ -150,6 +152,21 @@ const briefStateSchema = z.object({
 });
 export type BriefState = z.infer<typeof briefStateSchema>;
 
+/**
+ * Simple English rewrites of the PR's GitHub comments, keyed per comment:
+ * `t:<node id>` for a review-thread comment, `c:<id>` for a conversation
+ * comment, `r:<id>` for a review body. Written by a cheap hidden thread.
+ */
+const simpleStateSchema = z.object({
+  /** The plugin setting; when off, nothing is queued and items stay as they were. */
+  enabled: z.boolean(),
+  items: z.record(z.string(), z.string()),
+  /** Keys queued or being rewritten right now. */
+  pending: z.array(z.string()),
+  error: z.string().nullable(),
+});
+export type SimpleState = z.infer<typeof simpleStateSchema>;
+
 const commitInfoSchema = z.object({ sha: z.string(), parents: z.array(z.string()), author: z.string(), date: z.string(), title: z.string(), body: z.string() });
 export type CommitInfo = z.infer<typeof commitInfoSchema>;
 
@@ -279,6 +296,8 @@ export const rpcContract = defineRpcContract({
   brief_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: briefStateSchema },
   /** (Re)write the plain-English brief at the current head. */
   brief_write: { input: reviewIdSchema, output: briefStateSchema },
+  /** Simple English rewrites of the comments; missing ones are queued on each call when the setting is on. `refresh` throws the cache away and rewrites everything. */
+  simple_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: simpleStateSchema },
   /** Put one slop signal's evidence lines into the diff as notes (or take them out again). */
   notes_from_signal: { input: z.object({ reviewId: z.string(), signalId: z.string(), show: z.boolean() }), output: z.object({ count: z.number() }) },
   /** Ask the helper to find slop and cleanups; notes arrive over realtime. */
@@ -428,6 +447,18 @@ const MIGRATIONS = [
    )`,
   `CREATE INDEX IF NOT EXISTS notes_review ON notes (review_id)`,
   `CREATE TABLE IF NOT EXISTS review_seen (review_id TEXT PRIMARY KEY, seen_head_sha TEXT NOT NULL, prev_head_sha TEXT, seen_at INTEGER NOT NULL)`,
+  // A second hidden thread per review rewrites GitHub comments in Simple English; same shape as helpers.
+  `CREATE TABLE IF NOT EXISTS simplifiers (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS simple_comments (
+     review_id TEXT NOT NULL,
+     comment_key TEXT NOT NULL,
+     body_hash TEXT NOT NULL,
+     status TEXT NOT NULL,
+     text TEXT,
+     error TEXT,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY (review_id, comment_key)
+   )`,
 ];
 
 interface ReviewRow {
@@ -441,6 +472,7 @@ interface SeatRow { review_id: string; provider_id: string; thread_id: string; e
 interface CodemapRow { review_id: string; head_sha: string; status: string; json: string | null; error: string | null; updated_at: number }
 interface CacheRow { review_id: string; json: string; fetched_at: number }
 interface HelperRow { review_id: string; thread_id: string; provider_id: string; environment_id: string | null; job: string | null; created_at: number }
+interface SimpleRow { review_id: string; comment_key: string; body_hash: string; status: string; text: string | null; error: string | null; updated_at: number }
 interface NoteRow {
   id: string; review_id: string; head_sha: string; path: string; line: number; start_line: number | null; side: string; kind: string; severity: string; title: string; body: string;
   suggestion: string | null; source: string; signal_id: string | null; state: string; anchor_hash: string | null; created_at: number; updated_at: number;
@@ -501,6 +533,24 @@ function createStore(db: Database.Database) {
     ),
     setHelperJob: db.prepare<[string | null, string]>(`UPDATE helpers SET job = ? WHERE review_id = ?`),
     deleteHelper: db.prepare<[string]>(`DELETE FROM helpers WHERE review_id = ?`),
+    simplifier: db.prepare<[string], HelperRow>(`SELECT * FROM simplifiers WHERE review_id = ?`),
+    simplifierByThread: db.prepare<[string], HelperRow>(`SELECT * FROM simplifiers WHERE thread_id = ?`),
+    upsertSimplifier: db.prepare<[string, string, string, string | null, number]>(
+      `INSERT INTO simplifiers (review_id, thread_id, provider_id, environment_id, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id`,
+    ),
+    setSimplifierJob: db.prepare<[string | null, string]>(`UPDATE simplifiers SET job = ? WHERE review_id = ?`),
+    deleteSimplifier: db.prepare<[string]>(`DELETE FROM simplifiers WHERE review_id = ?`),
+    resetSimplifierJobs: db.prepare<[]>(`UPDATE simplifiers SET job = NULL`),
+    simpleRows: db.prepare<[string], SimpleRow>(`SELECT * FROM simple_comments WHERE review_id = ?`),
+    queueSimple: db.prepare<[string, string, string, number]>(
+      `INSERT INTO simple_comments (review_id, comment_key, body_hash, status, text, error, updated_at) VALUES (?, ?, ?, 'queued', NULL, NULL, ?)
+       ON CONFLICT(review_id, comment_key) DO UPDATE SET body_hash = excluded.body_hash, status = 'queued', text = NULL, error = NULL, updated_at = excluded.updated_at`,
+    ),
+    setSimpleStatus: db.prepare<[string, string | null, number, string, string]>(`UPDATE simple_comments SET status = ?, error = ?, updated_at = ? WHERE review_id = ? AND comment_key = ?`),
+    setSimpleReady: db.prepare<[string, number, string, string]>(`UPDATE simple_comments SET status = 'ready', text = ?, error = NULL, updated_at = ? WHERE review_id = ? AND comment_key = ?`),
+    deleteSimpleRow: db.prepare<[string, string]>(`DELETE FROM simple_comments WHERE review_id = ? AND comment_key = ?`),
+    deleteSimple: db.prepare<[string]>(`DELETE FROM simple_comments WHERE review_id = ?`),
+    resetSimpleWriting: db.prepare<[]>(`UPDATE simple_comments SET status = 'queued' WHERE status = 'writing'`),
     brief: db.prepare<[string], BriefRow>(`SELECT * FROM briefs WHERE review_id = ?`),
     ensureBrief: db.prepare<[string, string, number]>(`INSERT INTO briefs (review_id, head_sha, updated_at) VALUES (?, ?, ?) ON CONFLICT(review_id) DO NOTHING`),
     setSignals: db.prepare<[string, string, string | null, string | null, number, string]>(
@@ -666,12 +716,18 @@ export default async function plugin(bb: BbPluginApi) {
     hideSeatThreads: { type: "boolean", label: "Hide analyst threads from the sidebar", default: true },
     autoBrief: { type: "boolean", label: "Write the plain-English brief when a review is first opened at a new head", default: true },
     helperModel: { type: "string", label: "Model for the helper thread (brief, notes); empty uses the project's default", default: "" },
+    simpleEnglish: { type: "boolean", label: "Rewrite GitHub comments in Simple English as they load (a second hidden thread per review)", default: true },
+    simpleEnglishModel: { type: "string", label: "Model for the Simple English thread; empty uses helperModel, then the project's default", default: "" },
+    simpleEnglishSkill: { type: "string", label: "SKILL.md whose rules the rewrite follows; empty uses ~/.claude/skills/simple-english/SKILL.md, then built-in rules", default: "" },
   });
-  const { defaultProvider, hideSeatThreads, autoBrief, helperModel } = await settings.get();
+  const { defaultProvider, hideSeatThreads, autoBrief, helperModel, simpleEnglish, simpleEnglishModel, simpleEnglishSkill } = await settings.get();
 
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
   const { q }: Store = createStore(db);
+  // A rewrite that was in flight when the plugin last stopped never got its idle event; queue it again.
+  q.resetSimpleWriting.run();
+  q.resetSimplifierJobs.run();
   const host = bb.hosts.experimental_client({ contract: hostContract });
   const codemapBuilds = new Set<string>();
 
@@ -820,6 +876,7 @@ export default async function plugin(bb: BbPluginApi) {
     const result = await host.call("gh_threads", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
     q.setThreadsCache.run(row.id, JSON.stringify(result.threads), Date.now());
     publish(row.id, "threads");
+    scheduleSimple(row);
     return result.threads;
   }
 
@@ -1343,20 +1400,60 @@ export default async function plugin(bb: BbPluginApi) {
     ].join("\n");
   }
 
-  async function helperSend(row: ReviewRow, job: string, text: string): Promise<void> {
-    const existing = q.helper.get(row.id);
+  /** A hidden one-job-at-a-time thread per review. The helper works in the worktree; the simplifier only rewrites text. */
+  interface Lane {
+    title: string;
+    intro: (row: ReviewRow) => string;
+    model: string;
+    /** Provider reasoning level; the simplifier needs little of it. */
+    reasoningLevel?: "none" | "low";
+    get: (reviewId: string) => HelperRow | undefined;
+    upsert: (reviewId: string, threadId: string, providerId: string, environmentId: string | null, createdAt: number) => void;
+    setJob: (job: string | null, reviewId: string) => void;
+    remove: (reviewId: string) => void;
+  }
+  const helperLane: Lane = {
+    title: "helper",
+    intro: helperIntro,
+    model: helperModel,
+    get: (id) => q.helper.get(id),
+    upsert: (id, threadId, providerId, environmentId, createdAt) => { q.upsertHelper.run(id, threadId, providerId, environmentId, createdAt); },
+    setJob: (job, id) => { q.setHelperJob.run(job, id); },
+    remove: (id) => { q.deleteHelper.run(id); },
+  };
+  const simplifierLane: Lane = {
+    title: "simple english",
+    intro: simpleIntro,
+    model: simpleEnglishModel.trim() !== "" ? simpleEnglishModel : helperModel,
+    reasoningLevel: "low",
+    get: (id) => q.simplifier.get(id),
+    upsert: (id, threadId, providerId, environmentId, createdAt) => { q.upsertSimplifier.run(id, threadId, providerId, environmentId, createdAt); },
+    setJob: (job, id) => { q.setSimplifierJob.run(job, id); },
+    remove: (id) => { q.deleteSimplifier.run(id); },
+  };
+
+  const helperSend = (row: ReviewRow, job: string, text: string) => laneSend(helperLane, row, job, text);
+
+  async function laneSend(lane: Lane, row: ReviewRow, job: string, text: string): Promise<void> {
+    const existing = lane.get(row.id);
     if (existing !== undefined) {
       try {
         const thread = await bb.sdk.threads.get({ threadId: existing.thread_id });
         if (thread.archivedAt === null && thread.deletedAt === null) {
-          q.setHelperJob.run(job, row.id);
-          await bb.sdk.threads.send({ threadId: existing.thread_id, mode: "auto", input: [{ type: "text", text, mentions: [] }] });
+          lane.setJob(job, row.id);
+          await bb.sdk.threads.send({
+            threadId: existing.thread_id,
+            mode: "auto",
+            ...(lane.model.trim() !== "" ? { model: lane.model.trim() } : {}),
+            ...(lane.reasoningLevel === undefined ? {} : { reasoningLevel: lane.reasoningLevel }),
+            input: [{ type: "text", text, mentions: [] }],
+          });
           return;
         }
       } catch {
-        // stale helper; respawn below
+        // stale thread; respawn below
       }
-      q.deleteHelper.run(row.id);
+      lane.remove(row.id);
     }
     const providerId = existing?.provider_id ?? defaultProvider;
     const providers = await bb.sdk.providers.list();
@@ -1373,19 +1470,20 @@ export default async function plugin(bb: BbPluginApi) {
         : { type: "host", hostId: row.host_id, workspace: { type: "unmanaged", path: row.worktree } },
       providerId,
       ...(permissionMode ? { permissionMode } : {}),
-      ...(helperModel.trim() !== "" ? { model: helperModel.trim() } : {}),
-      title: `Review Desk ${row.owner}/${row.repo}#${row.number}: helper`,
+      ...(lane.model.trim() !== "" ? { model: lane.model.trim() } : {}),
+      ...(lane.reasoningLevel === undefined ? {} : { reasoningLevel: lane.reasoningLevel }),
+      title: `Review Desk ${row.owner}/${row.repo}#${row.number}: ${lane.title}`,
       visibility: hideSeatThreads ? "hidden" : "visible",
-      input: [{ type: "text", text: helperIntro(row), mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
+      input: [{ type: "text", text: lane.intro(row), mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
     });
-    q.upsertHelper.run(row.id, thread.id, providerId, knownEnvironment, now);
-    q.setHelperJob.run(job, row.id);
+    lane.upsert(row.id, thread.id, providerId, knownEnvironment, now);
+    lane.setJob(job, row.id);
     if (knownEnvironment === null) {
       void (async () => {
         const environmentId = thread.environmentId ?? (await waitForEnvironment(thread.id));
         if (environmentId !== null) {
           q.setEnvironment.run(environmentId, row.id);
-          q.upsertHelper.run(row.id, thread.id, providerId, environmentId, now);
+          lane.upsert(row.id, thread.id, providerId, environmentId, now);
         }
       })();
     }
@@ -1585,19 +1683,228 @@ export default async function plugin(bb: BbPluginApi) {
     publish(reviewId, "brief");
   }
 
+  // -- Simple English: GitHub comments rewritten by a second hidden thread ----
+  //
+  // Every comment over a few words goes, in batches, to a cheap hidden thread
+  // that answers with one rewrite per comment. Rows are keyed by comment and
+  // body hash, so an edited comment is redone and the rest is served from
+  // SQLite. The UI shows the rewrite under the original.
+
+  const SIMPLE_FENCE = "simple-english";
+  const SIMPLE_BATCH = 30;
+  const SIMPLE_BATCH_CHARS = 40_000;
+  const SIMPLE_MIN_WORDS = 12;
+  const SIMPLE_MAX_CHARS = 8_000;
+  const SIMPLE_RULES_FALLBACK = [
+    "Write short sentences: at most 20 words for an instruction, 25 for a statement. One idea per sentence.",
+    "Use the active voice and simple tenses. The only modals are can, will, and must. Never should, would, may, might, or could.",
+    "No contractions. Keep the articles and the word that.",
+    "Put the condition first: If the build fails, read the log.",
+    "One word per concept in the whole text: one of check, verify, confirm, validate; one of config, settings.",
+    "Replace filler: in order to becomes to, prior to becomes before, ensure becomes make sure that, leverage becomes use. Delete simply, just, robust, it is worth noting.",
+    "No semicolons. Write two sentences.",
+    "Describe an action with a verb, not a noun.",
+  ].join("\n");
+
+  interface SimpleItem { key: string; author: string; body: string }
+
+  const simpleHash = (body: string) => createHash("sha1").update(body).digest("hex").slice(0, 16);
+
+  function proseWords(body: string): number {
+    return body.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/<!--[\s\S]*?-->/g, " ").split(/\s+/).filter(Boolean).length;
+  }
+
+  /** Every comment worth rewriting: review threads plus the conversation, as far as both caches go. Open threads come first, so what the reviewer reads first is rewritten first. */
+  function commentItems(row: ReviewRow): SimpleItem[] {
+    const items: SimpleItem[] = [];
+    const threads = cachedThreads(row).slice().sort((a, b) => Number(a.isResolved) - Number(b.isResolved));
+    for (const t of threads) for (const c of t.comments) items.push({ key: `t:${c.id}`, author: c.author, body: c.body });
+    const conversation = parseJson<{ comments?: { id: number; author: string; body: string }[]; reviews?: { id: number; author: string; body: string }[] }>(q.conversationCache.get(row.id)?.json ?? null, {});
+    for (const c of conversation.comments ?? []) items.push({ key: `c:${c.id}`, author: c.author, body: c.body });
+    for (const r of conversation.reviews ?? []) items.push({ key: `r:${r.id}`, author: r.author, body: r.body });
+    return items.filter((i) => i.body.length <= SIMPLE_MAX_CHARS && proseWords(i.body) >= SIMPLE_MIN_WORDS);
+  }
+
+  let simpleRulesCache: string | null = null;
+  /** The user's own simple-english SKILL.md when present, so the rewrite follows the same rules they write with. */
+  function simpleRules(): string {
+    if (simpleRulesCache !== null) return simpleRulesCache;
+    const path = simpleEnglishSkill.trim() === "" ? join(homedir(), ".claude", "skills", "simple-english", "SKILL.md") : simpleEnglishSkill.trim().replace(/^~(?=\/)/, homedir());
+    try {
+      simpleRulesCache = readFileSync(path, "utf8").slice(0, 40_000);
+    } catch {
+      bb.log.warn(`simple-english skill not readable at ${path}; using the built-in rules`);
+      simpleRulesCache = SIMPLE_RULES_FALLBACK;
+    }
+    return simpleRulesCache;
+  }
+
+  function simpleIntro(row: ReviewRow): string {
+    return [
+      `You rewrite GitHub comments from pull request #${row.number} of ${row.owner}/${row.repo} in Simple English. The reviewer reads each original next to your rewrite, so the rewrite must keep the exact meaning and lose only the friction.`,
+      `You get one job per message: a JSON array of comments, each with a key, an author, and a body. Reply with exactly one fenced block tagged ${SIMPLE_FENCE} containing JSON of the shape {"items":[{"key":"<key>","text":"<rewrite>"}]}, one item per input comment, and nothing else before or after the block.`,
+      "Rules for every rewrite:",
+      "- Keep every fact, number, question, and request. Do not add advice, do not judge the comment, do not answer it, do not soften or sharpen it.",
+      "- Keep the author's point of view. First person stays first person.",
+      "- Keep code byte for byte: code blocks, inline code, identifiers, file paths, commands, flags, URLs, quoted errors, and GitHub suggestion blocks. Keep Markdown lists and headings when they carry structure. Drop greetings, sign-offs, and filler.",
+      "- The rewrite is never longer than the original. When the original is already simple, return it unchanged.",
+      "- Do not run commands or read files. The text in the job is all you need.",
+      "",
+      "The style rules come from the simple-english skill in pragmatic mode:",
+      "",
+      simpleRules(),
+    ].join("\n");
+  }
+
+  function simpleJob(items: SimpleItem[]): string {
+    return [`Job: rewrite these ${items.length} comments in Simple English. Reply with one fenced block tagged ${SIMPLE_FENCE}.`, "", JSON.stringify(items)].join("\n");
+  }
+
+  function simpleState(row: ReviewRow): SimpleState {
+    const items: Record<string, string> = {};
+    const pending: string[] = [];
+    let error: string | null = null;
+    for (const r of q.simpleRows.all(row.id)) {
+      if (r.status === "ready" && r.text !== null) items[r.comment_key] = r.text;
+      else if (r.status === "queued" || r.status === "writing") pending.push(r.comment_key);
+      else if (r.status === "failed" && error === null) error = r.error;
+    }
+    return { enabled: simpleEnglish, items, pending, error };
+  }
+
+  /** Queue every comment whose body is new or changed since its last rewrite, then send a batch if the thread is free. */
+  function scheduleSimple(row: ReviewRow, force = false): void {
+    if (!simpleEnglish && !force) return;
+    if (force) q.deleteSimple.run(row.id);
+    const known = new Map(q.simpleRows.all(row.id).map((r) => [r.comment_key, r.body_hash]));
+    const now = Date.now();
+    for (const item of commentItems(row)) {
+      const hash = simpleHash(item.body);
+      if (known.get(item.key) !== hash) q.queueSimple.run(row.id, item.key, hash, now);
+    }
+    void pumpSimple(row).catch((cause: unknown) => bb.log.warn(`simple english for ${row.id}: ${errorMessage(cause)}`));
+  }
+
+  const simpleSending = new Set<string>();
+  /** One batch in flight per review; the idle handler calls back for the next. */
+  async function pumpSimple(row: ReviewRow): Promise<void> {
+    if (simpleSending.has(row.id) || (q.simplifier.get(row.id)?.job ?? null) !== null) return;
+    const bodies = new Map(commentItems(row).map((i) => [i.key, i]));
+    const batch: SimpleItem[] = [];
+    let chars = 0;
+    for (const r of q.simpleRows.all(row.id)) {
+      if (r.status !== "queued") continue;
+      const item = bodies.get(r.comment_key);
+      if (item === undefined) {
+        q.deleteSimpleRow.run(row.id, r.comment_key);
+        continue;
+      }
+      if (batch.length >= SIMPLE_BATCH || chars + item.body.length > SIMPLE_BATCH_CHARS) break;
+      batch.push(item);
+      chars += item.body.length;
+    }
+    if (batch.length === 0) return;
+    simpleSending.add(row.id);
+    try {
+      const now = Date.now();
+      for (const item of batch) q.setSimpleStatus.run("writing", null, now, row.id, item.key);
+      publish(row.id, "simple");
+      await laneSend(simplifierLane, row, "simple", simpleJob(batch));
+    } catch (cause) {
+      const message = errorMessage(cause);
+      for (const item of batch) q.setSimpleStatus.run("failed", message, Date.now(), row.id, item.key);
+      publish(row.id, "simple");
+      throw cause;
+    } finally {
+      simpleSending.delete(row.id);
+    }
+  }
+
+  /**
+   * The rewrites in a reply. Rewrites keep the comments' own code fences, so
+   * the tagged block is read greedily to the last fence in the reply, then
+   * as a plain json block, then as whatever sits between the outer braces.
+   */
+  function parseSimpleReply(text: string): Map<string, string> | null {
+    const candidates: string[] = [];
+    const tagged = new RegExp("```" + SIMPLE_FENCE + "[^\\n]*\\n([\\s\\S]*)```", "i").exec(text);
+    if (tagged !== null) candidates.push(tagged[1]);
+    const json = /```json[^\n]*\n([\s\S]*)```/i.exec(text);
+    if (json !== null) candidates.push(json[1]);
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start !== -1 && end > start) candidates.push(text.slice(start, end + 1));
+    for (const candidate of candidates) {
+      try {
+        const parsed = JSON.parse(candidate) as { items?: unknown };
+        const rewrites = new Map<string, string>();
+        for (const entry of Array.isArray(parsed.items) ? parsed.items : []) {
+          const o = entry as { key?: unknown; text?: unknown };
+          if (typeof o.key === "string" && typeof o.text === "string" && o.text.trim() !== "") rewrites.set(o.key, o.text.trim());
+        }
+        return rewrites;
+      } catch {
+        // try the next shape
+      }
+    }
+    return null;
+  }
+
+  /** Comments that already got a second try after a bad reply; a second miss stays failed. */
+  const simpleRetried = new Set<string>();
+
+  function completeSimple(reviewId: string, text: string | null, error: string | null): void {
+    const row = q.review.get(reviewId);
+    if (row === undefined) return;
+    const rewrites = text === null ? null : parseSimpleReply(text);
+    const failure = error ?? (rewrites === null ? "could not read the rewrite" : "no rewrite returned");
+    const now = Date.now();
+    for (const r of q.simpleRows.all(reviewId)) {
+      // A rewrite lands wherever its key is still open; replies and batches can interleave after a reload.
+      const rewrite = r.status === "writing" || r.status === "queued" ? rewrites?.get(r.comment_key) : undefined;
+      if (rewrite !== undefined) {
+        q.setSimpleReady.run(rewrite, now, reviewId, r.comment_key);
+        continue;
+      }
+      if (r.status !== "writing") continue;
+      const retryKey = `${reviewId}:${r.comment_key}`;
+      if (simpleRetried.has(retryKey)) {
+        q.setSimpleStatus.run("failed", failure, now, reviewId, r.comment_key);
+      } else {
+        simpleRetried.add(retryKey);
+        q.setSimpleStatus.run("queued", failure, now, reviewId, r.comment_key);
+      }
+    }
+    publish(reviewId, "simple");
+    void pumpSimple(row).catch((cause: unknown) => bb.log.warn(`simple english for ${reviewId}: ${errorMessage(cause)}`));
+  }
+
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
     const helper = q.helperByThread.get(thread.id);
-    if (helper === undefined) return;
-    q.setHelperJob.run(null, helper.review_id);
-    if (helper.job === "brief") void completeBrief(helper.review_id, lastAssistantText, null);
-    if (helper.job === "notes") void completeNotes(helper.review_id, lastAssistantText, null);
+    if (helper !== undefined) {
+      q.setHelperJob.run(null, helper.review_id);
+      if (helper.job === "brief") void completeBrief(helper.review_id, lastAssistantText, null);
+      if (helper.job === "notes") void completeNotes(helper.review_id, lastAssistantText, null);
+      return;
+    }
+    const simplifier = q.simplifierByThread.get(thread.id);
+    if (simplifier === undefined) return;
+    // The simplifier only ever does one kind of job, so a reply is used even when a reload cleared the marker.
+    q.setSimplifierJob.run(null, simplifier.review_id);
+    completeSimple(simplifier.review_id, lastAssistantText, null);
   });
   bb.events.on("thread.failed", ({ thread, error }) => {
     const helper = q.helperByThread.get(thread.id);
-    if (helper === undefined) return;
-    q.setHelperJob.run(null, helper.review_id);
-    if (helper.job === "brief") void completeBrief(helper.review_id, null, error ?? "the helper thread failed");
-    if (helper.job === "notes") void completeNotes(helper.review_id, null, error ?? "the helper thread failed");
+    if (helper !== undefined) {
+      q.setHelperJob.run(null, helper.review_id);
+      if (helper.job === "brief") void completeBrief(helper.review_id, null, error ?? "the helper thread failed");
+      if (helper.job === "notes") void completeNotes(helper.review_id, null, error ?? "the helper thread failed");
+      return;
+    }
+    const simplifier = q.simplifierByThread.get(thread.id);
+    if (simplifier === undefined) return;
+    q.setSimplifierJob.run(null, simplifier.review_id);
+    completeSimple(simplifier.review_id, null, error ?? "the Simple English thread failed");
   });
 
   // -- private notes ----------------------------------------------------------
@@ -1826,6 +2133,8 @@ export default async function plugin(bb: BbPluginApi) {
     reviews_sync: ({ reviewId }) => syncReview(reviewId),
     reviews_remove: async ({ reviewId }) => {
       for (const seat of q.seats.all(reviewId)) await chatReset(reviewId, seat.provider_id);
+      q.deleteSimplifier.run(reviewId);
+      q.deleteSimple.run(reviewId);
       q.deleteReview.run(reviewId);
       publish(reviewId, "removed");
       return { ok: true as const };
@@ -1852,6 +2161,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const result = await host.call("gh_conversation", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
       q.setConversationCache.run(row.id, JSON.stringify(result), Date.now());
+      scheduleSimple(row);
       return { ...result, fetchedAt: Date.now() };
     },
     review_threads_refresh: async ({ reviewId }) => ({ threads: await refreshThreads(requireReview(reviewId)) }),
@@ -1930,6 +2240,11 @@ export default async function plugin(bb: BbPluginApi) {
       if (briefState(row).signalsStatus === "missing") startSignals(row);
       await writeBrief(row);
       return briefState(row);
+    },
+    simple_get: ({ reviewId, refresh }) => {
+      const row = requireReview(reviewId);
+      scheduleSimple(row, refresh === true);
+      return simpleState(row);
     },
     notes_from_signal: async ({ reviewId, signalId, show }) => ({ count: await notesFromSignal(requireReview(reviewId), signalId, show) }),
     notes_find: async ({ reviewId }) => {
@@ -2034,10 +2349,12 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "list", summary: "List reviews", usage: "bb review-desk list [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "codemap", summary: "Build or print the codemap", usage: "bb review-desk codemap <reviewId> [--json]" },
+      { name: "simple", summary: "Queue Simple English rewrites of the comments, or redo them all", usage: "bb review-desk simple <reviewId> [--redo] [--json]" },
     ],
     async run(argv) {
       const json = argv.includes("--json");
-      const args = argv.filter((a) => a !== "--json");
+      const redo = argv.includes("--redo");
+      const args = argv.filter((a) => a !== "--json" && a !== "--redo");
       const flag = (name: string) => {
         const i = args.indexOf(`--${name}`);
         return i !== -1 && i + 1 < args.length ? args[i + 1] : undefined;
@@ -2062,6 +2379,13 @@ export default async function plugin(bb: BbPluginApi) {
             const seat = await chatSend(reviewId, flag("provider") ?? defaultProvider, null, text, null);
             return ok(seat, `Sent to ${seat.providerId} analyst thread ${seat.threadId}`);
           }
+          case "simple": {
+            const row = requireReview(rest[0] ?? "");
+            scheduleSimple(row, redo);
+            const state = simpleState(row);
+            const failed = q.simpleRows.all(row.id).filter((r) => r.status === "failed").length;
+            return ok(state, `${Object.keys(state.items).length} ready, ${state.pending.length} pending, ${failed} failed${state.enabled ? "" : " (simpleEnglish is off; only --redo queues)"}${state.error === null ? "" : `\nlast error: ${state.error}`}`);
+          }
           case "codemap": {
             const row = requireReview(rest[0] ?? "");
             let state = codemapState(row);
@@ -2079,7 +2403,7 @@ export default async function plugin(bb: BbPluginApi) {
             return ok(c, text);
           }
           default:
-            return { exitCode: 1, stderr: "usage: bb review-desk open|list|ask|codemap" };
+            return { exitCode: 1, stderr: "usage: bb review-desk open|list|ask|codemap|simple" };
         }
       } catch (cause) {
         return { exitCode: 1, stderr: errorMessage(cause) };

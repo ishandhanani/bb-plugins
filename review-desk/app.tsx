@@ -6,7 +6,7 @@
 // threads, pending comments). The side panel holds Info (checks, reviewers,
 // labels, submit review), Chat (bb's own ThreadChat on an analyst thread that
 // lives in the PR worktree), and Codemap.
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { toast } from "sonner";
 import {
@@ -31,7 +31,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { FileDiff, type DiffLineAnnotation, type FileDiffMetadata, type SelectedLineRange } from "@pierre/diffs/react";
 import { parsePatchFiles } from "@pierre/diffs";
-import type { BriefState, CodemapState, CommitInfo, FileEntry, Note, NoteKind, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, rpcContract } from "./server";
+import type { BriefState, CodemapState, CommitInfo, FileEntry, Note, NoteKind, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, SimpleState, rpcContract } from "./server";
 import type { ChangedFile } from "./host-contract";
 import type { Codemap, GhThread } from "./host-contract";
 import type { Brief, BriefEvidence, ClaimVerdict } from "./brief-spec";
@@ -48,6 +48,7 @@ const PANEL_ID = "reviews";
 const PANEL_PATH = "reviews";
 const REVIEW_CHANGED = "review-changed";
 const PROVIDER_KEY = "review-desk:provider";
+const SIMPLE_KEY = "review-desk:simple-english";
 const selectionKey = (reviewId: string) => `review-desk:selection:${reviewId}`;
 
 // ---------------------------------------------------------------------------
@@ -367,6 +368,74 @@ function useBrief(reviewId: string | null) {
   return { state, error, refresh: () => load(true), rewrite };
 }
 
+// ---------------------------------------------------------------------------
+// Simple English
+//
+// The server rewrites every GitHub comment through a hidden thread; comment
+// bodies look their own rewrite up by key through this context, and one
+// toggle in the top bar shows or hides all of them.
+// ---------------------------------------------------------------------------
+
+interface SimpleContext {
+  on: boolean;
+  setOn(on: boolean): void;
+  /** The plugin setting; false means nothing new is being rewritten. */
+  enabled: boolean;
+  items: Record<string, string>;
+  pending: string[];
+  error: string | null;
+}
+const SimpleCtx = createContext<SimpleContext>({ on: false, setOn: () => undefined, enabled: false, items: {}, pending: [], error: null });
+
+function SimpleProvider({ reviewId, children }: { reviewId: string; children: ReactNode }) {
+  const rpc = useRpc<Contract>();
+  const [state, setState] = useState<SimpleState | null>(null);
+  const [on, setOnState] = useState<boolean>(() => readStorage<boolean>(SIMPLE_KEY) ?? true);
+  const load = useCallback(() => {
+    rpc.call("simple_get", { reviewId }).then(setState, () => undefined);
+  }, [rpc, reviewId]);
+  useEffect(() => {
+    setState(null);
+    load();
+  }, [load]);
+  useRealtime(REVIEW_CHANGED, (payload) => {
+    const p = payloadReview(payload);
+    if (p !== null && p.reviewId === reviewId && (p.what === "simple" || p.what === "threads" || p.what === "synced")) load();
+  });
+  const busy = state !== null && state.pending.length > 0;
+  useEffect(() => {
+    if (!busy) return;
+    const timer = setInterval(load, 8000);
+    return () => clearInterval(timer);
+  }, [busy, load]);
+  const value = useMemo<SimpleContext>(() => ({
+    on,
+    setOn: (next) => {
+      setOnState(next);
+      writeStorage(SIMPLE_KEY, next);
+    },
+    enabled: state?.enabled ?? true,
+    items: state?.items ?? {},
+    pending: state?.pending ?? [],
+    error: state?.error ?? null,
+  }), [on, state]);
+  return <SimpleCtx.Provider value={value}>{children}</SimpleCtx.Provider>;
+}
+
+function SimpleToggle() {
+  const simple = useContext(SimpleCtx);
+  const title = !simple.enabled
+    ? "Simple English rewrites are off in the plugin settings"
+    : simple.error !== null
+      ? `Show each GitHub comment rewritten in Simple English under the original. Last error: ${simple.error}`
+      : "Show each GitHub comment rewritten in Simple English under the original";
+  return (
+    <Button variant="ghost" size="sm" className={cn("h-7 text-xs", simple.on && "text-primary")} onClick={() => simple.setOn(!simple.on)} aria-pressed={simple.on} title={title}>
+      <Icon name={simple.pending.length > 0 && simple.on ? "Loading" : "TextWrap"} className={cn("size-3.5", simple.pending.length > 0 && simple.on && "animate-spin")} />Simple English
+    </Button>
+  );
+}
+
 function useProviders() {
   const rpc = useRpc<Contract>();
   const [providers, setProviders] = useState<ProviderOption[]>([]);
@@ -579,8 +648,11 @@ function AuthorChip({ login, prAuthor, when }: { login: string; prAuthor: string
   );
 }
 
-/** GitHub comment Markdown: HTML comments dropped, `<details>` rendered as real collapsibles. */
-function CommentBody({ body, className }: { body: string; className?: string }) {
+/** GitHub comment Markdown: HTML comments dropped, `<details>` rendered as real collapsibles. With `simpleKey`, the Simple English rewrite follows the original when the toggle is on. */
+function CommentBody({ body, className, simpleKey }: { body: string; className?: string; simpleKey?: string }) {
+  const simple = useContext(SimpleCtx);
+  const rewrite = simpleKey !== undefined && simple.on ? simple.items[simpleKey] : undefined;
+  const writing = rewrite === undefined && simpleKey !== undefined && simple.on && simple.pending.includes(simpleKey);
   const cleaned = body.replace(/<!--[\s\S]*?-->/g, "");
   const parts: ReactNode[] = [];
   const re = /<details[^>]*>\s*(?:<summary[^>]*>([\s\S]*?)<\/summary>)?([\s\S]*?)<\/details>/gi;
@@ -599,7 +671,19 @@ function CommentBody({ body, className }: { body: string; className?: string }) 
     i++;
   }
   if (last < cleaned.length) parts.push(<Markdown key={`t${i}`} content={cleaned.slice(last)} />);
-  return <div className={cn(PROSE, className)}>{parts}</div>;
+  return (
+    <div className={cn(PROSE, className)}>
+      {parts}
+      {rewrite !== undefined ? (
+        <div className="mt-2 rounded-md border border-dashed border-border/70 bg-muted/30 px-2.5 py-1.5">
+          <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Simple English</div>
+          <Markdown content={rewrite} />
+        </div>
+      ) : writing ? (
+        <div className="mt-1 text-[11px] text-muted-foreground">Simple English: writing…</div>
+      ) : null}
+    </div>
+  );
 }
 
 function ThreadCard({ thread, actions }: { thread: GhThread; actions: AnnoActions }) {
@@ -629,7 +713,7 @@ function ThreadCard({ thread, actions }: { thread: GhThread; actions: AnnoAction
         {thread.comments.map((c, index) => (
           <div key={c.id} className="px-3 py-2">
             {index > 0 ? <div className="mb-1"><AuthorChip login={c.author} prAuthor={actions.prAuthor} when={c.createdAt} /></div> : <div className="mb-1 text-muted-foreground">{timeAgo(c.createdAt)}</div>}
-            <CommentBody body={c.body} />
+            <CommentBody body={c.body} simpleKey={`t:${c.id}`} />
           </div>
         ))}
       </div>
@@ -1005,8 +1089,8 @@ function Discussion({ reviewId, threads }: { reviewId: string; threads: GhThread
   const open = threads.filter((t) => !t.isResolved);
   if (conversation === null) return <p className="text-sm text-muted-foreground">Loading…</p>;
   const items = [
-    ...conversation.reviews.map((r) => ({ key: `r-${r.id}`, author: r.author, when: r.submittedAt, body: r.body, badge: r.state, url: r.url })),
-    ...conversation.comments.map((c) => ({ key: `c-${c.id}`, author: c.author, when: c.createdAt, body: c.body, badge: null as string | null, url: c.url })),
+    ...conversation.reviews.map((r) => ({ key: `r:${r.id}`, author: r.author, when: r.submittedAt, body: r.body, badge: r.state, url: r.url })),
+    ...conversation.comments.map((c) => ({ key: `c:${c.id}`, author: c.author, when: c.createdAt, body: c.body, badge: null as string | null, url: c.url })),
   ].sort((a, b) => Date.parse(a.when ?? "") - Date.parse(b.when ?? ""));
   return (
     <div className="space-y-4 text-sm">
@@ -1037,7 +1121,7 @@ function Discussion({ reviewId, threads }: { reviewId: string; threads: GhThread
               {item.when ? <span>{timeAgo(item.when)}</span> : null}
               <UrlLink href={item.url} className="ml-auto hover:text-foreground" title="Open on GitHub"><Icon name="ExternalLink" className="size-3.5" /></UrlLink>
             </div>
-            {item.body.trim() === "" ? <span className="text-xs text-muted-foreground">No text.</span> : <Markdown content={item.body} />}
+            {item.body.trim() === "" ? <span className="text-xs text-muted-foreground">No text.</span> : <CommentBody body={item.body} simpleKey={item.key} />}
           </li>
         ))}
       </ul>
@@ -1570,6 +1654,7 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
         <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => void run("sync", async () => { await rpc.call("reviews_sync", { reviewId }); refetch(); toast.success("Synced with GitHub"); })} disabled={busy !== null} title="Refresh PR metadata, head, and threads">
           <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", busy === "sync" && "animate-spin")} />Sync
         </Button>
+        <SimpleToggle />
         <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: CODEMAP_TAB, target: { reviewId } })}><Icon name="Layers" className="size-3.5" />Codemap</Button>
         <Button variant="outline" size="sm" className="h-7 text-xs" onClick={openChat}><Icon name="Brain" className="size-3.5" />Chat</Button>
         <Button size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: INFO_TAB, target: { reviewId } })}>
@@ -2127,7 +2212,7 @@ function ReviewsPage({ subPath }: { subPath: string }) {
   const [head, section, target] = subPath.split("/");
   const reviewId = head !== "" ? head : null;
   const commit = section === "commits" && target !== undefined ? parseCommitTarget(target) : null;
-  if (reviewId !== null) return <ReviewView key={reviewId} reviewId={reviewId} commit={commit} />;
+  if (reviewId !== null) return <SimpleProvider key={reviewId} reviewId={reviewId}><ReviewView reviewId={reviewId} commit={commit} /></SimpleProvider>;
   const open = async (e: FormEvent) => {
     e.preventDefault();
     if (ref.trim() === "") return;
