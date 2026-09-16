@@ -717,10 +717,11 @@ export default async function plugin(bb: BbPluginApi) {
     autoBrief: { type: "boolean", label: "Write the plain-English brief when a review is first opened at a new head", default: true },
     helperModel: { type: "string", label: "Model for the helper thread (brief, notes); empty uses the project's default", default: "" },
     simpleEnglish: { type: "boolean", label: "Rewrite GitHub comments in Simple English as they load (a second hidden thread per review)", default: true },
+    simpleEnglishProvider: { type: "string", label: "Provider id for the Simple English thread; empty uses defaultProvider", default: "" },
     simpleEnglishModel: { type: "string", label: "Model for the Simple English thread; empty uses helperModel, then the project's default", default: "" },
     simpleEnglishSkill: { type: "string", label: "SKILL.md whose rules the rewrite follows; empty uses ~/.claude/skills/simple-english/SKILL.md, then built-in rules", default: "" },
   });
-  const { defaultProvider, hideSeatThreads, autoBrief, helperModel, simpleEnglish, simpleEnglishModel, simpleEnglishSkill } = await settings.get();
+  const { defaultProvider, hideSeatThreads, autoBrief, helperModel, simpleEnglish, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill } = await settings.get();
 
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
@@ -1404,6 +1405,8 @@ export default async function plugin(bb: BbPluginApi) {
   interface Lane {
     title: string;
     intro: (row: ReviewRow) => string;
+    /** Empty means defaultProvider. A live thread on another provider is replaced. */
+    providerId: string;
     model: string;
     /** Provider reasoning level; the simplifier needs little of it. */
     reasoningLevel?: "none" | "low";
@@ -1415,6 +1418,7 @@ export default async function plugin(bb: BbPluginApi) {
   const helperLane: Lane = {
     title: "helper",
     intro: helperIntro,
+    providerId: "",
     model: helperModel,
     get: (id) => q.helper.get(id),
     upsert: (id, threadId, providerId, environmentId, createdAt) => { q.upsertHelper.run(id, threadId, providerId, environmentId, createdAt); },
@@ -1424,6 +1428,7 @@ export default async function plugin(bb: BbPluginApi) {
   const simplifierLane: Lane = {
     title: "simple english",
     intro: simpleIntro,
+    providerId: simpleEnglishProvider.trim(),
     model: simpleEnglishModel.trim() !== "" ? simpleEnglishModel : helperModel,
     reasoningLevel: "low",
     get: (id) => q.simplifier.get(id),
@@ -1436,10 +1441,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function laneSend(lane: Lane, row: ReviewRow, job: string, text: string): Promise<void> {
     const existing = lane.get(row.id);
+    const wantedProvider = lane.providerId !== "" ? lane.providerId : (existing?.provider_id ?? defaultProvider);
     if (existing !== undefined) {
       try {
         const thread = await bb.sdk.threads.get({ threadId: existing.thread_id });
-        if (thread.archivedAt === null && thread.deletedAt === null) {
+        if (thread.archivedAt === null && thread.deletedAt === null && existing.provider_id === wantedProvider) {
           lane.setJob(job, row.id);
           await bb.sdk.threads.send({
             threadId: existing.thread_id,
@@ -1455,7 +1461,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       lane.remove(row.id);
     }
-    const providerId = existing?.provider_id ?? defaultProvider;
+    const providerId = wantedProvider;
     const providers = await bb.sdk.providers.list();
     const provider = providers.find((p) => p.id === providerId);
     if (provider === undefined) throw new Error(`unknown provider ${providerId}`);

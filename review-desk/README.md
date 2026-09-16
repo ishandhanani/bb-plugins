@@ -57,5 +57,6 @@ bb review-desk codemap <reviewId>
 - `autoBrief` (default true): write the plain-English brief the first time a review is viewed at a new head.
 - `helperModel` (default empty): model for the helper thread that writes the brief and finds notes; empty uses the project's remembered default, which is what the analyst seats use too.
 - `simpleEnglish` (default true): rewrite GitHub comments in Simple English as they load.
-- `simpleEnglishModel` (default empty): model for the Simple English thread; empty uses `helperModel`, then the project's default. A small, fast model is enough.
+- `simpleEnglishProvider` (default empty): provider id for the Simple English thread; empty uses `defaultProvider`. Changing it replaces the review's live Simple English thread on the next batch.
+- `simpleEnglishModel` (default empty): model for the Simple English thread; empty uses `helperModel`, then the project's default. A small, fast model is enough, for example `acp-devin` with `swe-1-7-lightning`.
 - `simpleEnglishSkill` (default empty): path to the SKILL.md whose rules the rewrite follows; empty uses `~/.claude/skills/simple-english/SKILL.md`, then a built-in short rule set.
