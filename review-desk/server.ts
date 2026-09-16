@@ -157,9 +157,11 @@ export type BriefState = z.infer<typeof briefStateSchema>;
  * `t:<node id>` for a review-thread comment, `c:<id>` for a conversation
  * comment, `r:<id>` for a review body. Written by a cheap hidden thread.
  */
+const simpleModeSchema = z.enum(["lazy", "eager", "off"]);
+export type SimpleMode = z.infer<typeof simpleModeSchema>;
 const simpleStateSchema = z.object({
-  /** The plugin setting; when off, nothing is queued and items stay as they were. */
-  enabled: z.boolean(),
+  /** lazy: rewrite a comment when the UI asks for it; eager: rewrite every comment as it loads; off: only explicit CLI runs. */
+  mode: simpleModeSchema,
   items: z.record(z.string(), z.string()),
   /** Keys queued or being rewritten right now. */
   pending: z.array(z.string()),
@@ -296,8 +298,10 @@ export const rpcContract = defineRpcContract({
   brief_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: briefStateSchema },
   /** (Re)write the plain-English brief at the current head. */
   brief_write: { input: reviewIdSchema, output: briefStateSchema },
-  /** Simple English rewrites of the comments; missing ones are queued on each call when the setting is on. `refresh` throws the cache away and rewrites everything. */
+  /** Simple English rewrites of the comments. In eager mode missing ones are queued on each call; `refresh` throws the cache away and rewrites everything. */
   simple_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: simpleStateSchema },
+  /** Rewrite these comments now, ahead of anything else queued; a failed one is tried again. */
+  simple_request: { input: z.object({ reviewId: z.string(), keys: z.array(z.string()).min(1).max(200) }), output: simpleStateSchema },
   /** Put one slop signal's evidence lines into the diff as notes (or take them out again). */
   notes_from_signal: { input: z.object({ reviewId: z.string(), signalId: z.string(), show: z.boolean() }), output: z.object({ count: z.number() }) },
   /** Ask the helper to find slop and cleanups; notes arrive over realtime. */
@@ -459,6 +463,10 @@ const MIGRATIONS = [
      updated_at INTEGER NOT NULL,
      PRIMARY KEY (review_id, comment_key)
    )`,
+  // Set when the UI asks for this comment; requested rows go to the front of the queue.
+  `ALTER TABLE simple_comments ADD COLUMN requested_at INTEGER`,
+  // Hash of the intro the thread was spawned with; a changed prompt replaces the thread.
+  `ALTER TABLE simplifiers ADD COLUMN intro_hash TEXT`,
 ];
 
 interface ReviewRow {
@@ -471,8 +479,8 @@ interface PendingRow { id: string; review_id: string; path: string; line: number
 interface SeatRow { review_id: string; provider_id: string; thread_id: string; environment_id: string | null; created_at: number }
 interface CodemapRow { review_id: string; head_sha: string; status: string; json: string | null; error: string | null; updated_at: number }
 interface CacheRow { review_id: string; json: string; fetched_at: number }
-interface HelperRow { review_id: string; thread_id: string; provider_id: string; environment_id: string | null; job: string | null; created_at: number }
-interface SimpleRow { review_id: string; comment_key: string; body_hash: string; status: string; text: string | null; error: string | null; updated_at: number }
+interface HelperRow { review_id: string; thread_id: string; provider_id: string; environment_id: string | null; job: string | null; created_at: number; intro_hash?: string | null }
+interface SimpleRow { review_id: string; comment_key: string; body_hash: string; status: string; text: string | null; error: string | null; updated_at: number; requested_at: number | null }
 interface NoteRow {
   id: string; review_id: string; head_sha: string; path: string; line: number; start_line: number | null; side: string; kind: string; severity: string; title: string; body: string;
   suggestion: string | null; source: string; signal_id: string | null; state: string; anchor_hash: string | null; created_at: number; updated_at: number;
@@ -535,17 +543,20 @@ function createStore(db: Database.Database) {
     deleteHelper: db.prepare<[string]>(`DELETE FROM helpers WHERE review_id = ?`),
     simplifier: db.prepare<[string], HelperRow>(`SELECT * FROM simplifiers WHERE review_id = ?`),
     simplifierByThread: db.prepare<[string], HelperRow>(`SELECT * FROM simplifiers WHERE thread_id = ?`),
-    upsertSimplifier: db.prepare<[string, string, string, string | null, number]>(
-      `INSERT INTO simplifiers (review_id, thread_id, provider_id, environment_id, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id`,
+    upsertSimplifier: db.prepare<[string, string, string, string | null, number, string | null]>(
+      `INSERT INTO simplifiers (review_id, thread_id, provider_id, environment_id, created_at, intro_hash) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id, intro_hash = excluded.intro_hash`,
     ),
     setSimplifierJob: db.prepare<[string | null, string]>(`UPDATE simplifiers SET job = ? WHERE review_id = ?`),
     deleteSimplifier: db.prepare<[string]>(`DELETE FROM simplifiers WHERE review_id = ?`),
     resetSimplifierJobs: db.prepare<[]>(`UPDATE simplifiers SET job = NULL`),
     simpleRows: db.prepare<[string], SimpleRow>(`SELECT * FROM simple_comments WHERE review_id = ?`),
+    /** Queued rows, requested ones first (oldest request first), then in load order. */
+    simpleQueue: db.prepare<[string], SimpleRow>(`SELECT * FROM simple_comments WHERE review_id = ? AND status = 'queued' ORDER BY (requested_at IS NULL), requested_at ASC, rowid ASC`),
     queueSimple: db.prepare<[string, string, string, number]>(
       `INSERT INTO simple_comments (review_id, comment_key, body_hash, status, text, error, updated_at) VALUES (?, ?, ?, 'queued', NULL, NULL, ?)
        ON CONFLICT(review_id, comment_key) DO UPDATE SET body_hash = excluded.body_hash, status = 'queued', text = NULL, error = NULL, updated_at = excluded.updated_at`,
     ),
+    markSimpleRequested: db.prepare<[number, string, string]>(`UPDATE simple_comments SET requested_at = ? WHERE review_id = ? AND comment_key = ?`),
     setSimpleStatus: db.prepare<[string, string | null, number, string, string]>(`UPDATE simple_comments SET status = ?, error = ?, updated_at = ? WHERE review_id = ? AND comment_key = ?`),
     setSimpleReady: db.prepare<[string, number, string, string]>(`UPDATE simple_comments SET status = 'ready', text = ?, error = NULL, updated_at = ? WHERE review_id = ? AND comment_key = ?`),
     deleteSimpleRow: db.prepare<[string, string]>(`DELETE FROM simple_comments WHERE review_id = ? AND comment_key = ?`),
@@ -716,12 +727,13 @@ export default async function plugin(bb: BbPluginApi) {
     hideSeatThreads: { type: "boolean", label: "Hide analyst threads from the sidebar", default: true },
     autoBrief: { type: "boolean", label: "Write the plain-English brief when a review is first opened at a new head", default: true },
     helperModel: { type: "string", label: "Model for the helper thread (brief, notes); empty uses the project's default", default: "" },
-    simpleEnglish: { type: "boolean", label: "Rewrite GitHub comments in Simple English as they load (a second hidden thread per review)", default: true },
+    simpleEnglishMode: { type: "string", label: "Simple English rewrites of GitHub comments: lazy (when you flip a comment), eager (every comment as it loads), or off", default: "lazy" },
     simpleEnglishProvider: { type: "string", label: "Provider id for the Simple English thread; empty uses defaultProvider", default: "" },
     simpleEnglishModel: { type: "string", label: "Model for the Simple English thread; empty uses helperModel, then the project's default", default: "" },
-    simpleEnglishSkill: { type: "string", label: "SKILL.md whose rules the rewrite follows; empty uses ~/.claude/skills/simple-english/SKILL.md, then built-in rules", default: "" },
+    simpleEnglishSkill: { type: "string", label: "Optional file appended to the rewrite prompt as vocabulary help (for example a simple-english SKILL.md); empty uses a short built-in word list", default: "" },
   });
-  const { defaultProvider, hideSeatThreads, autoBrief, helperModel, simpleEnglish, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill } = await settings.get();
+  const { defaultProvider, hideSeatThreads, autoBrief, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill } = await settings.get();
+  const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
 
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
@@ -1410,8 +1422,10 @@ export default async function plugin(bb: BbPluginApi) {
     model: string;
     /** Provider reasoning level; the simplifier needs little of it. */
     reasoningLevel?: "none" | "low";
+    /** When true, a live thread spawned with a different intro is replaced, so prompt changes take effect. */
+    replaceOnIntroChange: boolean;
     get: (reviewId: string) => HelperRow | undefined;
-    upsert: (reviewId: string, threadId: string, providerId: string, environmentId: string | null, createdAt: number) => void;
+    upsert: (reviewId: string, threadId: string, providerId: string, environmentId: string | null, createdAt: number, introHash: string) => void;
     setJob: (job: string | null, reviewId: string) => void;
     remove: (reviewId: string) => void;
   }
@@ -1420,6 +1434,7 @@ export default async function plugin(bb: BbPluginApi) {
     intro: helperIntro,
     providerId: "",
     model: helperModel,
+    replaceOnIntroChange: false,
     get: (id) => q.helper.get(id),
     upsert: (id, threadId, providerId, environmentId, createdAt) => { q.upsertHelper.run(id, threadId, providerId, environmentId, createdAt); },
     setJob: (job, id) => { q.setHelperJob.run(job, id); },
@@ -1431,8 +1446,9 @@ export default async function plugin(bb: BbPluginApi) {
     providerId: simpleEnglishProvider.trim(),
     model: simpleEnglishModel.trim() !== "" ? simpleEnglishModel : helperModel,
     reasoningLevel: "low",
+    replaceOnIntroChange: true,
     get: (id) => q.simplifier.get(id),
-    upsert: (id, threadId, providerId, environmentId, createdAt) => { q.upsertSimplifier.run(id, threadId, providerId, environmentId, createdAt); },
+    upsert: (id, threadId, providerId, environmentId, createdAt, introHash) => { q.upsertSimplifier.run(id, threadId, providerId, environmentId, createdAt, introHash); },
     setJob: (job, id) => { q.setSimplifierJob.run(job, id); },
     remove: (id) => { q.deleteSimplifier.run(id); },
   };
@@ -1442,10 +1458,13 @@ export default async function plugin(bb: BbPluginApi) {
   async function laneSend(lane: Lane, row: ReviewRow, job: string, text: string): Promise<void> {
     const existing = lane.get(row.id);
     const wantedProvider = lane.providerId !== "" ? lane.providerId : (existing?.provider_id ?? defaultProvider);
+    const intro = lane.intro(row);
+    const introHash = simpleHash(intro);
     if (existing !== undefined) {
       try {
         const thread = await bb.sdk.threads.get({ threadId: existing.thread_id });
-        if (thread.archivedAt === null && thread.deletedAt === null && existing.provider_id === wantedProvider) {
+        const sameIntro = !lane.replaceOnIntroChange || existing.intro_hash === introHash;
+        if (thread.archivedAt === null && thread.deletedAt === null && existing.provider_id === wantedProvider && sameIntro) {
           lane.setJob(job, row.id);
           await bb.sdk.threads.send({
             threadId: existing.thread_id,
@@ -1480,16 +1499,16 @@ export default async function plugin(bb: BbPluginApi) {
       ...(lane.reasoningLevel === undefined ? {} : { reasoningLevel: lane.reasoningLevel }),
       title: `Review Desk ${row.owner}/${row.repo}#${row.number}: ${lane.title}`,
       visibility: hideSeatThreads ? "hidden" : "visible",
-      input: [{ type: "text", text: lane.intro(row), mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
+      input: [{ type: "text", text: intro, mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
     });
-    lane.upsert(row.id, thread.id, providerId, knownEnvironment, now);
+    lane.upsert(row.id, thread.id, providerId, knownEnvironment, now, introHash);
     lane.setJob(job, row.id);
     if (knownEnvironment === null) {
       void (async () => {
         const environmentId = thread.environmentId ?? (await waitForEnvironment(thread.id));
         if (environmentId !== null) {
           q.setEnvironment.run(environmentId, row.id);
-          lane.upsert(row.id, thread.id, providerId, environmentId, now);
+          lane.upsert(row.id, thread.id, providerId, environmentId, now, introHash);
         }
       })();
     }
@@ -1701,15 +1720,12 @@ export default async function plugin(bb: BbPluginApi) {
   const SIMPLE_BATCH_CHARS = 40_000;
   const SIMPLE_MIN_WORDS = 12;
   const SIMPLE_MAX_CHARS = 8_000;
+  /** Vocabulary help for the rewrite. Short on purpose: a long rule set makes a fast model paraphrase instead of simplify. */
   const SIMPLE_RULES_FALLBACK = [
-    "Write short sentences: at most 20 words for an instruction, 25 for a statement. One idea per sentence.",
-    "Use the active voice and simple tenses. The only modals are can, will, and must. Never should, would, may, might, or could.",
-    "No contractions. Keep the articles and the word that.",
-    "Put the condition first: If the build fails, read the log.",
-    "One word per concept in the whole text: one of check, verify, confirm, validate; one of config, settings.",
-    "Replace filler: in order to becomes to, prior to becomes before, ensure becomes make sure that, leverage becomes use. Delete simply, just, robust, it is worth noting.",
-    "No semicolons. Write two sentences.",
-    "Describe an action with a verb, not a noun.",
+    "Word swaps: leverage, utilize -> use. address, tackle -> fix. validate, verify, confirm, ensure -> check. incorrect -> wrong. in order to -> to. prior to -> before. since (reason) -> because. therefore, hence, thus -> so. however -> but. functionality -> feature. utilize -> use. facilitate -> help. in the event that -> if. due to the fact that -> because.",
+    "Modals: should (requirement) -> must. should (advice) -> say it as a plain instruction. may, might, could -> can. would -> restructure as: if X, then Y.",
+    "Delete: simply, just, basically, essentially, it is worth noting, note that, please, kindly, robust, comprehensive, seamless, gracefully.",
+    "Active voice, present tense. No contractions.",
   ].join("\n");
 
   interface SimpleItem { key: string; author: string; body: string }
@@ -1720,22 +1736,30 @@ export default async function plugin(bb: BbPluginApi) {
     return body.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/<!--[\s\S]*?-->/g, " ").split(/\s+/).filter(Boolean).length;
   }
 
-  /** Every comment worth rewriting: review threads plus the conversation, as far as both caches go. Open threads come first, so what the reviewer reads first is rewritten first. */
-  function commentItems(row: ReviewRow): SimpleItem[] {
+  /**
+   * Every comment worth rewriting: review threads plus the conversation, as far as both caches go.
+   * Open threads come first, so what the reviewer reads first is rewritten first. `all` keeps the
+   * short ones too, for comments the reviewer asked for by hand.
+   */
+  function commentItems(row: ReviewRow, all = false): SimpleItem[] {
     const items: SimpleItem[] = [];
     const threads = cachedThreads(row).slice().sort((a, b) => Number(a.isResolved) - Number(b.isResolved));
     for (const t of threads) for (const c of t.comments) items.push({ key: `t:${c.id}`, author: c.author, body: c.body });
     const conversation = parseJson<{ comments?: { id: number; author: string; body: string }[]; reviews?: { id: number; author: string; body: string }[] }>(q.conversationCache.get(row.id)?.json ?? null, {});
     for (const c of conversation.comments ?? []) items.push({ key: `c:${c.id}`, author: c.author, body: c.body });
     for (const r of conversation.reviews ?? []) items.push({ key: `r:${r.id}`, author: r.author, body: r.body });
-    return items.filter((i) => i.body.length <= SIMPLE_MAX_CHARS && proseWords(i.body) >= SIMPLE_MIN_WORDS);
+    return items.filter((i) => i.body.length <= SIMPLE_MAX_CHARS && (all ? i.body.trim() !== "" : proseWords(i.body) >= SIMPLE_MIN_WORDS));
   }
 
   let simpleRulesCache: string | null = null;
-  /** The user's own simple-english SKILL.md when present, so the rewrite follows the same rules they write with. */
+  /** Vocabulary guidance: the built-in list, or the file named by simpleEnglishSkill when set. */
   function simpleRules(): string {
     if (simpleRulesCache !== null) return simpleRulesCache;
-    const path = simpleEnglishSkill.trim() === "" ? join(homedir(), ".claude", "skills", "simple-english", "SKILL.md") : simpleEnglishSkill.trim().replace(/^~(?=\/)/, homedir());
+    if (simpleEnglishSkill.trim() === "") {
+      simpleRulesCache = SIMPLE_RULES_FALLBACK;
+      return simpleRulesCache;
+    }
+    const path = simpleEnglishSkill.trim().replace(/^~(?=\/)/, homedir());
     try {
       simpleRulesCache = readFileSync(path, "utf8").slice(0, 40_000);
     } catch {
@@ -1747,17 +1771,28 @@ export default async function plugin(bb: BbPluginApi) {
 
   function simpleIntro(row: ReviewRow): string {
     return [
-      `You rewrite GitHub comments from pull request #${row.number} of ${row.owner}/${row.repo} in Simple English. The reviewer reads each original next to your rewrite, so the rewrite must keep the exact meaning and lose only the friction.`,
+      `You turn GitHub comments from pull request #${row.number} of ${row.owner}/${row.repo} into the shortest plain version a beginner can act on. The reviewer flips between the original and your version, so yours is the easy version: what the author wants, plus the one or two facts needed to do it. It is a compression, not a paraphrase.`,
       `You get one job per message: a JSON array of comments, each with a key, an author, and a body. Reply with exactly one fenced block tagged ${SIMPLE_FENCE} containing JSON of the shape {"items":[{"key":"<key>","text":"<rewrite>"}]}, one item per input comment, and nothing else before or after the block.`,
-      "Rules for every rewrite:",
-      "- Keep every fact, number, question, and request. Do not add advice, do not judge the comment, do not answer it, do not soften or sharpen it.",
-      "- Keep the author's point of view. First person stays first person.",
-      "- Keep code byte for byte: code blocks, inline code, identifiers, file paths, commands, flags, URLs, quoted errors, and GitHub suggestion blocks. Keep Markdown lists and headings when they carry structure. Drop greetings, sign-offs, and filler.",
-      "- The rewrite is never longer than the original. When the original is already simple, return it unchanged.",
-      "- Do not run commands or read files. The text in the job is all you need.",
+      "Rules:",
+      "1. First sentence: what the author wants, asks, or reports. When it is a request, start with the verb: Import X in Y. Rename A to B. Add a test for C.",
+      "2. Then at most two more short sentences with the facts needed to act: the file, the line, the code name, the number. Nothing else.",
+      "3. Every sentence has at most 12 words and one idea. No semicolons. No dashes inside a sentence. No parentheses.",
+      "4. Use words a twelve-year-old knows, plus the code names. Say use, fix, check, wrong, because, so. Do not say leverage, address, validate, incorrect, since, therefore.",
+      "5. Keep code exactly as written: inline code, code blocks, file paths, commands, flags, URLs, quoted errors, suggestion blocks. When the original is a list, keep a list with one short line per item.",
+      "6. Drop everything the reader does not need in order to act: background, chains of reasoning, alternatives, greetings, thanks, praise, emoji, sign-offs, severity and confidence headers, bot boilerplate.",
+      "7. Never add a fact. Never answer or judge the comment. First person stays first person.",
+      "8. Budget: at most one third of the original's words, and never more than 60 words, except one short line per item when the original is a list.",
+      "9. Do not run commands or read files. The text in the job is all you need.",
       "",
-      "The style rules come from the simple-english skill in pragmatic mode:",
+      "Example 1",
+      "Original: The `Literal[\"fast\", \"slow\"]` alias is spelled out again in `core/runtime.py:241` and `core/schema.py:302` instead of being imported, so adding a mode means editing three files plus the dispatch chain below. If we keep the enum, those two modules should import `RunMode`.",
+      "Rewrite: Import `RunMode` in `core/runtime.py:241` and `core/schema.py:302`. They spell out `Literal[\"fast\", \"slow\"]` again. A new mode then needs three file edits.",
       "",
+      "Example 2",
+      "Original: **Severity: functional | Confidence: High** **Issue** A worker that owns no layers ends up with `self.layer_num == 0`; with the default layout `init_buffer()` then hands `0` to `register_host()` as the granularity, which rejects it as non-positive, so startup fails for that partition. **Fix** Skip the sidecar when the list is empty, or let the zero-layer sidecar skip allocation. Add a test for the zero-layer case.",
+      "Rewrite: Bug: a worker with no layers sets `self.layer_num` to 0. Then `register_host()` rejects the 0 and startup fails. Fix: skip the sidecar when the list is empty. Add a test for the zero-layer case.",
+      "",
+      "Vocabulary help:",
       simpleRules(),
     ].join("\n");
   }
@@ -1775,31 +1810,51 @@ export default async function plugin(bb: BbPluginApi) {
       else if (r.status === "queued" || r.status === "writing") pending.push(r.comment_key);
       else if (r.status === "failed" && error === null) error = r.error;
     }
-    return { enabled: simpleEnglish, items, pending, error };
+    return { mode: simpleMode, items, pending, error };
   }
 
-  /** Queue every comment whose body is new or changed since its last rewrite, then send a batch if the thread is free. */
-  function scheduleSimple(row: ReviewRow, force = false): void {
-    if (!simpleEnglish && !force) return;
-    if (force) q.deleteSimple.run(row.id);
+  const pump = (row: ReviewRow) => void pumpSimple(row).catch((cause: unknown) => bb.log.warn(`simple english for ${row.id}: ${errorMessage(cause)}`));
+
+  /**
+   * Queue every comment whose body is new or changed since its last rewrite, then send a batch if
+   * the thread is free. Automatic callers (thread refresh, conversation fetch, simple_get) only do
+   * this in eager mode; the CLI is explicit and runs in any mode. `force` throws the cache away.
+   */
+  function scheduleSimple(row: ReviewRow, options: { force?: boolean; explicit?: boolean } = {}): void {
+    if (simpleMode !== "eager" && options.explicit !== true) return;
+    if (options.force === true) q.deleteSimple.run(row.id);
     const known = new Map(q.simpleRows.all(row.id).map((r) => [r.comment_key, r.body_hash]));
     const now = Date.now();
     for (const item of commentItems(row)) {
       const hash = simpleHash(item.body);
       if (known.get(item.key) !== hash) q.queueSimple.run(row.id, item.key, hash, now);
     }
-    void pumpSimple(row).catch((cause: unknown) => bb.log.warn(`simple english for ${row.id}: ${errorMessage(cause)}`));
+    pump(row);
+  }
+
+  /** The reviewer flipped these comments to Simple English: rewrite them next, short ones included, failed ones again. */
+  function requestSimple(row: ReviewRow, keys: string[]): void {
+    const wanted = new Set(keys);
+    const known = new Map(q.simpleRows.all(row.id).map((r) => [r.comment_key, r]));
+    const now = Date.now();
+    for (const item of commentItems(row, true)) {
+      if (!wanted.has(item.key)) continue;
+      const hash = simpleHash(item.body);
+      const current = known.get(item.key);
+      if (current === undefined || current.body_hash !== hash || current.status === "failed") q.queueSimple.run(row.id, item.key, hash, now);
+      if (current?.status !== "ready" || current.body_hash !== hash) q.markSimpleRequested.run(now, row.id, item.key);
+    }
+    pump(row);
   }
 
   const simpleSending = new Set<string>();
   /** One batch in flight per review; the idle handler calls back for the next. */
   async function pumpSimple(row: ReviewRow): Promise<void> {
     if (simpleSending.has(row.id) || (q.simplifier.get(row.id)?.job ?? null) !== null) return;
-    const bodies = new Map(commentItems(row).map((i) => [i.key, i]));
+    const bodies = new Map(commentItems(row, true).map((i) => [i.key, i]));
     const batch: SimpleItem[] = [];
     let chars = 0;
-    for (const r of q.simpleRows.all(row.id)) {
-      if (r.status !== "queued") continue;
+    for (const r of q.simpleQueue.all(row.id)) {
       const item = bodies.get(r.comment_key);
       if (item === undefined) {
         q.deleteSimpleRow.run(row.id, r.comment_key);
@@ -1882,7 +1937,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     publish(reviewId, "simple");
-    void pumpSimple(row).catch((cause: unknown) => bb.log.warn(`simple english for ${reviewId}: ${errorMessage(cause)}`));
+    pump(row);
   }
 
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
@@ -2249,7 +2304,12 @@ export default async function plugin(bb: BbPluginApi) {
     },
     simple_get: ({ reviewId, refresh }) => {
       const row = requireReview(reviewId);
-      scheduleSimple(row, refresh === true);
+      scheduleSimple(row, refresh === true ? { force: true, explicit: true } : {});
+      return simpleState(row);
+    },
+    simple_request: ({ reviewId, keys }) => {
+      const row = requireReview(reviewId);
+      requestSimple(row, keys);
       return simpleState(row);
     },
     notes_from_signal: async ({ reviewId, signalId, show }) => ({ count: await notesFromSignal(requireReview(reviewId), signalId, show) }),
@@ -2355,7 +2415,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "list", summary: "List reviews", usage: "bb review-desk list [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "codemap", summary: "Build or print the codemap", usage: "bb review-desk codemap <reviewId> [--json]" },
-      { name: "simple", summary: "Queue Simple English rewrites of the comments, or redo them all", usage: "bb review-desk simple <reviewId> [--redo] [--json]" },
+      { name: "simple", summary: "Queue Simple English rewrites of all the comments, redo them all, or request one comment by key", usage: "bb review-desk simple <reviewId> [--redo | --key <t:...|c:...|r:...>] [--json]" },
     ],
     async run(argv) {
       const json = argv.includes("--json");
@@ -2387,10 +2447,12 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "simple": {
             const row = requireReview(rest[0] ?? "");
-            scheduleSimple(row, redo);
+            const key = flag("key");
+            if (key !== undefined) requestSimple(row, [key]);
+            else scheduleSimple(row, { force: redo, explicit: true });
             const state = simpleState(row);
             const failed = q.simpleRows.all(row.id).filter((r) => r.status === "failed").length;
-            return ok(state, `${Object.keys(state.items).length} ready, ${state.pending.length} pending, ${failed} failed${state.enabled ? "" : " (simpleEnglish is off; only --redo queues)"}${state.error === null ? "" : `\nlast error: ${state.error}`}`);
+            return ok(state, `${Object.keys(state.items).length} ready, ${state.pending.length} pending, ${failed} failed (mode ${state.mode})${state.error === null ? "" : `\nlast error: ${state.error}`}`);
           }
           case "codemap": {
             const row = requireReview(rest[0] ?? "");

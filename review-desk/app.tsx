@@ -31,7 +31,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { FileDiff, type DiffLineAnnotation, type FileDiffMetadata, type SelectedLineRange } from "@pierre/diffs/react";
 import { parsePatchFiles } from "@pierre/diffs";
-import type { BriefState, CodemapState, CommitInfo, FileEntry, Note, NoteKind, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, SimpleState, rpcContract } from "./server";
+import type { BriefState, CodemapState, CommitInfo, FileEntry, Note, NoteKind, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, SimpleMode, SimpleState, rpcContract } from "./server";
 import type { ChangedFile } from "./host-contract";
 import type { Codemap, GhThread } from "./host-contract";
 import type { Brief, BriefEvidence, ClaimVerdict } from "./brief-spec";
@@ -371,26 +371,28 @@ function useBrief(reviewId: string | null) {
 // ---------------------------------------------------------------------------
 // Simple English
 //
-// The server rewrites every GitHub comment through a hidden thread; comment
-// bodies look their own rewrite up by key through this context, and one
-// toggle in the top bar shows or hides all of them.
+// The server rewrites GitHub comments through a hidden thread. Each comment
+// body flips between the original and its rewrite, asking for the rewrite the
+// first time it is shown; the top-bar toggle sets which side comments start on.
 // ---------------------------------------------------------------------------
 
 interface SimpleContext {
+  /** Comments start on the Simple English side. */
   on: boolean;
   setOn(on: boolean): void;
-  /** The plugin setting; false means nothing new is being rewritten. */
-  enabled: boolean;
+  mode: SimpleMode;
   items: Record<string, string>;
   pending: string[];
   error: string | null;
+  /** Ask the server to rewrite this comment now; calls within a tick are sent as one request. */
+  request(key: string): void;
 }
-const SimpleCtx = createContext<SimpleContext>({ on: false, setOn: () => undefined, enabled: false, items: {}, pending: [], error: null });
+const SimpleCtx = createContext<SimpleContext>({ on: false, setOn: () => undefined, mode: "off", items: {}, pending: [], error: null, request: () => undefined });
 
 function SimpleProvider({ reviewId, children }: { reviewId: string; children: ReactNode }) {
   const rpc = useRpc<Contract>();
   const [state, setState] = useState<SimpleState | null>(null);
-  const [on, setOnState] = useState<boolean>(() => readStorage<boolean>(SIMPLE_KEY) ?? true);
+  const [on, setOnState] = useState<boolean>(() => readStorage<boolean>(SIMPLE_KEY) ?? false);
   const load = useCallback(() => {
     rpc.call("simple_get", { reviewId }).then(setState, () => undefined);
   }, [rpc, reviewId]);
@@ -398,6 +400,23 @@ function SimpleProvider({ reviewId, children }: { reviewId: string; children: Re
     setState(null);
     load();
   }, [load]);
+  const queued = useRef<Set<string>>(new Set());
+  const asked = useRef<Map<string, number>>(new Map());
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (timer.current !== null) clearTimeout(timer.current); }, []);
+  const request = useCallback((key: string) => {
+    const now = Date.now();
+    if (now - (asked.current.get(key) ?? 0) < 30_000) return;
+    asked.current.set(key, now);
+    queued.current.add(key);
+    if (timer.current !== null) return;
+    timer.current = setTimeout(() => {
+      timer.current = null;
+      const keys = [...queued.current];
+      queued.current.clear();
+      if (keys.length > 0) rpc.call("simple_request", { reviewId, keys }).then(setState, () => undefined);
+    }, 150);
+  }, [rpc, reviewId]);
   useRealtime(REVIEW_CHANGED, (payload) => {
     const p = payloadReview(payload);
     if (p !== null && p.reviewId === reviewId && (p.what === "simple" || p.what === "threads" || p.what === "synced")) load();
@@ -414,24 +433,23 @@ function SimpleProvider({ reviewId, children }: { reviewId: string; children: Re
       setOnState(next);
       writeStorage(SIMPLE_KEY, next);
     },
-    enabled: state?.enabled ?? true,
+    mode: state?.mode ?? "lazy",
     items: state?.items ?? {},
     pending: state?.pending ?? [],
     error: state?.error ?? null,
-  }), [on, state]);
+    request,
+  }), [on, state, request]);
   return <SimpleCtx.Provider value={value}>{children}</SimpleCtx.Provider>;
 }
 
 function SimpleToggle() {
   const simple = useContext(SimpleCtx);
-  const title = !simple.enabled
-    ? "Simple English rewrites are off in the plugin settings"
-    : simple.error !== null
-      ? `Show each GitHub comment rewritten in Simple English under the original. Last error: ${simple.error}`
-      : "Show each GitHub comment rewritten in Simple English under the original";
+  if (simple.mode === "off") return null;
+  const title = `${simple.on ? "Comments start in Simple English; press to start on the original." : "Start every comment in Simple English; each comment keeps its own switch."}${simple.error !== null ? ` Last error: ${simple.error}` : ""}`;
+  const busy = simple.pending.length > 0;
   return (
     <Button variant="ghost" size="sm" className={cn("h-7 text-xs", simple.on && "text-primary")} onClick={() => simple.setOn(!simple.on)} aria-pressed={simple.on} title={title}>
-      <Icon name={simple.pending.length > 0 && simple.on ? "Loading" : "TextWrap"} className={cn("size-3.5", simple.pending.length > 0 && simple.on && "animate-spin")} />Simple English
+      <Icon name={busy ? "Loading" : "TextWrap"} className={cn("size-3.5", busy && "animate-spin")} />Simple English{busy ? ` · ${simple.pending.length}` : ""}
     </Button>
   );
 }
@@ -648,12 +666,23 @@ function AuthorChip({ login, prAuthor, when }: { login: string; prAuthor: string
   );
 }
 
-/** GitHub comment Markdown: HTML comments dropped, `<details>` rendered as real collapsibles. With `simpleKey`, the Simple English rewrite follows the original when the toggle is on. */
+/**
+ * GitHub comment Markdown: HTML comments dropped, `<details>` rendered as real collapsibles.
+ * With `simpleKey`, the body flips between the original and its Simple English rewrite; the
+ * rewrite is requested the first time the simple side is shown and arrives over realtime.
+ */
 function CommentBody({ body, className, simpleKey }: { body: string; className?: string; simpleKey?: string }) {
   const simple = useContext(SimpleCtx);
-  const rewrite = simpleKey !== undefined && simple.on ? simple.items[simpleKey] : undefined;
-  const writing = rewrite === undefined && simpleKey !== undefined && simple.on && simple.pending.includes(simpleKey);
-  const cleaned = body.replace(/<!--[\s\S]*?-->/g, "");
+  const [flipped, setFlipped] = useState<boolean | null>(null);
+  const canSimple = simpleKey !== undefined && simple.mode !== "off";
+  const showSimple = canSimple && (flipped ?? simple.on);
+  const rewrite = showSimple && simpleKey !== undefined ? simple.items[simpleKey] : undefined;
+  const writing = showSimple && rewrite === undefined && simpleKey !== undefined && simple.pending.includes(simpleKey);
+  useEffect(() => {
+    if (showSimple && rewrite === undefined && !writing && simpleKey !== undefined) simple.request(simpleKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showSimple, rewrite === undefined, writing, simpleKey]);
+  const cleaned = (rewrite ?? body).replace(/<!--[\s\S]*?-->/g, "");
   const parts: ReactNode[] = [];
   const re = /<details[^>]*>\s*(?:<summary[^>]*>([\s\S]*?)<\/summary>)?([\s\S]*?)<\/details>/gi;
   let last = 0;
@@ -674,13 +703,13 @@ function CommentBody({ body, className, simpleKey }: { body: string; className?:
   return (
     <div className={cn(PROSE, className)}>
       {parts}
-      {rewrite !== undefined ? (
-        <div className="mt-2 rounded-md border border-dashed border-border/70 bg-muted/30 px-2.5 py-1.5">
-          <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Simple English</div>
-          <Markdown content={rewrite} />
+      {canSimple ? (
+        <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground">
+          {rewrite !== undefined ? <span className="rounded-full border border-dashed border-border px-1.5 text-[10px] font-medium uppercase tracking-wide">Simple English</span> : writing ? <span className="inline-flex items-center gap-1"><Icon name="Loading" className="size-3 animate-spin" />Simple English is being written</span> : null}
+          <button type="button" className="ml-auto hover:text-foreground hover:underline" onClick={() => setFlipped(!showSimple)} title={showSimple ? "Show the original comment" : "Show this comment in Simple English"}>
+            {showSimple ? "Original" : "Simple English"}
+          </button>
         </div>
-      ) : writing ? (
-        <div className="mt-1 text-[11px] text-muted-foreground">Simple English: writing…</div>
       ) : null}
     </div>
   );
