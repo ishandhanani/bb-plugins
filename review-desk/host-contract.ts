@@ -97,7 +97,26 @@ export const codemapSymbolSchema = z.object({
 });
 export type CodemapSymbol = z.infer<typeof codemapSymbolSchema>;
 
+export const codemapFileRoleSchema = z.enum(["code", "tests", "docs", "config", "generated"]);
+export type CodemapFileRole = z.infer<typeof codemapFileRoleSchema>;
+
+/** Bumped when the codemap's shape or computation changes; a cached map of an older version is rebuilt. */
+export const CODEMAP_VERSION = 4;
+
+/** What kind of file a path is, from its name alone. Shared by the host (codemap) and the server (guide fallbacks). */
+export function fileRole(filePath: string): CodemapFileRole {
+  const lower = filePath.toLowerCase();
+  const base = lower.slice(lower.lastIndexOf("/") + 1);
+  if (/(^|\/)(generated|__generated__|gen)\//.test(lower) || /\.(pb|pb2)\.[a-z]+$/.test(base) || /_pb2(_grpc)?\.py$/.test(base) || /\.lock$/.test(base) || base === "package-lock.json" || base === "go.sum" || base === "yarn.lock") return "generated";
+  if (/(^|\/)(tests?|__tests__|testing|spec|fixtures)\//.test(lower) || /^test_.*\.py$/.test(base) || /_tests?\.(go|rs|py|ts|js|cc|cpp|cu)$/.test(base) || /\.(test|spec)\.[cm]?[jt]sx?$/.test(base) || base === "tests.rs" || base === "conftest.py") return "tests";
+  if (base.startsWith("requirements")) return "config";
+  if (/(^|\/)docs?\//.test(lower) || /\.(md|mdx|rst|adoc|txt)$/.test(base)) return "docs";
+  if (/(^|\/)\.github\//.test(lower) || /\.(toml|ya?ml|json|ini|cfg|conf|env|properties|tf)$/.test(base) || /^(dockerfile|makefile|justfile|cmakelists\.txt)/.test(base) || base.startsWith(".")) return "config";
+  return "code";
+}
+
 export const codemapSchema = z.object({
+  version: z.number(),
   headSha: z.string(),
   engine: z.enum(["tree-sitter", "regex"]),
   files: z.array(
@@ -105,6 +124,7 @@ export const codemapSchema = z.object({
       path: z.string(),
       lang: z.string().nullable(),
       module: z.string(),
+      role: codemapFileRoleSchema,
       changedLines: z.number(),
       symbols: z.array(codemapSymbolSchema),
     }),

@@ -15,7 +15,7 @@ Review GitHub pull requests inside bb: a document-style PR page with the diff, t
 - **Private notes**: comments only you see, shown inline with an amber dashed edge. Three sources: any slop signal can be shown as notes on its lines from the Brief tab; **Find slop and cleanups** (Notes menu above the changes) has the helper read the diff and leave up to 25 notes with kind (slop, cleanup, risk, question), severity, and sometimes a suggested rewrite; and **Keep private** on the comment composer. Each note can be dismissed, promoted to a pending GitHub comment (a suggestion becomes a `suggestion` block), sent to the chat as a pill, or sent to the council. Notes carry a content hash of their line and follow it across pushes; ones whose line is gone are marked stale.
 - **Chat with the PR**: the Chat tab hosts one analyst thread per provider, spawned into the PR worktree and read-only by instruction, rendered with bb's own thread view. The first message comes from bb's new-thread composer (pick provider and model there; the environment shown is ignored, the analyst always runs in the PR worktree); later messages go through the thread's own composer. Message actions turn an answer into a pending comment on the selected lines or send it to a Roundtable room.
 - **Code pills**: code goes into the chat as @-mention pills that resolve to text when you send, so the transcript stays short and the analyst gets the excerpt. Three ways in: select lines in the diff and press `a` or **Add to chat**; type `@` in the composer to search changed files, changed symbols from the codemap, GitHub review threads, the PR description, or an explicit `path:10-20`; or pick **Summarize in chat** on a file card. A banner above the composer shows the current diff selection with its own **Add to chat**.
-- **Codemap**: tree-sitter (Rust, Python, TypeScript, JavaScript, Go, C and C++) diffs symbols across base and head, links references between changed symbols, counts fan-in with `git grep`, orders modules for reading, and ranks hotspots. Regex extraction is the fallback.
+- **Codemap**: your map through the PR, in two layers. The base is deterministic: tree-sitter (Rust, Python, TypeScript, JavaScript, Go, C and C++) diffs symbols across base and head, links references between changed symbols, counts fan-in with `git grep`, tags each file's role (code, tests, docs, config, generated), orders modules by dependency with tests, config, and docs after the code, and ranks hotspots (test code counts a quarter). Regex extraction is the fallback. On top sits a **guide** the helper writes from the diff with the codemap as orientation: **What is going on** (the gist, the shape of the change, what to hold in mind), **How it runs** (the runtime path through the changed code as hops that jump to their line), **Reading order** (steps with a reason each), and one line per changed file saying what it does in this PR, with a role and a skim flag for mechanical changes. The Changes list follows the guide (**Guide order**, the default, with a header per step; **Path order** to switch) and every file card shows its line. Written once per head when `autoGuide` is on, queued behind the brief; Rewrite at any time from the Codemap tab.
 - **Info** tab: checks with a progress bar, reviewers with their state, assignees, labels, and the pending review.
 
 ## Layout
@@ -26,6 +26,7 @@ Review GitHub pull requests inside bb: a document-style PR page with the diff, t
 - `app.tsx` — the **Reviews** nav panel; fixed tabs **Info**, **Chat**, **Codemap**; the composer banner that receives pills.
 - `slop.ts` — deterministic slop signals over parsed patches (pure functions, server-side).
 - `brief-spec.ts` — the brief the helper thread returns, shared by server and app.
+- `guide-spec.ts` — the guide over the codemap the helper thread returns, shared by server and app.
 - `mention-ref.ts` — pill identity shared by server and app (what a pill points at, how its id is encoded, its label).
 - `skills/review-desk/SKILL.md` — instructions the analyst threads receive.
 
@@ -48,6 +49,7 @@ bb review-desk open <url | owner/repo#N>
 bb review-desk list
 bb review-desk ask <reviewId> <text...> [--provider <id>]
 bb review-desk codemap <reviewId>
+bb review-desk guide <reviewId> [--rewrite]
 ```
 
 ## Settings
@@ -55,7 +57,8 @@ bb review-desk codemap <reviewId>
 - `defaultProvider` (default `claude-code`): the analyst preselected in Chat and used by the CLI.
 - `hideSeatThreads` (default true): keep analyst and helper threads out of the sidebar.
 - `autoBrief` (default true): write the plain-English brief the first time a review is viewed at a new head.
-- `helperModel` (default empty): model for the helper thread that writes the brief and finds notes; empty uses the project's remembered default, which is what the analyst seats use too.
+- `autoGuide` (default true): write the codemap guide the first time a review is viewed at a new head. The helper runs one job at a time, so the guide waits for the brief.
+- `helperModel` (default empty): model for the helper thread that writes the brief and the guide and finds notes; empty uses the project's remembered default, which is what the analyst seats use too.
 - `simpleEnglishMode` (default `lazy`): `lazy` rewrites a comment when you flip it, `eager` rewrites every comment as it loads, `off` hides the switches; `bb review-desk simple <reviewId>` queues a whole review in any mode.
 - `simpleEnglishProvider` (default empty): provider id for the Simple English thread; empty uses `defaultProvider`. Changing it replaces the review's live Simple English thread on the next batch.
 - `simpleEnglishModel` (default empty): model for the Simple English thread; empty uses `helperModel`, then the project's default. A small, fast model is enough, for example `acp-devin` with `swe-1-7-lightning`.
