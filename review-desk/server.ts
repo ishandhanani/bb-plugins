@@ -5,8 +5,10 @@
 // repository through the host entry (git, gh, tree-sitter). Chat with the PR
 // runs on ordinary hidden bb threads (one per provider per review) spawned into
 // the PR worktree; the UI renders them with bb's own ThreadChat.
-import { existsSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi, type PluginMentionItem, type PluginMentionSearchContext } from "@get-bb/plugin-sdk";
@@ -14,9 +16,12 @@ import { z } from "zod";
 import { MENTION_PROVIDER_ID, decodeMentionRef, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
 import { computeSlop, type SlopReport } from "./slop";
 import { BRIEF_FENCE, type Brief, type BriefEvidence } from "./brief-spec";
+import { GUIDE_FENCE, GUIDE_ROLES, type Guide, type GuideFile, type GuideHop, type GuideRole, type GuideStep } from "./guide-spec";
 import {
+  CODEMAP_VERSION,
   changedFileSchema,
   codemapSchema,
+  fileRole,
   ghIssueCommentSchema,
   ghReviewSchema,
   ghThreadSchema,
@@ -127,6 +132,18 @@ const codemapStateSchema = z.object({
 });
 export type CodemapState = z.infer<typeof codemapStateSchema>;
 
+/** The helper-written guide over the codemap. Payload stays loose on the wire; app.tsx casts to the shared Guide type. */
+const guideStateSchema = z.object({
+  status: z.enum(["missing", "queued", "writing", "ready", "failed"]),
+  /** The latest guide on file, kept while a newer one is queued or writing. */
+  guide: z.record(z.string(), z.unknown()).nullable(),
+  error: z.string().nullable(),
+  /** The guide on file was written for an older head. */
+  stale: z.boolean(),
+  updatedAt: z.number().nullable(),
+});
+export type GuideState = z.infer<typeof guideStateSchema>;
+
 const providerOptionSchema = z.object({
   id: z.string(),
   displayName: z.string(),
@@ -149,6 +166,23 @@ const briefStateSchema = z.object({
   updatedAt: z.number().nullable(),
 });
 export type BriefState = z.infer<typeof briefStateSchema>;
+
+/**
+ * Simple English rewrites of the PR's GitHub comments, keyed per comment:
+ * `t:<node id>` for a review-thread comment, `c:<id>` for a conversation
+ * comment, `r:<id>` for a review body. Written by a cheap hidden thread.
+ */
+const simpleModeSchema = z.enum(["lazy", "eager", "off"]);
+export type SimpleMode = z.infer<typeof simpleModeSchema>;
+const simpleStateSchema = z.object({
+  /** lazy: rewrite a comment when the UI asks for it; eager: rewrite every comment as it loads; off: only explicit CLI runs. */
+  mode: simpleModeSchema,
+  items: z.record(z.string(), z.string()),
+  /** Keys queued or being rewritten right now. */
+  pending: z.array(z.string()),
+  error: z.string().nullable(),
+});
+export type SimpleState = z.infer<typeof simpleStateSchema>;
 
 const commitInfoSchema = z.object({ sha: z.string(), parents: z.array(z.string()), author: z.string(), date: z.string(), title: z.string(), body: z.string() });
 export type CommitInfo = z.infer<typeof commitInfoSchema>;
@@ -269,6 +303,10 @@ export const rpcContract = defineRpcContract({
   seat_lookup: { input: z.object({ threadId: z.string() }), output: z.object({ seat: z.object({ reviewId: z.string(), providerId: z.string() }).nullable() }) },
   chat_reset: { input: z.object({ reviewId: z.string(), providerId: z.string() }), output: okSchema },
   codemap_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: codemapStateSchema },
+  /** The guide over the codemap; queued for writing on first call at a new head when autoGuide is on. */
+  guide_get: { input: reviewIdSchema, output: guideStateSchema },
+  /** (Re)write the guide at the current head. */
+  guide_write: { input: reviewIdSchema, output: guideStateSchema },
   rooms_list: { input: z.null(), output: z.object({ rooms: z.array(z.object({ id: z.string(), title: z.string(), handles: z.array(z.string()) })), available: z.boolean() }) },
   send_to_room: {
     input: z.object({ roomId: z.string(), text: z.string().trim().min(1).max(20_000), tags: z.array(z.string()).max(8), turns: z.number().int().min(0).max(40).optional() }),
@@ -279,6 +317,10 @@ export const rpcContract = defineRpcContract({
   brief_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: briefStateSchema },
   /** (Re)write the plain-English brief at the current head. */
   brief_write: { input: reviewIdSchema, output: briefStateSchema },
+  /** Simple English rewrites of the comments. In eager mode missing ones are queued on each call; `refresh` throws the cache away and rewrites everything. */
+  simple_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: simpleStateSchema },
+  /** Rewrite these comments now, ahead of anything else queued; a failed one is tried again. */
+  simple_request: { input: z.object({ reviewId: z.string(), keys: z.array(z.string()).min(1).max(200) }), output: simpleStateSchema },
   /** Put one slop signal's evidence lines into the diff as notes (or take them out again). */
   notes_from_signal: { input: z.object({ reviewId: z.string(), signalId: z.string(), show: z.boolean() }), output: z.object({ count: z.number() }) },
   /** Ask the helper to find slop and cleanups; notes arrive over realtime. */
@@ -428,6 +470,35 @@ const MIGRATIONS = [
    )`,
   `CREATE INDEX IF NOT EXISTS notes_review ON notes (review_id)`,
   `CREATE TABLE IF NOT EXISTS review_seen (review_id TEXT PRIMARY KEY, seen_head_sha TEXT NOT NULL, prev_head_sha TEXT, seen_at INTEGER NOT NULL)`,
+  // A second hidden thread per review rewrites GitHub comments in Simple English; same shape as helpers.
+  `CREATE TABLE IF NOT EXISTS simplifiers (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS simple_comments (
+     review_id TEXT NOT NULL,
+     comment_key TEXT NOT NULL,
+     body_hash TEXT NOT NULL,
+     status TEXT NOT NULL,
+     text TEXT,
+     error TEXT,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY (review_id, comment_key)
+   )`,
+  // Set when the UI asks for this comment; requested rows go to the front of the queue.
+  `ALTER TABLE simple_comments ADD COLUMN requested_at INTEGER`,
+  // Hash of the intro the thread was spawned with; a changed prompt replaces the thread.
+  `ALTER TABLE simplifiers ADD COLUMN intro_hash TEXT`,
+  // The helper-written guide over the codemap. head_sha is the head the status
+  // is about; json_head_sha is the head the stored guide was written for, so an
+  // older guide stays on screen while a newer one is queued or writing.
+  `CREATE TABLE IF NOT EXISTS guides (
+     review_id TEXT PRIMARY KEY,
+     head_sha TEXT NOT NULL,
+     status TEXT NOT NULL,
+     json TEXT,
+     json_head_sha TEXT,
+     raw TEXT,
+     error TEXT,
+     updated_at INTEGER NOT NULL
+   )`,
 ];
 
 interface ReviewRow {
@@ -440,7 +511,8 @@ interface PendingRow { id: string; review_id: string; path: string; line: number
 interface SeatRow { review_id: string; provider_id: string; thread_id: string; environment_id: string | null; created_at: number }
 interface CodemapRow { review_id: string; head_sha: string; status: string; json: string | null; error: string | null; updated_at: number }
 interface CacheRow { review_id: string; json: string; fetched_at: number }
-interface HelperRow { review_id: string; thread_id: string; provider_id: string; environment_id: string | null; job: string | null; created_at: number }
+interface HelperRow { review_id: string; thread_id: string; provider_id: string; environment_id: string | null; job: string | null; created_at: number; intro_hash?: string | null }
+interface SimpleRow { review_id: string; comment_key: string; body_hash: string; status: string; text: string | null; error: string | null; updated_at: number; requested_at: number | null }
 interface NoteRow {
   id: string; review_id: string; head_sha: string; path: string; line: number; start_line: number | null; side: string; kind: string; severity: string; title: string; body: string;
   suggestion: string | null; source: string; signal_id: string | null; state: string; anchor_hash: string | null; created_at: number; updated_at: number;
@@ -449,6 +521,7 @@ interface BriefRow {
   review_id: string; head_sha: string; signals_status: string; signals_json: string | null; signals_error: string | null;
   brief_status: string; brief_head_sha: string | null; brief_json: string | null; brief_raw: string | null; brief_error: string | null; updated_at: number;
 }
+interface GuideRow { review_id: string; head_sha: string; status: string; json: string | null; json_head_sha: string | null; raw: string | null; error: string | null; updated_at: number }
 
 function newId(): string {
   return randomBytes(6).toString("hex");
@@ -501,6 +574,27 @@ function createStore(db: Database.Database) {
     ),
     setHelperJob: db.prepare<[string | null, string]>(`UPDATE helpers SET job = ? WHERE review_id = ?`),
     deleteHelper: db.prepare<[string]>(`DELETE FROM helpers WHERE review_id = ?`),
+    simplifier: db.prepare<[string], HelperRow>(`SELECT * FROM simplifiers WHERE review_id = ?`),
+    simplifierByThread: db.prepare<[string], HelperRow>(`SELECT * FROM simplifiers WHERE thread_id = ?`),
+    upsertSimplifier: db.prepare<[string, string, string, string | null, number, string | null]>(
+      `INSERT INTO simplifiers (review_id, thread_id, provider_id, environment_id, created_at, intro_hash) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id, intro_hash = excluded.intro_hash`,
+    ),
+    setSimplifierJob: db.prepare<[string | null, string]>(`UPDATE simplifiers SET job = ? WHERE review_id = ?`),
+    deleteSimplifier: db.prepare<[string]>(`DELETE FROM simplifiers WHERE review_id = ?`),
+    resetSimplifierJobs: db.prepare<[]>(`UPDATE simplifiers SET job = NULL`),
+    simpleRows: db.prepare<[string], SimpleRow>(`SELECT * FROM simple_comments WHERE review_id = ?`),
+    /** Queued rows, requested ones first (oldest request first), then in load order. */
+    simpleQueue: db.prepare<[string], SimpleRow>(`SELECT * FROM simple_comments WHERE review_id = ? AND status = 'queued' ORDER BY (requested_at IS NULL), requested_at ASC, rowid ASC`),
+    queueSimple: db.prepare<[string, string, string, number]>(
+      `INSERT INTO simple_comments (review_id, comment_key, body_hash, status, text, error, updated_at) VALUES (?, ?, ?, 'queued', NULL, NULL, ?)
+       ON CONFLICT(review_id, comment_key) DO UPDATE SET body_hash = excluded.body_hash, status = 'queued', text = NULL, error = NULL, updated_at = excluded.updated_at`,
+    ),
+    markSimpleRequested: db.prepare<[number, string, string]>(`UPDATE simple_comments SET requested_at = ? WHERE review_id = ? AND comment_key = ?`),
+    setSimpleStatus: db.prepare<[string, string | null, number, string, string]>(`UPDATE simple_comments SET status = ?, error = ?, updated_at = ? WHERE review_id = ? AND comment_key = ?`),
+    setSimpleReady: db.prepare<[string, number, string, string]>(`UPDATE simple_comments SET status = 'ready', text = ?, error = NULL, updated_at = ? WHERE review_id = ? AND comment_key = ?`),
+    deleteSimpleRow: db.prepare<[string, string]>(`DELETE FROM simple_comments WHERE review_id = ? AND comment_key = ?`),
+    deleteSimple: db.prepare<[string]>(`DELETE FROM simple_comments WHERE review_id = ?`),
+    resetSimpleWriting: db.prepare<[]>(`UPDATE simple_comments SET status = 'queued' WHERE status = 'writing'`),
     brief: db.prepare<[string], BriefRow>(`SELECT * FROM briefs WHERE review_id = ?`),
     ensureBrief: db.prepare<[string, string, number]>(`INSERT INTO briefs (review_id, head_sha, updated_at) VALUES (?, ?, ?) ON CONFLICT(review_id) DO NOTHING`),
     setSignals: db.prepare<[string, string, string | null, string | null, number, string]>(
@@ -532,6 +626,16 @@ function createStore(db: Database.Database) {
     setCodemap: db.prepare<[string, string, string, string | null, string | null, number]>(
       `INSERT INTO codemaps (review_id, head_sha, status, json, error, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, status = excluded.status, json = excluded.json, error = excluded.error, updated_at = excluded.updated_at`,
     ),
+    helpersWithJob: db.prepare<[], HelperRow>(`SELECT * FROM helpers WHERE job IS NOT NULL`),
+    briefsWriting: db.prepare<[], { review_id: string }>(`SELECT review_id FROM briefs WHERE brief_status = 'writing'`),
+    guide: db.prepare<[string], GuideRow>(`SELECT * FROM guides WHERE review_id = ?`),
+    guidesPending: db.prepare<[], { review_id: string; head_sha: string }>(`SELECT review_id, head_sha FROM guides WHERE status IN ('queued', 'writing')`),
+    /** Status for a head; the stored guide (json, json_head_sha, raw) is kept. */
+    setGuideStatus: db.prepare<[string, string, string, string | null, number]>(
+      `INSERT INTO guides (review_id, head_sha, status, error, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, status = excluded.status, error = excluded.error, updated_at = excluded.updated_at`,
+    ),
+    setGuideReady: db.prepare<[string, string | null, number, string]>(`UPDATE guides SET status = 'ready', json = ?, json_head_sha = head_sha, raw = ?, error = NULL, updated_at = ? WHERE review_id = ?`),
+    setGuideFailed: db.prepare<[string, string | null, number, string]>(`UPDATE guides SET status = 'failed', error = ?, raw = ?, updated_at = ? WHERE review_id = ?`),
   };
   return { q };
 }
@@ -665,15 +769,63 @@ export default async function plugin(bb: BbPluginApi) {
     defaultProvider: { type: "string", label: "Default AI provider id for the PR chat", default: "claude-code" },
     hideSeatThreads: { type: "boolean", label: "Hide analyst threads from the sidebar", default: true },
     autoBrief: { type: "boolean", label: "Write the plain-English brief when a review is first opened at a new head", default: true },
-    helperModel: { type: "string", label: "Model for the helper thread (brief, notes); empty uses the project's default", default: "" },
+    autoGuide: { type: "boolean", label: "Write the codemap guide (overview, flow, reading order, one line per file) when a review is first opened at a new head", default: true },
+    helperModel: { type: "string", label: "Model for the helper thread (brief, guide, notes); empty uses the project's default", default: "" },
+    simpleEnglishMode: { type: "string", label: "Simple English rewrites of GitHub comments: lazy (when you flip a comment), eager (every comment as it loads), or off", default: "lazy" },
+    simpleEnglishProvider: { type: "string", label: "Provider id for the Simple English thread; empty uses defaultProvider", default: "" },
+    simpleEnglishModel: { type: "string", label: "Model for the Simple English thread; empty uses helperModel, then the project's default", default: "" },
+    simpleEnglishSkill: { type: "string", label: "Optional file appended to the rewrite prompt as vocabulary help (for example a simple-english SKILL.md); empty uses a short built-in word list", default: "" },
   });
-  const { defaultProvider, hideSeatThreads, autoBrief, helperModel } = await settings.get();
+  const { defaultProvider, hideSeatThreads, autoBrief, autoGuide, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill } = await settings.get();
+  const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
 
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
   const { q }: Store = createStore(db);
+  // A rewrite that was in flight when the plugin last stopped never got its idle event; queue it again.
+  q.resetSimpleWriting.run();
+  q.resetSimplifierJobs.run();
   const host = bb.hosts.experimental_client({ contract: hostContract });
   const codemapBuilds = new Set<string>();
+
+  /** Jobs waiting for the helper: one thread per review, one job at a time. */
+  const helperWanted = new Map<string, Set<"brief" | "guide">>();
+  const want = (reviewId: string, job: "brief" | "guide") => {
+    const set = helperWanted.get(reviewId) ?? new Set<"brief" | "guide">();
+    set.add(job);
+    helperWanted.set(reviewId, set);
+  };
+
+  // The helper across a plugin reload. A thread still working on its job keeps
+  // its marker: the idle event arrives later and completes the job as usual. A
+  // thread that is idle, gone, or archived lost its reply, so the marker is
+  // cleared and a brief or guide that was writing goes back on the queue, to
+  // be sent on the next look at the review (brief_get, guide_get).
+  void (async () => {
+    const now = Date.now();
+    const briefs = new Set(q.briefsWriting.all().map((r) => r.review_id));
+    const guides = new Map(q.guidesPending.all().map((r) => [r.review_id, r.head_sha]));
+    for (const helper of q.helpersWithJob.all()) {
+      let running = false;
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: helper.thread_id });
+        running = thread.status !== "idle" && thread.archivedAt === null && thread.deletedAt === null;
+      } catch {
+        running = false;
+      }
+      if (!running) {
+        q.setHelperJob.run(null, helper.review_id);
+        continue;
+      }
+      if (helper.job === "brief") briefs.delete(helper.review_id);
+      if (helper.job === "guide") guides.delete(helper.review_id);
+    }
+    for (const reviewId of briefs) want(reviewId, "brief");
+    for (const [reviewId, headSha] of guides) {
+      q.setGuideStatus.run(reviewId, headSha, "queued", null, now);
+      want(reviewId, "guide");
+    }
+  })();
 
   const publish = (reviewId: string, what: string) => bb.realtime.publish(REVIEW_CHANGED, { reviewId, what });
 
@@ -820,6 +972,7 @@ export default async function plugin(bb: BbPluginApi) {
     const result = await host.call("gh_threads", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
     q.setThreadsCache.run(row.id, JSON.stringify(result.threads), Date.now());
     publish(row.id, "threads");
+    scheduleSimple(row);
     return result.threads;
   }
 
@@ -1069,10 +1222,14 @@ export default async function plugin(bb: BbPluginApi) {
 
   function codemapState(row: ReviewRow): CodemapState {
     const cached = q.codemap.get(row.id);
-    if (cached === undefined || cached.head_sha !== row.head_sha) {
-      return codemapBuilds.has(row.id) ? { status: "building", codemap: null, error: null, updatedAt: null } : { status: "missing", codemap: null, error: null, updatedAt: null };
+    const notBuilt = (): CodemapState => (codemapBuilds.has(row.id) ? { status: "building", codemap: null, error: null, updatedAt: null } : { status: "missing", codemap: null, error: null, updatedAt: null });
+    if (cached === undefined || cached.head_sha !== row.head_sha) return notBuilt();
+    if (cached.status === "ready") {
+      const codemap = parseJson<Codemap | null>(cached.json, null);
+      // A map built by an older version of the builder is rebuilt, not shown.
+      if (codemap === null || codemap.version !== CODEMAP_VERSION) return notBuilt();
+      return { status: "ready", codemap, error: null, updatedAt: cached.updated_at };
     }
-    if (cached.status === "ready") return { status: "ready", codemap: parseJson<Codemap | null>(cached.json, null), error: null, updatedAt: cached.updated_at };
     if (cached.status === "building") return { status: "building", codemap: null, error: null, updatedAt: cached.updated_at };
     return { status: "failed", codemap: null, error: cached.error, updatedAt: cached.updated_at };
   }
@@ -1093,6 +1250,8 @@ export default async function plugin(bb: BbPluginApi) {
       } finally {
         codemapBuilds.delete(row.id);
         publish(row.id, "codemap");
+        // A queued guide waits for the codemap; it can go now.
+        pumpHelper(row.id);
       }
     })();
   }
@@ -1343,22 +1502,127 @@ export default async function plugin(bb: BbPluginApi) {
     ].join("\n");
   }
 
-  async function helperSend(row: ReviewRow, job: string, text: string): Promise<void> {
-    const existing = q.helper.get(row.id);
+  /** A hidden one-job-at-a-time thread per review. The helper works in the worktree; the simplifier only rewrites text. */
+  interface Lane {
+    title: string;
+    intro: (row: ReviewRow) => string;
+    /** Empty means defaultProvider. A live thread on another provider is replaced. */
+    providerId: string;
+    model: string;
+    /** Provider reasoning level; the simplifier needs little of it. */
+    reasoningLevel?: "none" | "low";
+    /** When true, a live thread spawned with a different intro is replaced, so prompt changes take effect. */
+    replaceOnIntroChange: boolean;
+    get: (reviewId: string) => HelperRow | undefined;
+    upsert: (reviewId: string, threadId: string, providerId: string, environmentId: string | null, createdAt: number, introHash: string) => void;
+    setJob: (job: string | null, reviewId: string) => void;
+    remove: (reviewId: string) => void;
+  }
+  const helperLane: Lane = {
+    title: "helper",
+    intro: helperIntro,
+    providerId: "",
+    model: helperModel,
+    replaceOnIntroChange: false,
+    get: (id) => q.helper.get(id),
+    upsert: (id, threadId, providerId, environmentId, createdAt) => { q.upsertHelper.run(id, threadId, providerId, environmentId, createdAt); },
+    setJob: (job, id) => { q.setHelperJob.run(job, id); },
+    remove: (id) => { q.deleteHelper.run(id); },
+  };
+  const simplifierLane: Lane = {
+    title: "simple english",
+    intro: simpleIntro,
+    providerId: simpleEnglishProvider.trim(),
+    model: simpleEnglishModel.trim() !== "" ? simpleEnglishModel : helperModel,
+    reasoningLevel: "low",
+    replaceOnIntroChange: true,
+    get: (id) => q.simplifier.get(id),
+    upsert: (id, threadId, providerId, environmentId, createdAt, introHash) => { q.upsertSimplifier.run(id, threadId, providerId, environmentId, createdAt, introHash); },
+    setJob: (job, id) => { q.setSimplifierJob.run(job, id); },
+    remove: (id) => { q.deleteSimplifier.run(id); },
+  };
+
+  const helperSend = (row: ReviewRow, job: string, text: string) => laneSend(helperLane, row, job, text);
+
+  /** Reviews whose helper job is being prepared: the prompt is building, the job marker is not set yet. */
+  const helperSending = new Set<string>();
+
+  /** The helper takes one job at a time; the brief, the guide, and notes all wait for it. */
+  function helperBusy(row: ReviewRow): boolean {
+    return helperSending.has(row.id) || (q.helper.get(row.id)?.job ?? null) !== null;
+  }
+
+  /** Build a prompt and send it as the helper's job; `onError` records a failure so the UI can show it. */
+  async function runHelperJob(row: ReviewRow, job: string, prompt: () => Promise<string>, onError: (message: string) => void): Promise<void> {
+    helperSending.add(row.id);
+    try {
+      await helperSend(row, job, await prompt());
+    } catch (cause) {
+      onError(errorMessage(cause));
+      helperSending.delete(row.id);
+      pumpHelper(row.id);
+      return;
+    }
+    helperSending.delete(row.id);
+  }
+
+  /**
+   * Send the next waiting job once the helper is free. The brief goes before
+   * the guide; the guide also waits for the codemap, which it reads for
+   * orientation. Called when a job completes and when a codemap build ends.
+   */
+  function pumpHelper(reviewId: string): void {
+    const wanted = helperWanted.get(reviewId);
+    if (wanted === undefined || wanted.size === 0) return;
+    const row = q.review.get(reviewId);
+    if (row === undefined) {
+      helperWanted.delete(reviewId);
+      return;
+    }
+    if (helperBusy(row)) return;
+    if (wanted.has("brief")) {
+      wanted.delete("brief");
+      void sendBrief(row);
+      return;
+    }
+    if (wanted.has("guide")) {
+      const codemap = codemapState(row);
+      if (codemap.status === "missing") {
+        startCodemap(row);
+        return;
+      }
+      if (codemap.status === "building") return;
+      wanted.delete("guide");
+      void sendGuide(row);
+    }
+  }
+
+  async function laneSend(lane: Lane, row: ReviewRow, job: string, text: string): Promise<void> {
+    const existing = lane.get(row.id);
+    const wantedProvider = lane.providerId !== "" ? lane.providerId : (existing?.provider_id ?? defaultProvider);
+    const intro = lane.intro(row);
+    const introHash = simpleHash(intro);
     if (existing !== undefined) {
       try {
         const thread = await bb.sdk.threads.get({ threadId: existing.thread_id });
-        if (thread.archivedAt === null && thread.deletedAt === null) {
-          q.setHelperJob.run(job, row.id);
-          await bb.sdk.threads.send({ threadId: existing.thread_id, mode: "auto", input: [{ type: "text", text, mentions: [] }] });
+        const sameIntro = !lane.replaceOnIntroChange || existing.intro_hash === introHash;
+        if (thread.archivedAt === null && thread.deletedAt === null && existing.provider_id === wantedProvider && sameIntro) {
+          lane.setJob(job, row.id);
+          await bb.sdk.threads.send({
+            threadId: existing.thread_id,
+            mode: "auto",
+            ...(lane.model.trim() !== "" ? { model: lane.model.trim() } : {}),
+            ...(lane.reasoningLevel === undefined ? {} : { reasoningLevel: lane.reasoningLevel }),
+            input: [{ type: "text", text, mentions: [] }],
+          });
           return;
         }
       } catch {
-        // stale helper; respawn below
+        // stale thread; respawn below
       }
-      q.deleteHelper.run(row.id);
+      lane.remove(row.id);
     }
-    const providerId = existing?.provider_id ?? defaultProvider;
+    const providerId = wantedProvider;
     const providers = await bb.sdk.providers.list();
     const provider = providers.find((p) => p.id === providerId);
     if (provider === undefined) throw new Error(`unknown provider ${providerId}`);
@@ -1373,19 +1637,20 @@ export default async function plugin(bb: BbPluginApi) {
         : { type: "host", hostId: row.host_id, workspace: { type: "unmanaged", path: row.worktree } },
       providerId,
       ...(permissionMode ? { permissionMode } : {}),
-      ...(helperModel.trim() !== "" ? { model: helperModel.trim() } : {}),
-      title: `Review Desk ${row.owner}/${row.repo}#${row.number}: helper`,
+      ...(lane.model.trim() !== "" ? { model: lane.model.trim() } : {}),
+      ...(lane.reasoningLevel === undefined ? {} : { reasoningLevel: lane.reasoningLevel }),
+      title: `Review Desk ${row.owner}/${row.repo}#${row.number}: ${lane.title}`,
       visibility: hideSeatThreads ? "hidden" : "visible",
-      input: [{ type: "text", text: helperIntro(row), mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
+      input: [{ type: "text", text: intro, mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
     });
-    q.upsertHelper.run(row.id, thread.id, providerId, knownEnvironment, now);
-    q.setHelperJob.run(job, row.id);
+    lane.upsert(row.id, thread.id, providerId, knownEnvironment, now, introHash);
+    lane.setJob(job, row.id);
     if (knownEnvironment === null) {
       void (async () => {
         const environmentId = thread.environmentId ?? (await waitForEnvironment(thread.id));
         if (environmentId !== null) {
           q.setEnvironment.run(environmentId, row.id);
-          q.upsertHelper.run(row.id, thread.id, providerId, environmentId, now);
+          lane.upsert(row.id, thread.id, providerId, environmentId, now, introHash);
         }
       })();
     }
@@ -1467,18 +1732,53 @@ export default async function plugin(bb: BbPluginApi) {
     return report.signals.map((s) => `- ${s.label} (${s.count}): ${s.evidence.slice(0, 3).map((e) => (e.line === null ? e.note : `${e.path}:${e.line} ${e.note}`)).join("; ")}`).join("\n");
   }
 
-  function codemapDigest(row: ReviewRow): string {
+  /**
+   * The codemap as text for a helper prompt. The brief gets the top symbols
+   * overall; the guide (`perFile`) gets every file's changed symbols and the
+   * references between modules, so it can place files and trace the flow.
+   */
+  function codemapDigest(row: ReviewRow, options: { perFile?: number } = {}): string {
     const state = codemapState(row);
     if (state.status !== "ready" || state.codemap === null) return "(codemap not built yet)";
     const c = state.codemap;
-    return [
-      "Reading order:",
+    const lines = [
+      `Codemap (${c.engine}): ${c.stats.files} files, ${c.stats.symbols} symbols (+${c.stats.added} ~${c.stats.modified} -${c.stats.removed}), ${c.edges.length} references between changed symbols.`,
+      "Module order (dependencies first; tests, config, and docs after the code):",
       ...c.readingOrder.map((m, i) => `  ${i + 1}. ${m.module} (${m.paths.length} files): ${m.reason}`),
-      "Hotspots:",
+      "Hotspots (changed lines weighted by fan-in from the repository; tests count a quarter):",
       ...c.hotspots.slice(0, 10).map((h) => `  ${h.path}#${h.qualified} (${h.changedLines} changed lines, fan-in ${h.fanIn})`),
-      "Changed symbols (top 60 by changed lines):",
-      ...[...changedSymbols(row)].sort((a, b) => b.changedLines - a.changedLines).slice(0, 60).map((s) => `  ${s.status.padEnd(8)} ${s.kind.padEnd(9)} ${s.qualified}  ${s.path}:${s.status === "removed" ? `${s.oldStart}-${s.oldEnd} (base)` : `${s.start}-${s.end}`}`),
-    ].join("\n");
+    ];
+    if (options.perFile === undefined) {
+      lines.push(
+        "Changed symbols (top 60 by changed lines):",
+        ...[...changedSymbols(row)].sort((a, b) => b.changedLines - a.changedLines).slice(0, 60).map((s) => `  ${s.status.padEnd(8)} ${s.kind.padEnd(9)} ${s.qualified}  ${s.path}:${s.status === "removed" ? `${s.oldStart}-${s.oldEnd} (base)` : `${s.start}-${s.end}`}`),
+      );
+      return lines.join("\n");
+    }
+    lines.push("Changed symbols per file (+ added, ~ modified, - removed; head lines, base lines for removed):");
+    for (const f of c.files) {
+      const changed = f.symbols.filter((s) => s.status !== "unchanged").sort((a, b) => b.changedLines - a.changedLines);
+      if (changed.length === 0) {
+        lines.push(`  ${f.path} [${f.role}, ${f.changedLines} lines]: no symbol-level change`);
+        continue;
+      }
+      const shown = changed.slice(0, options.perFile).map((s) => `${s.status === "added" ? "+" : s.status === "removed" ? "-" : "~"}${s.kind} ${s.qualified} ${s.status === "removed" ? `${s.oldStart}-${s.oldEnd}` : `${s.start}-${s.end}`}`);
+      lines.push(`  ${f.path} [${f.role}, ${f.changedLines} lines]: ${shown.join("; ")}${changed.length > shown.length ? `; and ${changed.length - shown.length} more` : ""}`);
+    }
+    const moduleOf = new Map(c.files.map((f) => [f.path, f.module]));
+    const between = new Map<string, number>();
+    for (const e of c.edges) {
+      const from = moduleOf.get(e.from.split("#")[0]);
+      const to = moduleOf.get(e.to.split("#")[0]);
+      if (from === undefined || to === undefined || from === to) continue;
+      const key = `${from} -> ${to}`;
+      between.set(key, (between.get(key) ?? 0) + 1);
+    }
+    if (between.size > 0) {
+      lines.push("References between modules (from -> to: count):");
+      for (const [key, n] of [...between.entries()].sort((a, b) => b[1] - a[1]).slice(0, 40)) lines.push(`  ${key}: ${n}`);
+    }
+    return lines.join("\n");
   }
 
   async function briefPrompt(row: ReviewRow): Promise<string> {
@@ -1551,18 +1851,26 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
+  /** Mark the brief as writing and send it, or queue it when the helper has another job. */
   async function writeBrief(row: ReviewRow): Promise<void> {
     q.ensureBrief.run(row.id, row.head_sha, Date.now());
     const current = q.brief.get(row.id);
     if (current?.brief_status === "writing") return;
+    const busy = helperBusy(row);
     q.setBrief.run("writing", row.head_sha, null, null, null, Date.now(), row.id);
     publish(row.id, "brief");
-    try {
-      await helperSend(row, "brief", await briefPrompt(row));
-    } catch (cause) {
-      q.setBrief.run("failed", row.head_sha, null, null, errorMessage(cause), Date.now(), row.id);
-      publish(row.id, "brief");
+    if (busy) {
+      want(row.id, "brief");
+      return;
     }
+    await sendBrief(row);
+  }
+
+  async function sendBrief(row: ReviewRow): Promise<void> {
+    await runHelperJob(row, "brief", () => briefPrompt(row), (message) => {
+      q.setBrief.run("failed", row.head_sha, null, null, message, Date.now(), row.id);
+      publish(row.id, "brief");
+    });
   }
 
   async function completeBrief(reviewId: string, text: string | null, error: string | null): Promise<void> {
@@ -1583,21 +1891,455 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     publish(reviewId, "brief");
+    pumpHelper(reviewId);
+  }
+
+  // -- guide: the helper's map over the codemap -------------------------------
+  //
+  // The codemap says which symbols changed where. The guide, written by the
+  // helper from the diff with the codemap as orientation, says what the PR
+  // does, how the changed code runs, in what order to read the files, and what
+  // each file does in this PR. One job on the helper lane, after the brief.
+
+  function guideState(row: ReviewRow): GuideState {
+    const g = q.guide.get(row.id);
+    const guide = g?.json ? parseJson<Record<string, unknown> | null>(g.json, null) : null;
+    const stale = guide !== null && g?.json_head_sha !== row.head_sha;
+    if (g === undefined || g.head_sha !== row.head_sha) {
+      // No status for this head yet; an older guide may still be on file.
+      return { status: helperWanted.get(row.id)?.has("guide") ? "queued" : "missing", guide, error: null, stale, updatedAt: g?.updated_at ?? null };
+    }
+    const status = g.status === "queued" || g.status === "writing" || g.status === "ready" || g.status === "failed" ? g.status : "missing";
+    return { status, guide, error: status === "failed" ? g.error : null, stale, updatedAt: g.updated_at };
+  }
+
+  /** Ask for the guide at the current head; `force` rewrites one that is already current. */
+  function wantGuide(row: ReviewRow, force: boolean): void {
+    const state = guideState(row);
+    if (state.status === "writing" || state.status === "queued") return;
+    if (!force && state.status === "ready" && !state.stale) return;
+    want(row.id, "guide");
+    q.setGuideStatus.run(row.id, row.head_sha, "queued", null, Date.now());
+    publish(row.id, "guide");
+    pumpHelper(row.id);
+  }
+
+  async function sendGuide(row: ReviewRow): Promise<void> {
+    q.setGuideStatus.run(row.id, row.head_sha, "writing", null, Date.now());
+    publish(row.id, "guide");
+    await runHelperJob(row, "guide", () => guidePrompt(row), (message) => {
+      q.setGuideStatus.run(row.id, row.head_sha, "failed", message, Date.now());
+      publish(row.id, "guide");
+    });
+  }
+
+  async function guidePrompt(row: ReviewRow): Promise<string> {
+    const files = await filesFor(row);
+    const codemap = codemapState(row).codemap;
+    const roleOf = new Map((codemap?.files ?? []).map((f) => [f.path, f.role]));
+    return [
+      `Job: write the reading guide for this PR. Reply with exactly one fenced block tagged ${GUIDE_FENCE} containing this JSON:`,
+      "{",
+      '  "overview": string,',
+      '  "flow": [{ "path": string, "symbol": string, "what": string }],',
+      '  "steps": [{ "title": string, "why": string, "paths": [string] }],',
+      '  "files": [{ "path": string, "role": "core" | "types" | "wiring" | "tests" | "docs" | "config" | "generated" | "moved", "what": string, "skim": boolean }]',
+      "}",
+      "",
+      "The reviewer reads the diff with this guide beside it. It answers three questions: what is going on, in what order to read the files, and what each file does in this PR. Write from the diff and the code, not from the description.",
+      "",
+      "overview: 4 to 8 sentences, each under 20 words. First the one-sentence gist. Then the shape of the change: what was added, moved, removed, or rewired, and where the new behavior lives. Then what to hold in mind while reading: an invariant, a changed contract, a hot path. Name code by its identifiers. Everyday words, active voice, no marketing words (robust, seamless, comprehensive, leverage, enhance).",
+      "flow: the runtime path through the changed code, in call order, 3 to 10 hops. Each hop is one changed or newly called symbol: path = the changed file that holds it, symbol = its qualified name as the codemap spells it when possible, what = one sentence on what happens there and what it hands to the next hop. Skip tests, docs, and config. Empty when the PR has no runtime path (docs, config, pure renames).",
+      "steps: the reading order, 3 to 8 steps. Group files so each step is one idea a reader can hold: contracts and types first, then the core logic, then the callers and wiring that adopt it, then tests, then docs and config. title: at most 8 words. why: 1 to 3 sentences on what happens in this group and why it is read at this point. paths: changed files only, in the order to read them inside the step. Every file that is not skim appears in exactly one step; skim files may share one last step.",
+      "files: one entry for every changed file, no exceptions. role: core = the logic that changes behavior; types = structs, traits, interfaces, schemas, protos; wiring = callers, constructors, exports, registrations, CLI or config plumbing that adopts the change; tests; docs; config = build, CI, deployment, lockfiles; generated = machine-written output; moved = a file whose content moved with little change. what: one sentence, under 25 words, on what this file does in this PR: what it now does that it did not before, or what was removed. For a moved file, say where it came from. skim: true when the change is mechanical (rename, import shuffle, lockfile, formatting, moved without edits) and the reviewer can pass it quickly.",
+      "Read the diff before writing: the whole change, then per file where the summary below is not enough. The codemap below is deterministic orientation: which symbols changed where, who references whom, and a dependency order between modules. Trust the code over it.",
+      "",
+      `PR title: ${row.title}`,
+      "PR description (context only; verify against the code):",
+      row.body.trim() === "" ? "(none)" : row.body.trim().slice(0, 6000),
+      "",
+      `Changed files (${files.length}), with the codemap's role guess:`,
+      ...files.slice(0, 300).map((f) => `  ${f.status.padEnd(8)} ${(roleOf.get(f.path) ?? fileRole(f.path)).padEnd(9)} ${f.path}${f.oldPath && f.oldPath !== f.path ? ` (from ${f.oldPath})` : ""} (+${f.additions} -${f.deletions})`),
+      ...(files.length > 300 ? [`  ... ${files.length - 300} more`] : []),
+      "",
+      codemapDigest(row, { perFile: 8 }),
+    ].join("\n");
+  }
+
+  const rawGuideSchema = z.object({
+    overview: z.string().optional(),
+    flow: z.array(z.object({ path: z.string().optional(), symbol: z.string().optional(), what: z.string().optional() })).optional(),
+    steps: z.array(z.object({ title: z.string().optional(), why: z.string().optional(), paths: z.array(z.string()).optional() })).optional(),
+    files: z.array(z.object({ path: z.string(), role: z.string().optional(), what: z.string().optional(), skim: z.boolean().optional() })).optional(),
+  });
+
+  /**
+   * The helper's guide made whole: paths resolved to the diff, every changed
+   * file given a line and a place in a step (the codemap fills gaps), flow hops
+   * anchored to their symbol's head line when the codemap has it.
+   */
+  async function normalizeGuide(row: ReviewRow, raw: unknown): Promise<Guide> {
+    const parsed = rawGuideSchema.parse(raw);
+    const files = await filesFor(row);
+    const paths = new Set(files.map((f) => f.path));
+    const resolvePath = (p: string | undefined): string | null => {
+      if (p === undefined) return null;
+      const clean = p.trim().replace(/^\.\//, "").replace(/:\d+(-\d+)?$/, "");
+      if (paths.has(clean)) return clean;
+      const bySuffix = files.filter((f) => f.path.endsWith(`/${clean}`));
+      return bySuffix.length === 1 ? bySuffix[0].path : null;
+    };
+    const codemap = codemapState(row).codemap;
+    const codemapFile = new Map((codemap?.files ?? []).map((f) => [f.path, f]));
+    const fallbackRole = (path: string): GuideRole => {
+      const role = codemapFile.get(path)?.role ?? fileRole(path);
+      return role === "code" ? "core" : role;
+    };
+    const fallbackWhat = (path: string): string => {
+      const file = files.find((f) => f.path === path);
+      const changed = codemapFile.get(path)?.symbols.filter((s) => s.status !== "unchanged") ?? [];
+      if (file?.status === "deleted") return "Removed.";
+      if (file?.status === "renamed" && changed.length === 0) return `Moved from ${file.oldPath}.`;
+      if (changed.length === 0) return file?.status === "added" ? "New file." : "Edited.";
+      const part = (status: string, verb: string) => {
+        const list = changed.filter((s) => s.status === status);
+        return list.length === 0 ? null : `${verb} ${list.slice(0, 3).map((s) => s.name).join(", ")}${list.length > 3 ? ` and ${list.length - 3} more` : ""}`;
+      };
+      return `${[part("added", "Adds"), part("modified", "changes"), part("removed", "removes")].filter((s) => s !== null).join("; ")}.`;
+    };
+    const byPath = new Map<string, GuideFile>();
+    for (const f of parsed.files ?? []) {
+      const path = resolvePath(f.path);
+      if (path === null || byPath.has(path)) continue;
+      const role = (GUIDE_ROLES as readonly string[]).includes(f.role ?? "") ? (f.role as GuideRole) : fallbackRole(path);
+      byPath.set(path, { path, role, what: (f.what ?? "").trim() || fallbackWhat(path), skim: f.skim === true });
+    }
+    for (const f of files) {
+      if (byPath.has(f.path)) continue;
+      const role = fallbackRole(f.path);
+      byPath.set(f.path, { path: f.path, role, what: fallbackWhat(f.path), skim: role === "docs" || role === "config" || role === "generated" });
+    }
+    const placed = new Set<string>();
+    const steps: GuideStep[] = [];
+    for (const s of (parsed.steps ?? []).slice(0, 12)) {
+      const stepPaths: string[] = [];
+      for (const p of s.paths ?? []) {
+        const path = resolvePath(p);
+        if (path === null || placed.has(path)) continue;
+        placed.add(path);
+        stepPaths.push(path);
+      }
+      if (stepPaths.length === 0) continue;
+      steps.push({ title: (s.title ?? "").trim().slice(0, 80) || `Step ${steps.length + 1}`, why: (s.why ?? "").trim(), paths: stepPaths });
+    }
+    const rest = files.map((f) => f.path).filter((p) => !placed.has(p));
+    const restRead = rest.filter((p) => byPath.get(p)?.skim !== true);
+    const restSkim = rest.filter((p) => byPath.get(p)?.skim === true);
+    if (restRead.length > 0) steps.push({ title: steps.length === 0 ? "Changed files" : "Also changed", why: "Files the guide did not place in a step.", paths: restRead });
+    if (restSkim.length > 0) steps.push({ title: "Skim", why: "Mechanical changes: renames, lockfiles, formatting, generated output.", paths: restSkim });
+    const norm = (s: string) => s.replace(/\s+/g, "").toLowerCase();
+    const flow: GuideHop[] = [];
+    for (const h of (parsed.flow ?? []).slice(0, 12)) {
+      const path = resolvePath(h.path);
+      const symbol = (h.symbol ?? "").trim();
+      if (path === null || symbol === "") continue;
+      const symbols = (codemapFile.get(path)?.symbols ?? []).filter((s) => s.status !== "removed");
+      const wanted = norm(symbol);
+      const last = wanted.split(/::|\./).pop() ?? wanted;
+      const match = symbols.find((s) => norm(s.qualified) === wanted) ?? symbols.find((s) => norm(s.qualified).endsWith(`::${last}`) || norm(s.qualified).endsWith(`.${last}`)) ?? symbols.find((s) => norm(s.name) === last);
+      flow.push({ path, symbol, what: (h.what ?? "").trim(), line: match?.start ?? null });
+    }
+    return { overview: (parsed.overview ?? "").trim(), flow, steps, files: files.map((f) => byPath.get(f.path) as GuideFile) };
+  }
+
+  async function completeGuide(reviewId: string, text: string | null, error: string | null): Promise<void> {
+    const row = q.review.get(reviewId);
+    const g = q.guide.get(reviewId);
+    if (row === undefined || g === undefined || g.status !== "writing") return;
+    try {
+      if (error !== null || text === null) throw new Error(error ?? "the helper returned nothing");
+      const json = extractFenced(text, GUIDE_FENCE);
+      if (json === null) throw new Error(`no ${GUIDE_FENCE} block in the reply`);
+      const guide = await normalizeGuide(row, JSON.parse(json));
+      if (guide.overview === "" && guide.steps.length === 0) throw new Error("the guide has no overview and no steps");
+      q.setGuideReady.run(JSON.stringify(guide), text, Date.now(), reviewId);
+    } catch (cause) {
+      q.setGuideFailed.run(`could not read the guide: ${errorMessage(cause)}`, text, Date.now(), reviewId);
+    }
+    publish(reviewId, "guide");
+    pumpHelper(reviewId);
+  }
+
+  /** The guide for the UI; queues a write on the first look at a new head when autoGuide is on. */
+  function guideGet(row: ReviewRow): GuideState {
+    const state = guideState(row);
+    if (autoGuide && state.status === "missing") wantGuide(row, false);
+    else if (state.status === "queued") pumpHelper(row.id);
+    return guideState(row);
+  }
+
+  // -- Simple English: GitHub comments rewritten by a second hidden thread ----
+  //
+  // Every comment over a few words goes, in batches, to a cheap hidden thread
+  // that answers with one rewrite per comment. Rows are keyed by comment and
+  // body hash, so an edited comment is redone and the rest is served from
+  // SQLite. The UI shows the rewrite under the original.
+
+  const SIMPLE_FENCE = "simple-english";
+  const SIMPLE_BATCH = 30;
+  const SIMPLE_BATCH_CHARS = 40_000;
+  const SIMPLE_MIN_WORDS = 12;
+  const SIMPLE_MAX_CHARS = 8_000;
+  /** Vocabulary help for the rewrite. Short on purpose: a long rule set makes a fast model paraphrase instead of simplify. */
+  const SIMPLE_RULES_FALLBACK = [
+    "Word swaps: leverage, utilize -> use. address, tackle -> fix. validate, verify, confirm, ensure -> check. incorrect -> wrong. in order to -> to. prior to -> before. since (reason) -> because. therefore, hence, thus -> so. however -> but. functionality -> feature. utilize -> use. facilitate -> help. in the event that -> if. due to the fact that -> because.",
+    "Modals: should (requirement) -> must. should (advice) -> say it as a plain instruction. may, might, could -> can. would -> restructure as: if X, then Y.",
+    "Delete: simply, just, basically, essentially, it is worth noting, note that, please, kindly, robust, comprehensive, seamless, gracefully.",
+    "Active voice, present tense. No contractions.",
+  ].join("\n");
+
+  interface SimpleItem { key: string; author: string; body: string }
+
+  const simpleHash = (body: string) => createHash("sha1").update(body).digest("hex").slice(0, 16);
+
+  function proseWords(body: string): number {
+    return body.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/<!--[\s\S]*?-->/g, " ").split(/\s+/).filter(Boolean).length;
+  }
+
+  /**
+   * Every comment worth rewriting: review threads plus the conversation, as far as both caches go.
+   * Open threads come first, so what the reviewer reads first is rewritten first. `all` keeps the
+   * short ones too, for comments the reviewer asked for by hand.
+   */
+  function commentItems(row: ReviewRow, all = false): SimpleItem[] {
+    const items: SimpleItem[] = [];
+    const threads = cachedThreads(row).slice().sort((a, b) => Number(a.isResolved) - Number(b.isResolved));
+    for (const t of threads) for (const c of t.comments) items.push({ key: `t:${c.id}`, author: c.author, body: c.body });
+    const conversation = parseJson<{ comments?: { id: number; author: string; body: string }[]; reviews?: { id: number; author: string; body: string }[] }>(q.conversationCache.get(row.id)?.json ?? null, {});
+    for (const c of conversation.comments ?? []) items.push({ key: `c:${c.id}`, author: c.author, body: c.body });
+    for (const r of conversation.reviews ?? []) items.push({ key: `r:${r.id}`, author: r.author, body: r.body });
+    return items.filter((i) => i.body.length <= SIMPLE_MAX_CHARS && (all ? i.body.trim() !== "" : proseWords(i.body) >= SIMPLE_MIN_WORDS));
+  }
+
+  let simpleRulesCache: string | null = null;
+  /** Vocabulary guidance: the built-in list, or the file named by simpleEnglishSkill when set. */
+  function simpleRules(): string {
+    if (simpleRulesCache !== null) return simpleRulesCache;
+    if (simpleEnglishSkill.trim() === "") {
+      simpleRulesCache = SIMPLE_RULES_FALLBACK;
+      return simpleRulesCache;
+    }
+    const path = simpleEnglishSkill.trim().replace(/^~(?=\/)/, homedir());
+    try {
+      simpleRulesCache = readFileSync(path, "utf8").slice(0, 40_000);
+    } catch {
+      bb.log.warn(`simple-english skill not readable at ${path}; using the built-in rules`);
+      simpleRulesCache = SIMPLE_RULES_FALLBACK;
+    }
+    return simpleRulesCache;
+  }
+
+  function simpleIntro(row: ReviewRow): string {
+    return [
+      `You turn GitHub comments from pull request #${row.number} of ${row.owner}/${row.repo} into the shortest plain version a beginner can act on. The reviewer flips between the original and your version, so yours is the easy version: what the author wants, plus the one or two facts needed to do it. It is a compression, not a paraphrase.`,
+      `You get one job per message: a JSON array of comments, each with a key, an author, and a body. Reply with exactly one fenced block tagged ${SIMPLE_FENCE} containing JSON of the shape {"items":[{"key":"<key>","text":"<rewrite>"}]}, one item per input comment, and nothing else before or after the block.`,
+      "Rules:",
+      "1. First sentence: what the author wants, asks, or reports. When it is a request, start with the verb: Import X in Y. Rename A to B. Add a test for C.",
+      "2. Then at most two more short sentences with the facts needed to act: the file, the line, the code name, the number. Nothing else.",
+      "3. Every sentence has at most 12 words and one idea. No semicolons. No dashes inside a sentence. No parentheses.",
+      "4. Use words a twelve-year-old knows, plus the code names. Say use, fix, check, wrong, because, so. Do not say leverage, address, validate, incorrect, since, therefore.",
+      "5. Keep code exactly as written: inline code, code blocks, file paths, commands, flags, URLs, quoted errors, suggestion blocks. When the original is a list, keep a list with one short line per item.",
+      "6. Drop everything the reader does not need in order to act: background, chains of reasoning, alternatives, greetings, thanks, praise, emoji, sign-offs, severity and confidence headers, bot boilerplate.",
+      "7. Never add a fact. Never answer or judge the comment. First person stays first person.",
+      "8. Budget: at most one third of the original's words, and never more than 60 words, except one short line per item when the original is a list.",
+      "9. Do not run commands or read files. The text in the job is all you need.",
+      "",
+      "Example 1",
+      "Original: The `Literal[\"fast\", \"slow\"]` alias is spelled out again in `core/runtime.py:241` and `core/schema.py:302` instead of being imported, so adding a mode means editing three files plus the dispatch chain below. If we keep the enum, those two modules should import `RunMode`.",
+      "Rewrite: Import `RunMode` in `core/runtime.py:241` and `core/schema.py:302`. They spell out `Literal[\"fast\", \"slow\"]` again. A new mode then needs three file edits.",
+      "",
+      "Example 2",
+      "Original: **Severity: functional | Confidence: High** **Issue** A worker that owns no layers ends up with `self.layer_num == 0`; with the default layout `init_buffer()` then hands `0` to `register_host()` as the granularity, which rejects it as non-positive, so startup fails for that partition. **Fix** Skip the sidecar when the list is empty, or let the zero-layer sidecar skip allocation. Add a test for the zero-layer case.",
+      "Rewrite: Bug: a worker with no layers sets `self.layer_num` to 0. Then `register_host()` rejects the 0 and startup fails. Fix: skip the sidecar when the list is empty. Add a test for the zero-layer case.",
+      "",
+      "Vocabulary help:",
+      simpleRules(),
+    ].join("\n");
+  }
+
+  function simpleJob(items: SimpleItem[]): string {
+    return [`Job: rewrite these ${items.length} comments in Simple English. Reply with one fenced block tagged ${SIMPLE_FENCE}.`, "", JSON.stringify(items)].join("\n");
+  }
+
+  function simpleState(row: ReviewRow): SimpleState {
+    const items: Record<string, string> = {};
+    const pending: string[] = [];
+    let error: string | null = null;
+    for (const r of q.simpleRows.all(row.id)) {
+      if (r.status === "ready" && r.text !== null) items[r.comment_key] = r.text;
+      else if (r.status === "queued" || r.status === "writing") pending.push(r.comment_key);
+      else if (r.status === "failed" && error === null) error = r.error;
+    }
+    return { mode: simpleMode, items, pending, error };
+  }
+
+  const pump = (row: ReviewRow) => void pumpSimple(row).catch((cause: unknown) => bb.log.warn(`simple english for ${row.id}: ${errorMessage(cause)}`));
+
+  /**
+   * Queue every comment whose body is new or changed since its last rewrite, then send a batch if
+   * the thread is free. Automatic callers (thread refresh, conversation fetch, simple_get) only do
+   * this in eager mode; the CLI is explicit and runs in any mode. `force` throws the cache away.
+   */
+  function scheduleSimple(row: ReviewRow, options: { force?: boolean; explicit?: boolean } = {}): void {
+    if (simpleMode !== "eager" && options.explicit !== true) return;
+    if (options.force === true) q.deleteSimple.run(row.id);
+    const known = new Map(q.simpleRows.all(row.id).map((r) => [r.comment_key, r.body_hash]));
+    const now = Date.now();
+    for (const item of commentItems(row)) {
+      const hash = simpleHash(item.body);
+      if (known.get(item.key) !== hash) q.queueSimple.run(row.id, item.key, hash, now);
+    }
+    pump(row);
+  }
+
+  /** The reviewer flipped these comments to Simple English: rewrite them next, short ones included, failed ones again. */
+  function requestSimple(row: ReviewRow, keys: string[]): void {
+    const wanted = new Set(keys);
+    const known = new Map(q.simpleRows.all(row.id).map((r) => [r.comment_key, r]));
+    const now = Date.now();
+    for (const item of commentItems(row, true)) {
+      if (!wanted.has(item.key)) continue;
+      const hash = simpleHash(item.body);
+      const current = known.get(item.key);
+      if (current === undefined || current.body_hash !== hash || current.status === "failed") q.queueSimple.run(row.id, item.key, hash, now);
+      if (current?.status !== "ready" || current.body_hash !== hash) q.markSimpleRequested.run(now, row.id, item.key);
+    }
+    pump(row);
+  }
+
+  const simpleSending = new Set<string>();
+  /** One batch in flight per review; the idle handler calls back for the next. */
+  async function pumpSimple(row: ReviewRow): Promise<void> {
+    if (simpleSending.has(row.id) || (q.simplifier.get(row.id)?.job ?? null) !== null) return;
+    const bodies = new Map(commentItems(row, true).map((i) => [i.key, i]));
+    const batch: SimpleItem[] = [];
+    let chars = 0;
+    for (const r of q.simpleQueue.all(row.id)) {
+      const item = bodies.get(r.comment_key);
+      if (item === undefined) {
+        q.deleteSimpleRow.run(row.id, r.comment_key);
+        continue;
+      }
+      if (batch.length >= SIMPLE_BATCH || chars + item.body.length > SIMPLE_BATCH_CHARS) break;
+      batch.push(item);
+      chars += item.body.length;
+    }
+    if (batch.length === 0) return;
+    simpleSending.add(row.id);
+    try {
+      const now = Date.now();
+      for (const item of batch) q.setSimpleStatus.run("writing", null, now, row.id, item.key);
+      publish(row.id, "simple");
+      await laneSend(simplifierLane, row, "simple", simpleJob(batch));
+    } catch (cause) {
+      const message = errorMessage(cause);
+      for (const item of batch) q.setSimpleStatus.run("failed", message, Date.now(), row.id, item.key);
+      publish(row.id, "simple");
+      throw cause;
+    } finally {
+      simpleSending.delete(row.id);
+    }
+  }
+
+  /**
+   * The rewrites in a reply. Rewrites keep the comments' own code fences, so
+   * the tagged block is read greedily to the last fence in the reply, then
+   * as a plain json block, then as whatever sits between the outer braces.
+   */
+  function parseSimpleReply(text: string): Map<string, string> | null {
+    const candidates: string[] = [];
+    const tagged = new RegExp("```" + SIMPLE_FENCE + "[^\\n]*\\n([\\s\\S]*)```", "i").exec(text);
+    if (tagged !== null) candidates.push(tagged[1]);
+    const json = /```json[^\n]*\n([\s\S]*)```/i.exec(text);
+    if (json !== null) candidates.push(json[1]);
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start !== -1 && end > start) candidates.push(text.slice(start, end + 1));
+    for (const candidate of candidates) {
+      try {
+        const parsed = JSON.parse(candidate) as { items?: unknown };
+        const rewrites = new Map<string, string>();
+        for (const entry of Array.isArray(parsed.items) ? parsed.items : []) {
+          const o = entry as { key?: unknown; text?: unknown };
+          if (typeof o.key === "string" && typeof o.text === "string" && o.text.trim() !== "") rewrites.set(o.key, o.text.trim());
+        }
+        return rewrites;
+      } catch {
+        // try the next shape
+      }
+    }
+    return null;
+  }
+
+  /** Comments that already got a second try after a bad reply; a second miss stays failed. */
+  const simpleRetried = new Set<string>();
+
+  function completeSimple(reviewId: string, text: string | null, error: string | null): void {
+    const row = q.review.get(reviewId);
+    if (row === undefined) return;
+    const rewrites = text === null ? null : parseSimpleReply(text);
+    const failure = error ?? (rewrites === null ? "could not read the rewrite" : "no rewrite returned");
+    const now = Date.now();
+    for (const r of q.simpleRows.all(reviewId)) {
+      // A rewrite lands wherever its key is still open; replies and batches can interleave after a reload.
+      const rewrite = r.status === "writing" || r.status === "queued" ? rewrites?.get(r.comment_key) : undefined;
+      if (rewrite !== undefined) {
+        q.setSimpleReady.run(rewrite, now, reviewId, r.comment_key);
+        continue;
+      }
+      if (r.status !== "writing") continue;
+      const retryKey = `${reviewId}:${r.comment_key}`;
+      if (simpleRetried.has(retryKey)) {
+        q.setSimpleStatus.run("failed", failure, now, reviewId, r.comment_key);
+      } else {
+        simpleRetried.add(retryKey);
+        q.setSimpleStatus.run("queued", failure, now, reviewId, r.comment_key);
+      }
+    }
+    publish(reviewId, "simple");
+    pump(row);
   }
 
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
     const helper = q.helperByThread.get(thread.id);
-    if (helper === undefined) return;
-    q.setHelperJob.run(null, helper.review_id);
-    if (helper.job === "brief") void completeBrief(helper.review_id, lastAssistantText, null);
-    if (helper.job === "notes") void completeNotes(helper.review_id, lastAssistantText, null);
+    if (helper !== undefined) {
+      q.setHelperJob.run(null, helper.review_id);
+      if (helper.job === "brief") void completeBrief(helper.review_id, lastAssistantText, null);
+      if (helper.job === "notes") void completeNotes(helper.review_id, lastAssistantText, null);
+      if (helper.job === "guide") void completeGuide(helper.review_id, lastAssistantText, null);
+      if (helper.job === null) pumpHelper(helper.review_id);
+      return;
+    }
+    const simplifier = q.simplifierByThread.get(thread.id);
+    if (simplifier === undefined) return;
+    // The simplifier only ever does one kind of job, so a reply is used even when a reload cleared the marker.
+    q.setSimplifierJob.run(null, simplifier.review_id);
+    completeSimple(simplifier.review_id, lastAssistantText, null);
   });
   bb.events.on("thread.failed", ({ thread, error }) => {
     const helper = q.helperByThread.get(thread.id);
-    if (helper === undefined) return;
-    q.setHelperJob.run(null, helper.review_id);
-    if (helper.job === "brief") void completeBrief(helper.review_id, null, error ?? "the helper thread failed");
-    if (helper.job === "notes") void completeNotes(helper.review_id, null, error ?? "the helper thread failed");
+    if (helper !== undefined) {
+      q.setHelperJob.run(null, helper.review_id);
+      if (helper.job === "brief") void completeBrief(helper.review_id, null, error ?? "the helper thread failed");
+      if (helper.job === "notes") void completeNotes(helper.review_id, null, error ?? "the helper thread failed");
+      if (helper.job === "guide") void completeGuide(helper.review_id, null, error ?? "the helper thread failed");
+      if (helper.job === null) pumpHelper(helper.review_id);
+      return;
+    }
+    const simplifier = q.simplifierByThread.get(thread.id);
+    if (simplifier === undefined) return;
+    q.setSimplifierJob.run(null, simplifier.review_id);
+    completeSimple(simplifier.review_id, null, error ?? "the Simple English thread failed");
   });
 
   // -- private notes ----------------------------------------------------------
@@ -1709,9 +2451,14 @@ export default async function plugin(bb: BbPluginApi) {
   }));
 
   async function findNotes(row: ReviewRow): Promise<void> {
-    if (q.helper.get(row.id)?.job !== null && q.helper.get(row.id)?.job !== undefined) throw new Error("the helper is busy; wait for the current job to finish");
+    if (helperBusy(row)) throw new Error("the helper is busy; wait for the current job to finish");
     notesErrors.delete(row.id);
-    await helperSend(row, "notes", await notesPrompt(row));
+    helperSending.add(row.id);
+    try {
+      await helperSend(row, "notes", await notesPrompt(row));
+    } finally {
+      helperSending.delete(row.id);
+    }
     publish(row.id, "notes");
   }
 
@@ -1751,6 +2498,7 @@ export default async function plugin(bb: BbPluginApi) {
       notesErrors.set(reviewId, errorMessage(cause));
     }
     publish(reviewId, "notes");
+    pumpHelper(reviewId);
   }
 
   function noteToComment(note: NoteRow): string {
@@ -1764,6 +2512,8 @@ export default async function plugin(bb: BbPluginApi) {
     const state = briefState(row);
     if (refresh || state.signalsStatus === "missing") startSignals(row);
     if (autoBrief && state.briefStatus === "missing") void writeBrief(row);
+    // A brief re-queued by a plugin reload goes out on the first look at the review.
+    else if (state.briefStatus === "writing") pumpHelper(row.id);
     return briefState(row);
   }
 
@@ -1826,6 +2576,8 @@ export default async function plugin(bb: BbPluginApi) {
     reviews_sync: ({ reviewId }) => syncReview(reviewId),
     reviews_remove: async ({ reviewId }) => {
       for (const seat of q.seats.all(reviewId)) await chatReset(reviewId, seat.provider_id);
+      q.deleteSimplifier.run(reviewId);
+      q.deleteSimple.run(reviewId);
       q.deleteReview.run(reviewId);
       publish(reviewId, "removed");
       return { ok: true as const };
@@ -1852,6 +2604,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const result = await host.call("gh_conversation", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
       q.setConversationCache.run(row.id, JSON.stringify(result), Date.now());
+      scheduleSimple(row);
       return { ...result, fetchedAt: Date.now() };
     },
     review_threads_refresh: async ({ reviewId }) => ({ threads: await refreshThreads(requireReview(reviewId)) }),
@@ -1924,12 +2677,28 @@ export default async function plugin(bb: BbPluginApi) {
       if (refresh || state.status === "missing") startCodemap(row);
       return codemapState(row);
     },
+    guide_get: ({ reviewId }) => guideGet(requireReview(reviewId)),
+    guide_write: ({ reviewId }) => {
+      const row = requireReview(reviewId);
+      wantGuide(row, true);
+      return guideState(row);
+    },
     brief_get: ({ reviewId, refresh }) => briefGet(requireReview(reviewId), refresh === true),
     brief_write: async ({ reviewId }) => {
       const row = requireReview(reviewId);
       if (briefState(row).signalsStatus === "missing") startSignals(row);
       await writeBrief(row);
       return briefState(row);
+    },
+    simple_get: ({ reviewId, refresh }) => {
+      const row = requireReview(reviewId);
+      scheduleSimple(row, refresh === true ? { force: true, explicit: true } : {});
+      return simpleState(row);
+    },
+    simple_request: ({ reviewId, keys }) => {
+      const row = requireReview(reviewId);
+      requestSimple(row, keys);
+      return simpleState(row);
     },
     notes_from_signal: async ({ reviewId, signalId, show }) => ({ count: await notesFromSignal(requireReview(reviewId), signalId, show) }),
     notes_find: async ({ reviewId }) => {
@@ -2034,10 +2803,14 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "list", summary: "List reviews", usage: "bb review-desk list [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "codemap", summary: "Build or print the codemap", usage: "bb review-desk codemap <reviewId> [--json]" },
+      { name: "guide", summary: "Write or print the reading guide over the codemap", usage: "bb review-desk guide <reviewId> [--rewrite] [--json]" },
+      { name: "simple", summary: "Queue Simple English rewrites of all the comments, redo them all, or request one comment by key", usage: "bb review-desk simple <reviewId> [--redo | --key <t:...|c:...|r:...>] [--json]" },
     ],
     async run(argv) {
       const json = argv.includes("--json");
-      const args = argv.filter((a) => a !== "--json");
+      const redo = argv.includes("--redo");
+      const rewrite = argv.includes("--rewrite");
+      const args = argv.filter((a) => a !== "--json" && a !== "--redo" && a !== "--rewrite");
       const flag = (name: string) => {
         const i = args.indexOf(`--${name}`);
         return i !== -1 && i + 1 < args.length ? args[i + 1] : undefined;
@@ -2062,6 +2835,15 @@ export default async function plugin(bb: BbPluginApi) {
             const seat = await chatSend(reviewId, flag("provider") ?? defaultProvider, null, text, null);
             return ok(seat, `Sent to ${seat.providerId} analyst thread ${seat.threadId}`);
           }
+          case "simple": {
+            const row = requireReview(rest[0] ?? "");
+            const key = flag("key");
+            if (key !== undefined) requestSimple(row, [key]);
+            else scheduleSimple(row, { force: redo, explicit: true });
+            const state = simpleState(row);
+            const failed = q.simpleRows.all(row.id).filter((r) => r.status === "failed").length;
+            return ok(state, `${Object.keys(state.items).length} ready, ${state.pending.length} pending, ${failed} failed (mode ${state.mode})${state.error === null ? "" : `\nlast error: ${state.error}`}`);
+          }
           case "codemap": {
             const row = requireReview(rest[0] ?? "");
             let state = codemapState(row);
@@ -2071,15 +2853,41 @@ export default async function plugin(bb: BbPluginApi) {
             const c = state.codemap;
             const text = [
               `Codemap (${c.engine}) for ${c.headSha.slice(0, 10)}: ${c.stats.files} files, ${c.stats.symbols} symbols (+${c.stats.added} ~${c.stats.modified} -${c.stats.removed})`,
-              "Reading order:",
+              "Module order:",
               ...c.readingOrder.map((m, i) => `  ${i + 1}. ${m.module}  (${m.paths.length} files) ${m.reason}`),
               "Hotspots:",
               ...c.hotspots.slice(0, 10).map((h) => `  ${h.score}  ${h.path}#${h.qualified}  (${h.changedLines} lines, fan-in ${h.fanIn})`),
             ].join("\n");
             return ok(c, text);
           }
+          case "guide": {
+            const row = requireReview(rest[0] ?? "");
+            const before = guideState(row);
+            if (rewrite || before.status === "missing" || before.status === "failed") wantGuide(row, true);
+            else if (before.status === "queued") pumpHelper(row.id);
+            const state = guideState(row);
+            if (state.guide === null) return ok(state, `Guide ${state.status}${state.error ? `: ${state.error}` : ""}. Run again in a moment.`);
+            const g = state.guide as unknown as Guide;
+            const fileOf = new Map(g.files.map((f) => [f.path, f]));
+            const text = [
+              `Guide${state.stale ? ` (written for an older head; now ${state.status})` : state.status === "ready" ? "" : ` (${state.status})`}`,
+              "",
+              g.overview,
+              ...(g.flow.length > 0 ? ["", "How it runs:", ...g.flow.map((h, i) => `  ${i + 1}. ${h.symbol}  ${h.path}${h.line !== null ? `:${h.line}` : ""}\n     ${h.what}`)] : []),
+              "",
+              "Reading order:",
+              ...g.steps.flatMap((s, i) => [
+                `  ${i + 1}. ${s.title}${s.why ? `: ${s.why}` : ""}`,
+                ...s.paths.map((p) => {
+                  const f = fileOf.get(p);
+                  return `       ${(f?.role ?? "").padEnd(9)} ${p}${f?.skim ? "  (skim)" : ""}\n${" ".repeat(17)}${f?.what ?? ""}`;
+                }),
+              ]),
+            ].join("\n");
+            return ok(g, text);
+          }
           default:
-            return { exitCode: 1, stderr: "usage: bb review-desk open|list|ask|codemap" };
+            return { exitCode: 1, stderr: "usage: bb review-desk open|list|ask|codemap|guide|simple" };
         }
       } catch (cause) {
         return { exitCode: 1, stderr: errorMessage(cause) };

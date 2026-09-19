@@ -6,7 +6,7 @@
 // threads, pending comments). The side panel holds Info (checks, reviewers,
 // labels, submit review), Chat (bb's own ThreadChat on an analyst thread that
 // lives in the PR worktree), and Codemap.
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { toast } from "sonner";
 import {
@@ -31,10 +31,11 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { FileDiff, type DiffLineAnnotation, type FileDiffMetadata, type SelectedLineRange } from "@pierre/diffs/react";
 import { parsePatchFiles } from "@pierre/diffs";
-import type { BriefState, CodemapState, CommitInfo, FileEntry, Note, NoteKind, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, rpcContract } from "./server";
+import type { BriefState, CodemapState, CommitInfo, FileEntry, GuideState, Note, NoteKind, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, SimpleMode, SimpleState, rpcContract } from "./server";
 import type { ChangedFile } from "./host-contract";
 import type { Codemap, GhThread } from "./host-contract";
 import type { Brief, BriefEvidence, ClaimVerdict } from "./brief-spec";
+import type { Guide, GuideFile, GuideRole } from "./guide-spec";
 import type { Evidence as SlopEvidence, SlopReport } from "./slop";
 import { MENTION_PROVIDER_ID, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
 import { Button } from "@/components/ui/button";
@@ -48,7 +49,19 @@ const PANEL_ID = "reviews";
 const PANEL_PATH = "reviews";
 const REVIEW_CHANGED = "review-changed";
 const PROVIDER_KEY = "review-desk:provider";
+const SIMPLE_KEY = "review-desk:simple-english";
 const selectionKey = (reviewId: string) => `review-desk:selection:${reviewId}`;
+/** How the Changes list is ordered: as the guide reads the PR, or by path. A preference, not per review. */
+const ORDER_KEY = "review-desk:order";
+const ORDER_EVENT = "review-desk:order";
+type FileOrder = "guide" | "path";
+
+/** A jump into the PR diff asked for from a side tab (the Codemap); ReviewView listens and expands, selects, and scrolls. */
+const JUMP_EVENT = "review-desk:jump";
+interface JumpRequest { reviewId: string; path: string; line: number | null }
+function requestJump(reviewId: string, path: string, line: number | null = null): void {
+  window.dispatchEvent(new CustomEvent<JumpRequest>(JUMP_EVENT, { detail: { reviewId, path, line } }));
+}
 
 // ---------------------------------------------------------------------------
 // Code pills
@@ -367,6 +380,144 @@ function useBrief(reviewId: string | null) {
   return { state, error, refresh: () => load(true), rewrite };
 }
 
+/** The helper-written guide over the codemap: overview, flow, reading steps, one line per file. */
+function useGuide(reviewId: string | null) {
+  const rpc = useRpc<Contract>();
+  const [state, setState] = useState<GuideState | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(() => {
+    if (reviewId === null) return;
+    rpc.call("guide_get", { reviewId }).then(
+      (result) => {
+        setState(result);
+        setError(null);
+      },
+      (cause: unknown) => setError(describeError(cause)),
+    );
+  }, [rpc, reviewId]);
+  useEffect(() => {
+    setState(null);
+    load();
+  }, [load]);
+  useRealtime(REVIEW_CHANGED, (payload) => {
+    const p = payloadReview(payload);
+    if (p !== null && p.reviewId === reviewId && (p.what === "guide" || p.what === "codemap" || p.what === "synced")) load();
+  });
+  const busy = state !== null && (state.status === "queued" || state.status === "writing");
+  useEffect(() => {
+    if (!busy) return;
+    const timer = setInterval(() => load(), 6000);
+    return () => clearInterval(timer);
+  }, [busy, load]);
+  const rewrite = useCallback(() => {
+    if (reviewId === null) return;
+    rpc.call("guide_write", { reviewId }).then(setState, (cause: unknown) => toast.error(describeError(cause)));
+  }, [rpc, reviewId]);
+  const guide = useMemo(() => (state?.guide ? (state.guide as unknown as Guide) : null), [state?.guide]);
+  return { state, guide, busy, error, rewrite };
+}
+
+function useFileOrder(): [FileOrder, (order: FileOrder) => void] {
+  const read = (): FileOrder => (readStorage<FileOrder>(ORDER_KEY) === "path" ? "path" : "guide");
+  const [order, setOrderState] = useState<FileOrder>(read);
+  useEffect(() => {
+    const onChange = () => setOrderState(read());
+    window.addEventListener(ORDER_EVENT, onChange);
+    return () => window.removeEventListener(ORDER_EVENT, onChange);
+  }, []);
+  const setOrder = useCallback((next: FileOrder) => {
+    writeStorage(ORDER_KEY, next);
+    window.dispatchEvent(new CustomEvent(ORDER_EVENT));
+  }, []);
+  return [order, setOrder];
+}
+
+// ---------------------------------------------------------------------------
+// Simple English
+//
+// The server rewrites GitHub comments through a hidden thread. Each comment
+// body flips between the original and its rewrite, asking for the rewrite the
+// first time it is shown; the top-bar toggle sets which side comments start on.
+// ---------------------------------------------------------------------------
+
+interface SimpleContext {
+  /** Comments start on the Simple English side. */
+  on: boolean;
+  setOn(on: boolean): void;
+  mode: SimpleMode;
+  items: Record<string, string>;
+  pending: string[];
+  error: string | null;
+  /** Ask the server to rewrite this comment now; calls within a tick are sent as one request. */
+  request(key: string): void;
+}
+const SimpleCtx = createContext<SimpleContext>({ on: false, setOn: () => undefined, mode: "off", items: {}, pending: [], error: null, request: () => undefined });
+
+function SimpleProvider({ reviewId, children }: { reviewId: string; children: ReactNode }) {
+  const rpc = useRpc<Contract>();
+  const [state, setState] = useState<SimpleState | null>(null);
+  const [on, setOnState] = useState<boolean>(() => readStorage<boolean>(SIMPLE_KEY) ?? false);
+  const load = useCallback(() => {
+    rpc.call("simple_get", { reviewId }).then(setState, () => undefined);
+  }, [rpc, reviewId]);
+  useEffect(() => {
+    setState(null);
+    load();
+  }, [load]);
+  const queued = useRef<Set<string>>(new Set());
+  const asked = useRef<Map<string, number>>(new Map());
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (timer.current !== null) clearTimeout(timer.current); }, []);
+  const request = useCallback((key: string) => {
+    const now = Date.now();
+    if (now - (asked.current.get(key) ?? 0) < 30_000) return;
+    asked.current.set(key, now);
+    queued.current.add(key);
+    if (timer.current !== null) return;
+    timer.current = setTimeout(() => {
+      timer.current = null;
+      const keys = [...queued.current];
+      queued.current.clear();
+      if (keys.length > 0) rpc.call("simple_request", { reviewId, keys }).then(setState, () => undefined);
+    }, 150);
+  }, [rpc, reviewId]);
+  useRealtime(REVIEW_CHANGED, (payload) => {
+    const p = payloadReview(payload);
+    if (p !== null && p.reviewId === reviewId && (p.what === "simple" || p.what === "threads" || p.what === "synced")) load();
+  });
+  const busy = state !== null && state.pending.length > 0;
+  useEffect(() => {
+    if (!busy) return;
+    const timer = setInterval(load, 8000);
+    return () => clearInterval(timer);
+  }, [busy, load]);
+  const value = useMemo<SimpleContext>(() => ({
+    on,
+    setOn: (next) => {
+      setOnState(next);
+      writeStorage(SIMPLE_KEY, next);
+    },
+    mode: state?.mode ?? "lazy",
+    items: state?.items ?? {},
+    pending: state?.pending ?? [],
+    error: state?.error ?? null,
+    request,
+  }), [on, state, request]);
+  return <SimpleCtx.Provider value={value}>{children}</SimpleCtx.Provider>;
+}
+
+function SimpleToggle() {
+  const simple = useContext(SimpleCtx);
+  if (simple.mode === "off") return null;
+  const title = `${simple.on ? "Comments start in Simple English; press to start on the original." : "Start every comment in Simple English; each comment keeps its own switch."}${simple.error !== null ? ` Last error: ${simple.error}` : ""}`;
+  const busy = simple.pending.length > 0;
+  return (
+    <Button variant="ghost" size="sm" className={cn("h-7 text-xs", simple.on && "text-primary")} onClick={() => simple.setOn(!simple.on)} aria-pressed={simple.on} title={title}>
+      <Icon name={busy ? "Loading" : "TextWrap"} className={cn("size-3.5", busy && "animate-spin")} />Simple English{busy ? ` · ${simple.pending.length}` : ""}
+    </Button>
+  );
+}
+
 function useProviders() {
   const rpc = useRpc<Contract>();
   const [providers, setProviders] = useState<ProviderOption[]>([]);
@@ -579,9 +730,23 @@ function AuthorChip({ login, prAuthor, when }: { login: string; prAuthor: string
   );
 }
 
-/** GitHub comment Markdown: HTML comments dropped, `<details>` rendered as real collapsibles. */
-function CommentBody({ body, className }: { body: string; className?: string }) {
-  const cleaned = body.replace(/<!--[\s\S]*?-->/g, "");
+/**
+ * GitHub comment Markdown: HTML comments dropped, `<details>` rendered as real collapsibles.
+ * With `simpleKey`, the body flips between the original and its Simple English rewrite; the
+ * rewrite is requested the first time the simple side is shown and arrives over realtime.
+ */
+function CommentBody({ body, className, simpleKey }: { body: string; className?: string; simpleKey?: string }) {
+  const simple = useContext(SimpleCtx);
+  const [flipped, setFlipped] = useState<boolean | null>(null);
+  const canSimple = simpleKey !== undefined && simple.mode !== "off";
+  const showSimple = canSimple && (flipped ?? simple.on);
+  const rewrite = showSimple && simpleKey !== undefined ? simple.items[simpleKey] : undefined;
+  const writing = showSimple && rewrite === undefined && simpleKey !== undefined && simple.pending.includes(simpleKey);
+  useEffect(() => {
+    if (showSimple && rewrite === undefined && !writing && simpleKey !== undefined) simple.request(simpleKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showSimple, rewrite === undefined, writing, simpleKey]);
+  const cleaned = (rewrite ?? body).replace(/<!--[\s\S]*?-->/g, "");
   const parts: ReactNode[] = [];
   const re = /<details[^>]*>\s*(?:<summary[^>]*>([\s\S]*?)<\/summary>)?([\s\S]*?)<\/details>/gi;
   let last = 0;
@@ -599,7 +764,19 @@ function CommentBody({ body, className }: { body: string; className?: string }) 
     i++;
   }
   if (last < cleaned.length) parts.push(<Markdown key={`t${i}`} content={cleaned.slice(last)} />);
-  return <div className={cn(PROSE, className)}>{parts}</div>;
+  return (
+    <div className={cn(PROSE, className)}>
+      {parts}
+      {canSimple ? (
+        <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground">
+          {rewrite !== undefined ? <span className="rounded-full border border-dashed border-border px-1.5 text-[10px] font-medium uppercase tracking-wide">Simple English</span> : writing ? <span className="inline-flex items-center gap-1"><Icon name="Loading" className="size-3 animate-spin" />Simple English is being written</span> : null}
+          <button type="button" className="ml-auto hover:text-foreground hover:underline" onClick={() => setFlipped(!showSimple)} title={showSimple ? "Show the original comment" : "Show this comment in Simple English"}>
+            {showSimple ? "Original" : "Simple English"}
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 function ThreadCard({ thread, actions }: { thread: GhThread; actions: AnnoActions }) {
@@ -629,7 +806,7 @@ function ThreadCard({ thread, actions }: { thread: GhThread; actions: AnnoAction
         {thread.comments.map((c, index) => (
           <div key={c.id} className="px-3 py-2">
             {index > 0 ? <div className="mb-1"><AuthorChip login={c.author} prAuthor={actions.prAuthor} when={c.createdAt} /></div> : <div className="mb-1 text-muted-foreground">{timeAgo(c.createdAt)}</div>}
-            <CommentBody body={c.body} />
+            <CommentBody body={c.body} simpleKey={`t:${c.id}`} />
           </div>
         ))}
       </div>
@@ -727,6 +904,24 @@ function toSelectionRef(selection: Selection): SelectionRef {
   };
 }
 
+const ROLE_STYLE: Record<GuideRole, string> = {
+  core: "border-primary/50 text-primary",
+  types: "border-foreground/40 text-foreground",
+  wiring: "border-border text-muted-foreground",
+  tests: "border-amber-500/50 text-amber-800 dark:text-amber-200",
+  docs: "border-border text-muted-foreground",
+  config: "border-border text-muted-foreground",
+  generated: "border-border text-muted-foreground",
+  moved: "border-border text-muted-foreground",
+};
+/** The guide's role for a file: core, types, wiring, tests, docs, config, generated, moved. */
+function RoleChip({ role }: { role: GuideRole }) {
+  return <span className={cn("shrink-0 rounded-full border px-1.5 text-[10px] uppercase", ROLE_STYLE[role])}>{role}</span>;
+}
+function SkimChip() {
+  return <span className="shrink-0 rounded-full border border-dashed border-border px-1.5 text-[10px] text-muted-foreground" title="Mechanical change: rename, imports, lockfile, formatting">skim</span>;
+}
+
 /** Where a file card's diff comes from: the PR (base..head) or an arbitrary commit range. */
 type DiffSource = { kind: "pr" } | { kind: "range"; base: string; head: string };
 
@@ -735,6 +930,8 @@ interface FileCardProps {
   file: FileEntry;
   /** Commit view: no GitHub threads, notes, viewed marks, or comment composer. */
   source?: DiffSource;
+  /** The guide's line for this file, shown under the path. */
+  guide?: GuideFile | null;
   threads: GhThread[];
   pending: PendingComment[];
   notes: Note[];
@@ -830,34 +1027,43 @@ function FileCard(props: FileCardProps) {
 
   return (
     <div ref={ref} id={fileAnchorId(file.path)} className="scroll-mt-3 rounded-lg border border-border bg-card">
-      <div className="sticky top-0 z-10 flex items-center gap-2 rounded-t-lg border-b border-border bg-card/95 px-3 py-2 text-xs backdrop-blur">
-        <button type="button" onClick={onToggle} className="text-muted-foreground hover:text-foreground" aria-expanded={expanded} aria-label={expanded ? "Collapse file" : "Expand file"}>
-          <Icon name={expanded ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
-        </button>
-        <span className="min-w-0 flex-1 truncate">
-          <span className="font-medium text-foreground">{name}</span>
-          {dir ? <span className="ml-2 text-muted-foreground">{dir}</span> : null}
-          {file.oldPath && file.oldPath !== file.path ? <span className="ml-2 text-muted-foreground">renamed from {file.oldPath}</span> : null}
-        </span>
-        {file.unresolvedCount > 0 ? <span className="inline-flex items-center gap-1 text-muted-foreground" title={`${file.unresolvedCount} open GitHub thread${file.unresolvedCount === 1 ? "" : "s"}`}><Icon name="Github" className="size-3" />{file.unresolvedCount}</span> : null}
-        {file.pendingCount > 0 ? <span className="rounded-full border border-dashed border-foreground/40 px-1.5 text-[10px]">{file.pendingCount} pending</span> : null}
-        {props.notes.filter((n) => n.state === "open" || n.state === "stale").length > 0 ? <span className="rounded-full border border-dashed border-amber-500/60 bg-amber-500/10 px-1.5 text-[10px] text-amber-800 dark:text-amber-200">{props.notes.filter((n) => n.state === "open" || n.state === "stale").length} notes</span> : null}
-        <span className="font-mono"><span className="text-primary">+{file.additions}</span> <span className="ml-1 text-destructive">-{file.deletions}</span></span>
-        {inCommit ? null : (
-          <Button variant="ghost" size="sm" className={cn("h-6 px-2 text-xs", file.viewed && "text-primary")} onClick={() => props.onViewed(!file.viewed)}>
-            {file.viewed ? <><Icon name="Check" className="size-3" />Viewed</> : "Mark as viewed"}
-          </Button>
-        )}
-        <span className="relative">
-          <Button variant="ghost" size="sm" className="h-6 w-6 px-0" onClick={() => setMenu((m) => !m)} aria-label="File actions" aria-expanded={menu}><Icon name="MoreHorizontal" className="size-3.5" /></Button>
-          {menu ? (
-            <div className="absolute right-0 top-full z-20 mt-1 w-52 rounded-md border border-border bg-card p-1 text-xs shadow-md">
-              <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => { setMenu(false); props.onSummarize(); }}><Icon name="Brain" className="size-3.5" />Summarize in chat</button>
-              <FileLink target={{ kind: "host", hostId: review.hostId, path: `${review.worktree}/${file.path}` }} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => setMenu(false)}><Icon name="ExternalLink" className="size-3.5" />Open file at head</FileLink>
-              <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => { void navigator.clipboard?.writeText(file.path); setMenu(false); toast.success("Path copied"); }}><Icon name="Copy" className="size-3.5" />Copy path</button>
-            </div>
-          ) : null}
-        </span>
+      <div className="sticky top-0 z-10 rounded-t-lg border-b border-border bg-card/95 px-3 py-2 text-xs backdrop-blur">
+        <div className="flex items-center gap-2">
+          <button type="button" onClick={onToggle} className="text-muted-foreground hover:text-foreground" aria-expanded={expanded} aria-label={expanded ? "Collapse file" : "Expand file"}>
+            <Icon name={expanded ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
+          </button>
+          <span className="min-w-0 flex-1 truncate">
+            <span className="font-medium text-foreground">{name}</span>
+            {dir ? <span className="ml-2 text-muted-foreground">{dir}</span> : null}
+            {file.oldPath && file.oldPath !== file.path ? <span className="ml-2 text-muted-foreground">renamed from {file.oldPath}</span> : null}
+          </span>
+          {file.unresolvedCount > 0 ? <span className="inline-flex items-center gap-1 text-muted-foreground" title={`${file.unresolvedCount} open GitHub thread${file.unresolvedCount === 1 ? "" : "s"}`}><Icon name="Github" className="size-3" />{file.unresolvedCount}</span> : null}
+          {file.pendingCount > 0 ? <span className="rounded-full border border-dashed border-foreground/40 px-1.5 text-[10px]">{file.pendingCount} pending</span> : null}
+          {props.notes.filter((n) => n.state === "open" || n.state === "stale").length > 0 ? <span className="rounded-full border border-dashed border-amber-500/60 bg-amber-500/10 px-1.5 text-[10px] text-amber-800 dark:text-amber-200">{props.notes.filter((n) => n.state === "open" || n.state === "stale").length} notes</span> : null}
+          <span className="font-mono"><span className="text-primary">+{file.additions}</span> <span className="ml-1 text-destructive">-{file.deletions}</span></span>
+          {inCommit ? null : (
+            <Button variant="ghost" size="sm" className={cn("h-6 px-2 text-xs", file.viewed && "text-primary")} onClick={() => props.onViewed(!file.viewed)}>
+              {file.viewed ? <><Icon name="Check" className="size-3" />Viewed</> : "Mark as viewed"}
+            </Button>
+          )}
+          <span className="relative">
+            <Button variant="ghost" size="sm" className="h-6 w-6 px-0" onClick={() => setMenu((m) => !m)} aria-label="File actions" aria-expanded={menu}><Icon name="MoreHorizontal" className="size-3.5" /></Button>
+            {menu ? (
+              <div className="absolute right-0 top-full z-20 mt-1 w-52 rounded-md border border-border bg-card p-1 text-xs shadow-md">
+                <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => { setMenu(false); props.onSummarize(); }}><Icon name="Brain" className="size-3.5" />Summarize in chat</button>
+                <FileLink target={{ kind: "host", hostId: review.hostId, path: `${review.worktree}/${file.path}` }} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => setMenu(false)}><Icon name="ExternalLink" className="size-3.5" />Open file at head</FileLink>
+                <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-state-hover" onClick={() => { void navigator.clipboard?.writeText(file.path); setMenu(false); toast.success("Path copied"); }}><Icon name="Copy" className="size-3.5" />Copy path</button>
+              </div>
+            ) : null}
+          </span>
+        </div>
+        {props.guide ? (
+          <div className="mt-1 flex min-w-0 items-center gap-1.5 pl-[22px] text-[11px] text-muted-foreground">
+            <RoleChip role={props.guide.role} />
+            {props.guide.skim ? <SkimChip /> : null}
+            <span className="min-w-0 truncate" title={props.guide.what}>{props.guide.what}</span>
+          </div>
+        ) : null}
       </div>
 
       {selected ? (
@@ -1005,8 +1211,8 @@ function Discussion({ reviewId, threads }: { reviewId: string; threads: GhThread
   const open = threads.filter((t) => !t.isResolved);
   if (conversation === null) return <p className="text-sm text-muted-foreground">Loading…</p>;
   const items = [
-    ...conversation.reviews.map((r) => ({ key: `r-${r.id}`, author: r.author, when: r.submittedAt, body: r.body, badge: r.state, url: r.url })),
-    ...conversation.comments.map((c) => ({ key: `c-${c.id}`, author: c.author, when: c.createdAt, body: c.body, badge: null as string | null, url: c.url })),
+    ...conversation.reviews.map((r) => ({ key: `r:${r.id}`, author: r.author, when: r.submittedAt, body: r.body, badge: r.state, url: r.url })),
+    ...conversation.comments.map((c) => ({ key: `c:${c.id}`, author: c.author, when: c.createdAt, body: c.body, badge: null as string | null, url: c.url })),
   ].sort((a, b) => Date.parse(a.when ?? "") - Date.parse(b.when ?? ""));
   return (
     <div className="space-y-4 text-sm">
@@ -1037,7 +1243,7 @@ function Discussion({ reviewId, threads }: { reviewId: string; threads: GhThread
               {item.when ? <span>{timeAgo(item.when)}</span> : null}
               <UrlLink href={item.url} className="ml-auto hover:text-foreground" title="Open on GitHub"><Icon name="ExternalLink" className="size-3.5" /></UrlLink>
             </div>
-            {item.body.trim() === "" ? <span className="text-xs text-muted-foreground">No text.</span> : <Markdown content={item.body} />}
+            {item.body.trim() === "" ? <span className="text-xs text-muted-foreground">No text.</span> : <CommentBody body={item.body} simpleKey={item.key} />}
           </li>
         ))}
       </ul>
@@ -1451,6 +1657,9 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
   const [roomText, setRoomText] = useState<string | null>(null);
   const [noteFilter, setNoteFilter] = useState<{ kinds: Set<NoteKind>; showDismissed: boolean }>({ kinds: new Set<NoteKind>(["slop", "cleanup", "risk", "question"]), showDismissed: false });
   const [notesMenu, setNotesMenu] = useState(false);
+  const { state: guideState, guide, busy: guideBusy } = useGuide(reviewId);
+  const [order, setOrder] = useFileOrder();
+  const guideByPath = useMemo(() => new Map((guide?.files ?? []).map((f) => [f.path, f])), [guide]);
 
   const setSelection = useCallback((next: Selection | null) => {
     setSelectionState(next);
@@ -1525,6 +1734,17 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
     settle();
   }, [setSelection]);
 
+  // Jumps asked for from the Codemap tab land here while the PR diff is on screen.
+  useEffect(() => {
+    if (commit !== null) return;
+    const onJump = (e: Event) => {
+      const d = (e as CustomEvent<JumpRequest>).detail;
+      if (d.reviewId === reviewId) jumpToLine(d.path, d.line, "new");
+    };
+    window.addEventListener(JUMP_EVENT, onJump);
+    return () => window.removeEventListener(JUMP_EVENT, onJump);
+  }, [reviewId, commit, jumpToLine]);
+
   // `a` with lines selected drops them into the chat; ignored while typing.
   // In a commit view the pill points at the lines as they were at that commit.
   const commitHead = useRef<string | null>(null);
@@ -1570,6 +1790,7 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
         <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => void run("sync", async () => { await rpc.call("reviews_sync", { reviewId }); refetch(); toast.success("Synced with GitHub"); })} disabled={busy !== null} title="Refresh PR metadata, head, and threads">
           <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", busy === "sync" && "animate-spin")} />Sync
         </Button>
+        <SimpleToggle />
         <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: CODEMAP_TAB, target: { reviewId } })}><Icon name="Layers" className="size-3.5" />Codemap</Button>
         <Button variant="outline" size="sm" className="h-7 text-xs" onClick={openChat}><Icon name="Brain" className="size-3.5" />Chat</Button>
         <Button size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: INFO_TAB, target: { reviewId } })}>
@@ -1649,6 +1870,62 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
     }
   };
   const shown = filter.trim() === "" ? files : files.filter((f) => f.path.toLowerCase().includes(filter.trim().toLowerCase()));
+  // Guide order: the file cards follow the guide's steps, with a header per
+  // step. Files the guide does not know (pushed since it was written) close the
+  // list. A path filter shows a flat list.
+  const groups: { title: string; why: string; files: FileEntry[] }[] | null = (() => {
+    if (order !== "guide" || guide === null || filter.trim() !== "") return null;
+    const byPath = new Map(files.map((f) => [f.path, f]));
+    const placed = new Set<string>();
+    const out: { title: string; why: string; files: FileEntry[] }[] = [];
+    for (const step of guide.steps) {
+      const list: FileEntry[] = [];
+      for (const p of step.paths) {
+        const f = byPath.get(p);
+        if (f === undefined || placed.has(p)) continue;
+        placed.add(p);
+        list.push(f);
+      }
+      if (list.length > 0) out.push({ title: step.title, why: step.why, files: list });
+    }
+    const rest = files.filter((f) => !placed.has(f.path));
+    if (rest.length > 0) out.push({ title: "Not in the guide", why: "Changed since the guide was written, or left out of it.", files: rest });
+    return out;
+  })();
+  const sequence = groups === null ? shown : groups.flatMap((g) => g.files);
+  const renderCard = (f: FileEntry) => {
+    const index = sequence.indexOf(f);
+    const expanded = isExpanded(f, index);
+    return (
+      <FileCard
+        key={f.path}
+        review={review}
+        file={f}
+        guide={guideByPath.get(f.path) ?? null}
+        threads={threadsByPath.get(f.path) ?? []}
+        pending={pendingByPath.get(f.path) ?? []}
+        notes={notesByPath.get(f.path) ?? []}
+        composer={composer?.path === f.path ? composer : null}
+        selection={selection}
+        onSelect={setSelection}
+        onOpenComposer={(path, range) => {
+          const start = Math.min(range.start, range.end);
+          const end = Math.max(range.start, range.end);
+          setComposer({ kind: "composer", path, line: end, startLine: start !== end ? start : null, side: (range.side ?? "additions") === "deletions" ? "LEFT" : "RIGHT", initial: "" });
+        }}
+        expanded={expanded}
+        onToggle={() => toggle(f.path, expanded)}
+        onViewed={(viewed) => void run("viewed", async () => { await rpc.call("viewed_set", { reviewId, path: f.path, viewed }); refetch(); })}
+        diffStyle={diffStyle}
+        theme={theme}
+        actions={actions}
+        rpc={rpc}
+        onAttach={(sel) => attachToChat(selectionPill(reviewId, sel))}
+        onSummarize={() => attachToChat(pill({ kind: "file", reviewId, path: f.path }), "Summarize these changes and why they matter for this PR.")}
+        onCouncil={(text) => setRoomText(text)}
+      />
+    );
+  };
   const openThreads = threads.filter((t) => !t.isResolved).length;
   const repoUrl = review.url.replace(/\/pull\/\d+$/, "");
 
@@ -1722,6 +1999,18 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
                   </div>
                 ) : null}
               </span>
+              {order === "guide" && guide === null ? (
+                <span className="inline-flex items-center gap-1 text-xs text-muted-foreground" title="Guide order applies once the helper has written the guide; see the Codemap tab">
+                  {guideBusy ? <Icon name="Loading" className="size-3 animate-spin" /> : null}
+                  {guideBusy ? "guide writing…" : guideState?.status === "failed" ? "guide failed" : "no guide yet"}
+                </span>
+              ) : order === "guide" && guideState?.stale ? (
+                <span className="rounded-full border border-border px-1.5 text-[10px] text-muted-foreground" title="The head moved since the guide was written">guide stale</span>
+              ) : null}
+              <select value={order} onChange={(e) => setOrder(e.target.value as FileOrder)} className="h-7 rounded-md border border-input bg-background px-1.5 text-xs" aria-label="File order" title="Order the files as the guide reads them, or by path">
+                <option value="guide">Guide order</option>
+                <option value="path">Path order</option>
+              </select>
               <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Find a file…" className="h-7 w-44 text-xs" aria-label="Filter files" />
               <select value={diffStyle} onChange={(e) => setDiffStyle(e.target.value as "unified" | "split")} className="h-7 rounded-md border border-input bg-background px-1.5 text-xs" aria-label="Diff style">
                 <option value="unified">Unified</option>
@@ -1732,39 +2021,22 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
           </div>
 
           <div className="mt-3 flex flex-col gap-3">
-            {shown.length === 0 ? <EmptyState>No files match.</EmptyState> : null}
-            {shown.map((f) => {
-              const index = files.indexOf(f);
-              const expanded = isExpanded(f, index);
-              return (
-                <FileCard
-                  key={f.path}
-                  review={review}
-                  file={f}
-                  threads={threadsByPath.get(f.path) ?? []}
-                  pending={pendingByPath.get(f.path) ?? []}
-                  notes={notesByPath.get(f.path) ?? []}
-                  composer={composer?.path === f.path ? composer : null}
-                  selection={selection}
-                  onSelect={setSelection}
-                  onOpenComposer={(path, range) => {
-                    const start = Math.min(range.start, range.end);
-                    const end = Math.max(range.start, range.end);
-                    setComposer({ kind: "composer", path, line: end, startLine: start !== end ? start : null, side: (range.side ?? "additions") === "deletions" ? "LEFT" : "RIGHT", initial: "" });
-                  }}
-                  expanded={expanded}
-                  onToggle={() => toggle(f.path, expanded)}
-                  onViewed={(viewed) => void run("viewed", async () => { await rpc.call("viewed_set", { reviewId, path: f.path, viewed }); refetch(); })}
-                  diffStyle={diffStyle}
-                  theme={theme}
-                  actions={actions}
-                  rpc={rpc}
-                  onAttach={(sel) => attachToChat(selectionPill(reviewId, sel))}
-                  onSummarize={() => attachToChat(pill({ kind: "file", reviewId, path: f.path }), "Summarize these changes and why they matter for this PR.")}
-                  onCouncil={(text) => setRoomText(text)}
-                />
-              );
-            })}
+            {sequence.length === 0 ? <EmptyState>No files match.</EmptyState> : null}
+            {groups === null
+              ? shown.map(renderCard)
+              : groups.map((g, gi) => (
+                  <div key={`${gi}:${g.title}`} className={cn("flex flex-col gap-3", gi > 0 && "mt-4")}>
+                    <div className="flex flex-col gap-0.5">
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-xs text-muted-foreground">{gi + 1}.</span>
+                        <span className="text-sm font-semibold">{g.title}</span>
+                        <span className="text-xs text-muted-foreground">{g.files.length} file{g.files.length === 1 ? "" : "s"}</span>
+                      </div>
+                      {g.why ? <p className="pl-5 text-xs text-muted-foreground">{g.why}</p> : null}
+                    </div>
+                    {g.files.map(renderCard)}
+                  </div>
+                ))}
           </div>
         </div>
       </div>
@@ -2041,45 +2313,136 @@ function PillBanner() {
   );
 }
 
+/**
+ * The Codemap tab: the guide first (what is going on, how it runs, the reading
+ * order with one line per file), then the deterministic layer (hotspots and
+ * changed symbols). Until the guide is written, the module order from the
+ * codemap stands in for the reading order.
+ */
 function CodemapTab() {
   const target = useFixedTabTarget(CODEMAP_TAB);
   const reviewId = target?.target.reviewId ?? null;
   const { state, error, refresh } = useCodemap(reviewId, reviewId !== null);
+  const { state: gs, guide, busy: guideBusy, error: guideError, rewrite } = useGuide(reviewId);
+  const [order, setOrder] = useFileOrder();
   const [filter, setFilter] = useState("");
   if (reviewId === null) return <div className="p-4"><EmptyState>Open a review and press Codemap to see its structure here.</EmptyState></div>;
   if (error) return <p className="p-3 text-xs text-destructive">{error}</p>;
-  if (state === null || state.status === "building" || state.status === "missing") return <p className="inline-flex items-center gap-1.5 p-3 text-xs text-muted-foreground"><Icon name="Loading" className="size-3.5 animate-spin" />Building the codemap: parsing changed files and counting references…</p>;
-  if (state.status === "failed" || state.codemap === null) return <div className="space-y-2 p-3 text-xs"><p className="text-destructive">{state.error ?? "Codemap failed."}</p><Button size="sm" variant="outline" onClick={refresh}>Retry</Button></div>;
-  const c: Codemap = state.codemap;
-  const files = c.files.filter((f) => f.symbols.some((s) => s.status !== "unchanged")).filter((f) => filter === "" || f.path.toLowerCase().includes(filter.toLowerCase()));
+  const c: Codemap | null = state?.status === "ready" ? state.codemap : null;
+  const building = state === null || state.status === "building" || state.status === "missing";
+  const jump = (path: string, line: number | null = null) => requestJump(reviewId, path, line);
+  const fileOf = new Map((guide?.files ?? []).map((f) => [f.path, f]));
+  const files = (c?.files ?? []).filter((f) => f.symbols.some((s) => s.status !== "unchanged")).filter((f) => filter === "" || f.path.toLowerCase().includes(filter.toLowerCase()));
+  const pathLine = (p: string) => {
+    const { name, dir } = splitPath(p);
+    return <><span className="min-w-0 truncate font-mono text-[11px] text-foreground">{name}</span>{dir ? <span className="min-w-0 truncate text-[10px] text-muted-foreground">{dir}</span> : null}</>;
+  };
   return (
     <div className="flex h-full min-h-0 flex-col text-xs">
       <div className="flex flex-wrap items-center gap-2 border-b border-border p-3">
         <span className="text-sm font-semibold">Codemap</span>
-        <span className="text-muted-foreground">{c.stats.symbols} symbols · +{c.stats.added} ~{c.stats.modified} -{c.stats.removed} · {c.edges.length} references</span>
-        <Button variant="ghost" size="sm" className="ml-auto h-7 px-1.5" onClick={refresh} aria-label="Rebuild codemap"><Icon name="ArrowReloadHorizontal" className="size-3.5" /></Button>
+        {c ? (
+          <span className="text-muted-foreground">{c.stats.files} files · {c.stats.symbols} symbols · +{c.stats.added} ~{c.stats.modified} -{c.stats.removed} · {c.edges.length} references</span>
+        ) : building ? (
+          <span className="inline-flex items-center gap-1.5 text-muted-foreground"><Icon name="Loading" className="size-3.5 animate-spin" />parsing changed files and counting references…</span>
+        ) : (
+          <span className="text-destructive">{state?.error ?? "Codemap failed."}</span>
+        )}
+        <Button variant="ghost" size="sm" className="ml-auto h-7 px-1.5" onClick={refresh} aria-label="Rebuild codemap" title="Rebuild the codemap"><Icon name="ArrowReloadHorizontal" className="size-3.5" /></Button>
       </div>
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium">Guide</span>
+          <span className="text-muted-foreground">written from the diff by the helper</span>
+          {gs?.stale ? <span className="rounded-full border border-border px-1.5 text-[10px] text-muted-foreground" title="The head moved since this was written">stale</span> : null}
+          {guideBusy ? <span className="inline-flex items-center gap-1 text-muted-foreground"><Icon name="Loading" className="size-3 animate-spin" />{gs?.status === "queued" ? "queued" : "writing"}</span> : null}
+          <Button variant="ghost" size="sm" className="ml-auto h-6 px-1.5 text-xs" onClick={rewrite} disabled={guideBusy} title="Write the guide again at the current head">
+            <Icon name={guideBusy ? "Loading" : "ArrowReloadHorizontal"} className={cn("size-3.5", guideBusy && "animate-spin")} />{guide ? "Rewrite" : "Write"}
+          </Button>
+        </div>
+        {guideError ? <p className="text-destructive">{guideError}</p> : null}
+        {gs?.status === "failed" ? <p className="text-destructive">{gs.error ?? "The guide failed."}</p> : null}
+        {guide === null && guideBusy ? <p className="text-muted-foreground">The helper is reading the diff. A minute for small PRs, several for large ones. The module order below stands in meanwhile.</p> : null}
+        {guide === null && !guideBusy && gs?.status !== "failed" ? <p className="text-muted-foreground">Press Write for what is going on, how the changed code runs, a reading order, and one line per file.</p> : null}
+
+        {guide !== null && guide.overview !== "" ? (
+          <section className="space-y-1.5">
+            <div className="font-medium">What is going on</div>
+            <div className={cn(PROSE, "text-xs")}><Markdown content={guide.overview} /></div>
+          </section>
+        ) : null}
+
+        {guide !== null && guide.flow.length > 0 ? (
+          <section className="space-y-1.5">
+            <div className="font-medium">How it runs</div>
+            <ol className="ml-2 space-y-2 border-l border-border pl-4">
+              {guide.flow.map((h, i) => (
+                <li key={`${i}:${h.symbol}`} className="relative">
+                  <span className="absolute -left-[23px] top-0.5 flex size-3.5 items-center justify-center rounded-full border border-border bg-card text-[8px] text-muted-foreground">{i + 1}</span>
+                  <button type="button" onClick={() => jump(h.path, h.line)} className="block max-w-full truncate text-left font-mono hover:underline" title={`${h.path}${h.line !== null ? `:${h.line}` : ""}`}>{h.symbol}</button>
+                  <div className="truncate font-mono text-[10px] text-muted-foreground">{splitPath(h.path).name}{h.line !== null ? `:${h.line}` : ""}</div>
+                  {h.what ? <div className="text-[11px] text-muted-foreground">{h.what}</div> : null}
+                </li>
+              ))}
+            </ol>
+          </section>
+        ) : null}
+
         <section className="space-y-1.5">
-          <div className="font-medium">Reading order</div>
-          <ol className="space-y-1.5">
-            {c.readingOrder.map((m, i) => (
-              <li key={m.module} className="rounded-md border border-border p-2">
-                <div className="flex items-center gap-1.5"><span className="text-muted-foreground">{i + 1}.</span><span className="font-mono font-medium">{m.module}</span><span className="ml-auto text-muted-foreground">{m.paths.length} files</span></div>
-                <div className="text-[11px] text-muted-foreground">{m.reason}</div>
-                <ul className="mt-1 space-y-0.5">
-                  {m.paths.map((p) => <li key={p}><button type="button" onClick={() => scrollToFile(p)} className="w-full truncate text-left font-mono text-[11px] hover:underline" title={p}>{p.split("/").slice(2).join("/") || p}</button></li>)}
-                </ul>
-              </li>
-            ))}
-          </ol>
+          <div className="flex items-center gap-2">
+            <span className="font-medium">Reading order</span>
+            {guide !== null ? (
+              order === "guide" ? <span className="text-muted-foreground">Changes follow this order</span> : <button type="button" className="text-muted-foreground hover:underline" onClick={() => setOrder("guide")}>Order Changes this way</button>
+            ) : c !== null ? (
+              <span className="text-muted-foreground">from references between modules</span>
+            ) : null}
+          </div>
+          {guide !== null ? (
+            <ol className="space-y-1.5">
+              {guide.steps.map((s, i) => (
+                <li key={`${i}:${s.title}`} className="rounded-md border border-border p-2">
+                  <div className="flex items-baseline gap-1.5"><span className="text-muted-foreground">{i + 1}.</span><span className="font-medium">{s.title}</span><span className="ml-auto shrink-0 text-muted-foreground">{s.paths.length} file{s.paths.length === 1 ? "" : "s"}</span></div>
+                  {s.why ? <div className="text-[11px] text-muted-foreground">{s.why}</div> : null}
+                  <ul className="mt-1.5 space-y-1">
+                    {s.paths.map((p) => {
+                      const f = fileOf.get(p);
+                      return (
+                        <li key={p} className="min-w-0">
+                          <button type="button" onClick={() => jump(p)} className="flex w-full items-center gap-1.5 text-left hover:underline" title={p}>
+                            {f ? <RoleChip role={f.role} /> : null}
+                            {pathLine(p)}
+                            {f?.skim ? <span className="ml-auto"><SkimChip /></span> : null}
+                          </button>
+                          {f?.what ? <div className="text-[11px] text-muted-foreground">{f.what}</div> : null}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </li>
+              ))}
+            </ol>
+          ) : c !== null ? (
+            <ol className="space-y-1.5">
+              {c.readingOrder.map((m, i) => (
+                <li key={m.module} className="rounded-md border border-border p-2">
+                  <div className="flex items-center gap-1.5"><span className="text-muted-foreground">{i + 1}.</span><span className="min-w-0 truncate font-mono font-medium">{m.module}</span><span className="ml-auto shrink-0 text-muted-foreground">{m.paths.length} file{m.paths.length === 1 ? "" : "s"}</span></div>
+                  <div className="text-[11px] text-muted-foreground">{m.reason}</div>
+                  <ul className="mt-1 space-y-0.5">
+                    {m.paths.map((p) => <li key={p}><button type="button" onClick={() => jump(p)} className="flex w-full items-center gap-1.5 text-left hover:underline" title={p}>{pathLine(p)}</button></li>)}
+                  </ul>
+                </li>
+              ))}
+            </ol>
+          ) : null}
         </section>
+
+        {c !== null ? (
         <section className="space-y-1.5">
-          <div className="font-medium">Hotspots</div>
+          <div className="flex items-baseline gap-2"><span className="font-medium">Hotspots</span><span className="text-muted-foreground">changed lines weighted by fan-in; tests count a quarter</span></div>
           <ul className="space-y-0.5">
             {c.hotspots.slice(0, 12).map((h) => (
               <li key={`${h.path}#${h.qualified}`}>
-                <button type="button" onClick={() => scrollToFile(h.path)} className="flex w-full items-center gap-2 text-left hover:underline" title={`${h.path} · ${h.changedLines} changed lines · fan-in ${h.fanIn}`}>
+                <button type="button" onClick={() => jump(h.path)} className="flex w-full items-center gap-2 text-left hover:underline" title={`${h.path} · ${h.changedLines} changed lines · fan-in ${h.fanIn}`}>
                   <span className="w-10 shrink-0 text-right font-mono text-muted-foreground">{Math.round(h.score)}</span>
                   <span className="min-w-0 flex-1 truncate font-mono">{h.qualified}</span>
                 </button>
@@ -2087,11 +2450,13 @@ function CodemapTab() {
             ))}
           </ul>
         </section>
+        ) : null}
+        {c !== null ? (
         <section className="space-y-1.5">
           <div className="flex items-center gap-2"><span className="font-medium">Changed symbols</span><Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter files…" className="ml-auto h-7 w-40 text-xs" /></div>
           {files.map((f) => (
             <div key={f.path} className="rounded-md border border-border bg-card">
-              <button type="button" onClick={() => scrollToFile(f.path)} className="flex w-full items-center gap-2 border-b border-border/60 px-2 py-1.5 text-left font-mono hover:underline">
+              <button type="button" onClick={() => jump(f.path)} className="flex w-full items-center gap-2 border-b border-border/60 px-2 py-1.5 text-left font-mono hover:underline">
                 <span className="min-w-0 flex-1 truncate">{f.path}</span>
                 <span className="text-muted-foreground">{f.changedLines} lines</span>
               </button>
@@ -2108,6 +2473,8 @@ function CodemapTab() {
             </div>
           ))}
         </section>
+        ) : null}
+        {state?.status === "failed" ? <Button size="sm" variant="outline" onClick={refresh}>Retry the codemap</Button> : null}
       </div>
     </div>
   );
@@ -2127,7 +2494,7 @@ function ReviewsPage({ subPath }: { subPath: string }) {
   const [head, section, target] = subPath.split("/");
   const reviewId = head !== "" ? head : null;
   const commit = section === "commits" && target !== undefined ? parseCommitTarget(target) : null;
-  if (reviewId !== null) return <ReviewView key={reviewId} reviewId={reviewId} commit={commit} />;
+  if (reviewId !== null) return <SimpleProvider key={reviewId} reviewId={reviewId}><ReviewView reviewId={reviewId} commit={commit} /></SimpleProvider>;
   const open = async (e: FormEvent) => {
     e.preventDefault();
     if (ref.trim() === "") return;
