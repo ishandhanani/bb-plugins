@@ -137,7 +137,7 @@ export const codemapSchema = z.object({
 export type Codemap = z.infer<typeof codemapSchema>;
 
 export const hostContract = defineRpcContract({
-  /** Fetch the PR head and base, and keep a detached worktree at the head. */
+  /** Fetch the PR head and base, and keep a detached worktree at the head. `fetch: false` skips the network and only keeps the worktree in place. */
   repo_prepare: {
     input: z.object({
       repoPath: z.string(),
@@ -146,6 +146,7 @@ export const hostContract = defineRpcContract({
       baseRefName: z.string(),
       worktreesDir: z.string(),
       key: z.string(),
+      fetch: z.boolean().optional(),
     }),
     output: z.object({ worktree: z.string(), headSha: z.string(), baseSha: z.string() }),
   },

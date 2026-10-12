@@ -17,6 +17,7 @@ import { MENTION_PROVIDER_ID, decodeMentionRef, encodeMentionRef, mentionLabel, 
 import { computeSlop, type SlopReport } from "./slop";
 import { BRIEF_FENCE, type Brief, type BriefEvidence } from "./brief-spec";
 import { GUIDE_FENCE, GUIDE_ROLES, type Guide, type GuideFile, type GuideHop, type GuideRole, type GuideStep } from "./guide-spec";
+import { BOARD_STAGES, BOARD_STAGE_LABEL, isBoardStage, type BoardStage } from "./board-spec";
 import {
   CODEMAP_VERSION,
   changedFileSchema,
@@ -75,6 +76,9 @@ const reviewSchema = z.object({
 });
 export type Review = z.infer<typeof reviewSchema>;
 
+const boardStageSchema = z.enum(BOARD_STAGES);
+
+/** One card on the board: the PR's state plus the few numbers that say what is in its way. */
 const reviewSummarySchema = z.object({
   id: z.string(),
   owner: z.string(),
@@ -85,6 +89,28 @@ const reviewSummarySchema = z.object({
   headSha: z.string(),
   pendingCount: z.number(),
   updatedAt: z.number(),
+  url: z.string(),
+  isDraft: z.boolean(),
+  author: z.string().nullable(),
+  headRefName: z.string(),
+  reviewDecision: z.string().nullable(),
+  mergeable: z.string().nullable(),
+  additions: z.number(),
+  deletions: z.number(),
+  changedFiles: z.number(),
+  checks: z.object({ total: z.number(), passed: z.number(), failed: z.number(), pending: z.number() }),
+  approvals: z.number(),
+  changesRequested: z.number(),
+  unresolvedThreads: z.number(),
+  createdAt: z.string(),
+  ghUpdatedAt: z.string(),
+  syncedAt: z.number(),
+  /** The column the card is in. */
+  stage: boardStageSchema,
+  /** The column GitHub's state puts it in. */
+  autoStage: boardStageSchema,
+  /** You dragged the card; it holds its column until GitHub's state changes. */
+  pinned: z.boolean(),
 });
 export type ReviewSummary = z.infer<typeof reviewSummarySchema>;
 
@@ -236,6 +262,13 @@ export const rpcContract = defineRpcContract({
   },
   reviews_sync: { input: reviewIdSchema, output: z.object({ review: reviewSchema, headChanged: z.boolean() }) },
   reviews_remove: { input: reviewIdSchema, output: okSchema },
+  /** Drag a card to a column; null puts it back where GitHub's state says. A dragged card holds its column until that state changes. */
+  board_move: { input: z.object({ reviewId: z.string(), stage: boardStageSchema.nullable() }), output: z.object({ review: reviewSummarySchema }) },
+  /** Sync every PR that is not done with GitHub. A PR whose head moved gets the full sync; the others skip the git fetch. */
+  board_refresh: {
+    input: z.null(),
+    output: z.object({ reviews: z.array(reviewSummarySchema), synced: z.number(), failed: z.array(z.object({ reviewId: z.string(), error: z.string() })) }),
+  },
   review_patch: {
     input: z.object({ reviewId: z.string(), path: z.string() }),
     output: z.object({ patch: z.string(), file: changedFileSchema.nullable() }),
@@ -499,6 +532,8 @@ const MIGRATIONS = [
      error TEXT,
      updated_at INTEGER NOT NULL
    )`,
+  // The board: a card dragged to a column keeps it while GitHub's own state (auto_stage) is unchanged.
+  `CREATE TABLE IF NOT EXISTS board_stages (review_id TEXT PRIMARY KEY, stage TEXT NOT NULL, auto_stage TEXT NOT NULL, updated_at INTEGER NOT NULL)`,
 ];
 
 interface ReviewRow {
@@ -522,6 +557,7 @@ interface BriefRow {
   brief_status: string; brief_head_sha: string | null; brief_json: string | null; brief_raw: string | null; brief_error: string | null; updated_at: number;
 }
 interface GuideRow { review_id: string; head_sha: string; status: string; json: string | null; json_head_sha: string | null; raw: string | null; error: string | null; updated_at: number }
+interface BoardStageRow { review_id: string; stage: string; auto_stage: string; updated_at: number }
 
 function newId(): string {
   return randomBytes(6).toString("hex");
@@ -540,8 +576,16 @@ function createStore(db: Database.Database) {
       `UPDATE reviews SET title = ?, body = ?, state = ?, is_draft = ?, author = ?, base_ref = ?, head_ref = ?, head_sha = ?, base_sha = ?, additions = ?, deletions = ?, changed_files = ?, review_decision = ?, mergeable = ?, labels_json = ?, checks_json = ?, reviewers_json = ?, assignees_json = ?, commits_json = ?, gh_created_at = ?, worktree = ?, gh_updated_at = ?, synced_at = ?, updated_at = ? WHERE id = ?`,
     ),
     setEnvironment: db.prepare<[string, string]>(`UPDATE reviews SET environment_id = ? WHERE id = ?`),
+    /** Forget the environments bound to a review's worktree path (the review, its seats, helper, and simplifier). */
+    clearEnvironments: [
+      db.prepare<[string]>(`UPDATE reviews SET environment_id = NULL WHERE id = ?`),
+      db.prepare<[string]>(`UPDATE seats SET environment_id = NULL WHERE review_id = ?`),
+      db.prepare<[string]>(`UPDATE helpers SET environment_id = NULL WHERE review_id = ?`),
+      db.prepare<[string]>(`UPDATE simplifiers SET environment_id = NULL WHERE review_id = ?`),
+    ],
     touch: db.prepare<[number, string]>(`UPDATE reviews SET updated_at = ? WHERE id = ?`),
     deleteReview: db.prepare<[string]>(`DELETE FROM reviews WHERE id = ?`),
+    setWorktree: db.prepare<[string, string]>(`UPDATE reviews SET worktree = ? WHERE id = ?`),
     filesCache: db.prepare<[string], { head_sha: string; json: string }>(`SELECT head_sha, json FROM files_cache WHERE review_id = ?`),
     setFilesCache: db.prepare<[string, string, string]>(`INSERT INTO files_cache (review_id, head_sha, json) VALUES (?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, json = excluded.json`),
     viewed: db.prepare<[string], { path: string }>(`SELECT path FROM viewed WHERE review_id = ?`),
@@ -636,6 +680,11 @@ function createStore(db: Database.Database) {
     ),
     setGuideReady: db.prepare<[string, string | null, number, string]>(`UPDATE guides SET status = 'ready', json = ?, json_head_sha = head_sha, raw = ?, error = NULL, updated_at = ? WHERE review_id = ?`),
     setGuideFailed: db.prepare<[string, string | null, number, string]>(`UPDATE guides SET status = 'failed', error = ?, raw = ?, updated_at = ? WHERE review_id = ?`),
+    boardStage: db.prepare<[string], BoardStageRow>(`SELECT * FROM board_stages WHERE review_id = ?`),
+    setBoardStage: db.prepare<[string, string, string, number]>(
+      `INSERT INTO board_stages (review_id, stage, auto_stage, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET stage = excluded.stage, auto_stage = excluded.auto_stage, updated_at = excluded.updated_at`,
+    ),
+    deleteBoardStage: db.prepare<[string]>(`DELETE FROM board_stages WHERE review_id = ?`),
   };
   return { q };
 }
@@ -775,8 +824,10 @@ export default async function plugin(bb: BbPluginApi) {
     simpleEnglishProvider: { type: "string", label: "Provider id for the Simple English thread; empty uses defaultProvider", default: "" },
     simpleEnglishModel: { type: "string", label: "Model for the Simple English thread; empty uses helperModel, then the project's default", default: "" },
     simpleEnglishSkill: { type: "string", label: "Optional file appended to the rewrite prompt as vocabulary help (for example a simple-english SKILL.md); empty uses a short built-in word list", default: "" },
+    boardRefresh: { type: "string", label: "Cron (5 fields, server-local time) for syncing the board's open PRs with GitHub in the background; empty turns it off", default: "*/15 * * * *" },
+    worktreesDir: { type: "string", label: "Directory on the repository's machine for the PR worktrees; empty uses ~/.review-desk/worktrees. Keep it outside bb's data dir, or bb refuses to run the chat and helper threads there", default: "" },
   });
-  const { defaultProvider, hideSeatThreads, autoBrief, autoGuide, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill } = await settings.get();
+  const { defaultProvider, hideSeatThreads, autoBrief, autoGuide, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
 
   const db = bb.storage.database();
@@ -880,12 +931,21 @@ export default async function plugin(bb: BbPluginApi) {
 
   function applyPr(row: ReviewRow, pr: GhPr, prepared: { worktree: string; headSha: string; baseSha: string }): void {
     const now = Date.now();
+    // A worktree that moved (new worktreesDir, or the move out of bb's data dir)
+    // invalidates the environments bound to the old path; the next spawn makes new ones.
+    if (prepared.worktree !== row.worktree) for (const stmt of q.clearEnvironments) stmt.run(row.id);
     q.updateReviewMeta.run(
       pr.title, pr.body, pr.state, pr.isDraft ? 1 : 0, pr.author?.login ?? null, pr.baseRefName, pr.headRefName, prepared.headSha, prepared.baseSha,
       pr.additions, pr.deletions, pr.changedFiles, pr.reviewDecision, pr.mergeable, JSON.stringify(pr.labels), JSON.stringify(pr.checks),
       JSON.stringify(pr.reviewers), JSON.stringify(pr.assignees), JSON.stringify(pr.commits), pr.createdAt,
       prepared.worktree, pr.updatedAt, now, now, row.id,
     );
+    // A dragged card follows GitHub again once GitHub's state has moved on.
+    const pin = q.boardStage.get(row.id);
+    if (pin !== undefined && pin.auto_stage !== autoStage(requireReview(row.id))) {
+      q.deleteBoardStage.run(row.id);
+      publish(row.id, "board");
+    }
   }
 
   async function openReview(ref: string): Promise<Review> {
@@ -901,7 +961,7 @@ export default async function plugin(bb: BbPluginApi) {
     const key = `${parsed.owner}__${parsed.repo}__${parsed.number}`;
     const prepared = await host.call(
       "repo_prepare",
-      { repoPath: located.repoPath, number: parsed.number, headSha: pr.headRefOid, baseRefName: pr.baseRefName, worktreesDir: "", key },
+      { repoPath: located.repoPath, number: parsed.number, headSha: pr.headRefOid, baseRefName: pr.baseRefName, worktreesDir: worktreesDir.trim(), key },
       { hostId: located.hostId },
     );
     const id = newId();
@@ -922,7 +982,7 @@ export default async function plugin(bb: BbPluginApi) {
     const key = `${row.owner}__${row.repo}__${row.number}`;
     const prepared = await host.call(
       "repo_prepare",
-      { repoPath: row.repo_path, number: row.number, headSha: pr.headRefOid, baseRefName: pr.baseRefName, worktreesDir: "", key },
+      { repoPath: row.repo_path, number: row.number, headSha: pr.headRefOid, baseRefName: pr.baseRefName, worktreesDir: worktreesDir.trim(), key },
       hostOptions(row),
     );
     applyPr(row, pr, prepared);
@@ -979,6 +1039,162 @@ export default async function plugin(bb: BbPluginApi) {
   function cachedThreads(row: ReviewRow): GhThread[] {
     const cache = q.threadsCache.get(row.id);
     return cache === undefined ? [] : parseJson<GhThread[]>(cache.json, []);
+  }
+
+  // -- board -----------------------------------------------------------------
+
+  /**
+   * The column GitHub's state puts a PR in. `reviewDecision` is null on
+   * repositories without required reviews, so the latest review per reviewer
+   * decides when it is missing.
+   */
+  function autoStage(row: ReviewRow): BoardStage {
+    if (row.state !== "OPEN") return "done";
+    // gh reports a missing decision as "" on repositories without required reviews.
+    const decision = row.review_decision === "" ? null : row.review_decision;
+    const reviewers = parseJson<Review["reviewers"]>(row.reviewers_json, []);
+    if (decision === "CHANGES_REQUESTED" || reviewers.some((r) => r.state === "CHANGES_REQUESTED")) return "changes_requested";
+    if (decision === "APPROVED") return "approved";
+    // REVIEW_REQUIRED stays unreviewed even with approvals: a required reviewer is still missing.
+    if (decision === null && reviewers.some((r) => r.state === "APPROVED")) return "approved";
+    return "unreviewed";
+  }
+
+  const CHECK_OK = new Set(["success", "skipped", "neutral"]);
+  const CHECK_FAILED = new Set(["failure", "error", "timed_out", "cancelled", "action_required", "startup_failure"]);
+
+  /** A review as one card on the board. */
+  function summarize(row: ReviewRow): ReviewSummary {
+    const auto = autoStage(row);
+    const pin = q.boardStage.get(row.id);
+    const pinned = pin !== undefined && pin.auto_stage === auto && isBoardStage(pin.stage);
+    const checks = parseJson<Review["checks"]>(row.checks_json, []);
+    const reviewers = parseJson<Review["reviewers"]>(row.reviewers_json, []);
+    let passed = 0;
+    let failed = 0;
+    for (const c of checks) {
+      const verdict = (c.conclusion ?? "").toLowerCase();
+      if (CHECK_OK.has(verdict)) passed++;
+      else if (CHECK_FAILED.has(verdict)) failed++;
+    }
+    return {
+      id: row.id,
+      owner: row.owner,
+      repo: row.repo,
+      number: row.number,
+      title: row.title,
+      state: row.state,
+      headSha: row.head_sha,
+      pendingCount: q.pending.all(row.id).length,
+      updatedAt: row.updated_at,
+      url: row.url,
+      isDraft: row.is_draft === 1,
+      author: row.author,
+      headRefName: row.head_ref,
+      reviewDecision: row.review_decision,
+      mergeable: row.mergeable,
+      additions: row.additions,
+      deletions: row.deletions,
+      changedFiles: row.changed_files,
+      checks: { total: checks.length, passed, failed, pending: checks.length - passed - failed },
+      approvals: reviewers.filter((r) => r.state === "APPROVED").length,
+      changesRequested: reviewers.filter((r) => r.state === "CHANGES_REQUESTED").length,
+      unresolvedThreads: cachedThreads(row).filter((t) => !t.isResolved).length,
+      createdAt: row.gh_created_at,
+      ghUpdatedAt: row.gh_updated_at,
+      syncedAt: row.synced_at,
+      stage: pinned && isBoardStage(pin.stage) ? pin.stage : auto,
+      autoStage: auto,
+      pinned,
+    };
+  }
+
+  function boardCards(): ReviewSummary[] {
+    return q.reviews.all().map(summarize);
+  }
+
+  function moveCard(reviewId: string, stage: BoardStage | null): ReviewSummary {
+    const row = requireReview(reviewId);
+    if (stage === null || stage === autoStage(row)) q.deleteBoardStage.run(reviewId);
+    else q.setBoardStage.run(reviewId, stage, autoStage(row), Date.now());
+    publish(reviewId, "board");
+    return summarize(row);
+  }
+
+  /** Sync one PR with GitHub; the git fetch and file list only run when the head moved. */
+  async function lightSync(row: ReviewRow): Promise<void> {
+    const pr = await host.call("gh_pr", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
+    if (pr.headRefOid !== row.head_sha) {
+      await syncReview(row.id);
+      return;
+    }
+    // The head did not move, so no fetch; this still keeps the worktree where it belongs.
+    const prepared = await host.call(
+      "repo_prepare",
+      { repoPath: row.repo_path, number: row.number, headSha: row.head_sha, baseRefName: pr.baseRefName, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}`, fetch: false },
+      hostOptions(row),
+    );
+    applyPr(row, pr, prepared);
+    await refreshThreads(requireReview(row.id)).catch((cause: unknown) => bb.log.warn(`threads for ${row.id}: ${errorMessage(cause)}`));
+    publish(row.id, "synced");
+  }
+
+  /** Keep a PR's worktree where `worktreesDir` says, without GitHub or the network. */
+  async function ensureWorktree(row: ReviewRow): Promise<void> {
+    const prepared = await host.call(
+      "repo_prepare",
+      { repoPath: row.repo_path, number: row.number, headSha: row.head_sha, baseRefName: row.base_ref, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}`, fetch: false },
+      hostOptions(row),
+    );
+    if (prepared.worktree === row.worktree) return;
+    for (const stmt of q.clearEnvironments) stmt.run(row.id);
+    q.setWorktree.run(prepared.worktree, row.id);
+    publish(row.id, "synced");
+  }
+
+  type BoardRefreshResult = { synced: number; failed: { reviewId: string; error: string }[] };
+  let boardRefreshing: Promise<BoardRefreshResult> | null = null;
+  /** Sync every PR that is not done, four at a time; callers that overlap share one run. */
+  function refreshBoard(): Promise<BoardRefreshResult> {
+    if (boardRefreshing !== null) return boardRefreshing;
+    boardRefreshing = (async () => {
+      const rows = q.reviews.all();
+      const queue = rows.filter((r) => autoStage(r) !== "done");
+      const failed: BoardRefreshResult["failed"] = [];
+      let synced = 0;
+      // Done PRs are not synced, but their worktrees still follow the setting.
+      for (const row of rows.filter((r) => autoStage(r) === "done")) {
+        await ensureWorktree(row).catch((cause: unknown) => bb.log.warn(`worktree for ${row.owner}/${row.repo}#${row.number}: ${errorMessage(cause)}`));
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(4, queue.length) }, async () => {
+          for (let row = queue.shift(); row !== undefined; row = queue.shift()) {
+            try {
+              await lightSync(row);
+              synced++;
+            } catch (cause) {
+              failed.push({ reviewId: row.id, error: errorMessage(cause) });
+              bb.log.warn(`board refresh ${row.owner}/${row.repo}#${row.number}: ${errorMessage(cause)}`);
+            }
+          }
+        }),
+      );
+      return { synced, failed };
+    })().finally(() => {
+      boardRefreshing = null;
+    });
+    return boardRefreshing;
+  }
+
+  if (boardRefresh.trim() !== "") {
+    try {
+      bb.background.schedule("board-refresh", boardRefresh.trim(), async () => {
+        const result = await refreshBoard();
+        if (result.failed.length > 0) throw new Error(`${result.failed.length} of ${result.synced + result.failed.length} PRs failed to sync; first: ${result.failed[0].error}`);
+      });
+    } catch (cause) {
+      bb.log.warn(`board refresh schedule "${boardRefresh}" not registered: ${errorMessage(cause)}`);
+    }
   }
 
   // -- read model ------------------------------------------------------------
@@ -2558,19 +2774,12 @@ export default async function plugin(bb: BbPluginApi) {
   // -- RPC -------------------------------------------------------------------
 
   bb.rpc.register(rpcContract, {
-    reviews_list: () => ({
-      reviews: q.reviews.all().map((row) => ({
-        id: row.id,
-        owner: row.owner,
-        repo: row.repo,
-        number: row.number,
-        title: row.title,
-        state: row.state,
-        headSha: row.head_sha,
-        pendingCount: q.pending.all(row.id).length,
-        updatedAt: row.updated_at,
-      })),
-    }),
+    reviews_list: () => ({ reviews: boardCards() }),
+    board_move: ({ reviewId, stage }) => ({ review: moveCard(reviewId, stage) }),
+    board_refresh: async () => {
+      const result = await refreshBoard();
+      return { reviews: boardCards(), ...result };
+    },
     reviews_open: async ({ ref }) => ({ review: await openReview(ref) }),
     reviews_get: ({ reviewId }) => reviewDetail(reviewId),
     reviews_sync: ({ reviewId }) => syncReview(reviewId),
@@ -2578,6 +2787,7 @@ export default async function plugin(bb: BbPluginApi) {
       for (const seat of q.seats.all(reviewId)) await chatReset(reviewId, seat.provider_id);
       q.deleteSimplifier.run(reviewId);
       q.deleteSimple.run(reviewId);
+      q.deleteBoardStage.run(reviewId);
       q.deleteReview.run(reviewId);
       publish(reviewId, "removed");
       return { ok: true as const };
@@ -2801,6 +3011,9 @@ export default async function plugin(bb: BbPluginApi) {
     commands: [
       { name: "open", summary: "Open or refresh a PR review", usage: "bb review-desk open <url | owner/repo#N>" },
       { name: "list", summary: "List reviews", usage: "bb review-desk list [--json]" },
+      { name: "board", summary: "Print the board: every tracked PR under its column", usage: "bb review-desk board [--json]" },
+      { name: "move", summary: "Drag a card to a column, or back to the column GitHub's state gives it", usage: "bb review-desk move <reviewId> <unreviewed|changes_requested|approved|done|auto> [--json]" },
+      { name: "refresh", summary: "Sync every PR that is not done with GitHub", usage: "bb review-desk refresh [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "codemap", summary: "Build or print the codemap", usage: "bb review-desk codemap <reviewId> [--json]" },
       { name: "guide", summary: "Write or print the reading guide over the codemap", usage: "bb review-desk guide <reviewId> [--rewrite] [--json]" },
@@ -2827,6 +3040,37 @@ export default async function plugin(bb: BbPluginApi) {
           case "list": {
             const rows = q.reviews.all();
             return ok(rows.map(toReview), rows.length === 0 ? "No reviews." : rows.map((r) => `${r.id}  ${r.owner}/${r.repo}#${r.number}  ${r.title}  [${r.state}]`).join("\n"));
+          }
+          case "board": {
+            const cards = boardCards();
+            const lines: string[] = [];
+            for (const stage of BOARD_STAGES) {
+              const inStage = cards.filter((c) => c.stage === stage);
+              lines.push(`${BOARD_STAGE_LABEL[stage]} (${inStage.length})`);
+              for (const c of inStage) {
+                const bits = [
+                  c.isDraft ? "draft" : null,
+                  c.checks.total > 0 ? `checks ${c.checks.passed}/${c.checks.total}${c.checks.failed > 0 ? ` (${c.checks.failed} failing)` : ""}` : null,
+                  c.unresolvedThreads > 0 ? `${c.unresolvedThreads} open thread${c.unresolvedThreads === 1 ? "" : "s"}` : null,
+                  c.approvals > 0 ? `${c.approvals} approval${c.approvals === 1 ? "" : "s"}` : null,
+                  c.mergeable === "CONFLICTING" ? "conflicts" : null,
+                  c.pinned ? "dragged here" : null,
+                ].filter((b): b is string => b !== null);
+                lines.push(`  ${c.id}  ${c.owner}/${c.repo}#${c.number}  ${c.title}${bits.length > 0 ? `  [${bits.join(", ")}]` : ""}`);
+              }
+            }
+            return ok(cards, cards.length === 0 ? "No PRs on the board." : lines.join("\n"));
+          }
+          case "move": {
+            const [reviewId, stage] = rest;
+            if (!reviewId || !stage || (stage !== "auto" && !isBoardStage(stage))) return { exitCode: 1, stderr: `usage: bb review-desk move <reviewId> <${BOARD_STAGES.join("|")}|auto>` };
+            const card = moveCard(reviewId, stage === "auto" ? null : stage);
+            return ok(card, `${card.owner}/${card.repo}#${card.number} is in ${BOARD_STAGE_LABEL[card.stage]}${card.pinned ? " (dragged; follows GitHub again when its state changes)" : " (GitHub's state)"}`);
+          }
+          case "refresh": {
+            const result = await refreshBoard();
+            const failed = result.failed.length === 0 ? "" : `; ${result.failed.length} failed: ${result.failed.map((f) => `${f.reviewId} (${f.error})`).join(", ")}`;
+            return ok(result, `Synced ${result.synced} PR${result.synced === 1 ? "" : "s"}${failed}`);
           }
           case "ask": {
             const [reviewId, ...words] = rest;
@@ -2887,7 +3131,7 @@ export default async function plugin(bb: BbPluginApi) {
             return ok(g, text);
           }
           default:
-            return { exitCode: 1, stderr: "usage: bb review-desk open|list|ask|codemap|guide|simple" };
+            return { exitCode: 1, stderr: "usage: bb review-desk open|list|board|move|refresh|ask|codemap|guide|simple" };
         }
       } catch (cause) {
         return { exitCode: 1, stderr: errorMessage(cause) };

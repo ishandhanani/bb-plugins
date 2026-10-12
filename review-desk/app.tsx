@@ -7,7 +7,7 @@
 // labels, submit review), Chat (bb's own ThreadChat on an analyst thread that
 // lives in the PR worktree), and Codemap.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import type { FormEvent, ReactNode } from "react";
+import type { DragEvent, FormEvent, ReactNode } from "react";
 import { toast } from "sonner";
 import {
   definePluginApp,
@@ -16,7 +16,6 @@ import {
   UrlLink,
   useBbNavigate,
   useComposer,
-  useComposerView,
   useRealtime,
   useRpc,
   experimental_FileLink as FileLink,
@@ -38,8 +37,9 @@ import type { Brief, BriefEvidence, ClaimVerdict } from "./brief-spec";
 import type { Guide, GuideFile, GuideRole } from "./guide-spec";
 import type { Evidence as SlopEvidence, SlopReport } from "./slop";
 import { MENTION_PROVIDER_ID, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
+import { BOARD_STAGES, BOARD_STAGE_HINT, BOARD_STAGE_LABEL, type BoardStage } from "./board-spec";
 import { Button } from "@/components/ui/button";
-import { Icon } from "@/components/ui/icon";
+import { Icon, type IconName } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 
@@ -70,7 +70,7 @@ function requestJump(reviewId: string, path: string, line: number | null = null)
 // is sent. The diff page cannot write into a composer directly (it lives in
 // the nav panel; the composer lives in the Chat tab), so it queues the pill
 // per review and the composer banner, mounted inside the composer, drains the
-// queue with `useComposer().insertMention`.
+// queue with `useComposer().insert`.
 // ---------------------------------------------------------------------------
 
 interface Attach { mention: PluginComposerMention; text?: string }
@@ -1783,7 +1783,7 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
   const { review, files, threads, pending } = detail;
   const topBar = (
     <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-xs">
-      <Button variant="ghost" size="sm" className="h-7 px-1.5" onClick={() => (commit === null ? navigate.toPluginPanel(PANEL_PATH) : openCommit(null))} aria-label={commit === null ? "Back to reviews" : "Back to the pull request"}><Icon name="ChevronLeft" className="size-4" /></Button>
+      <Button variant="ghost" size="sm" className="h-7 px-1.5" onClick={() => (commit === null ? navigate.toPluginPanel(PANEL_PATH) : openCommit(null))} aria-label={commit === null ? "Back to the board" : "Back to the pull request"}><Icon name="ChevronLeft" className="size-4" /></Button>
       <Icon name="GitPullRequest" className="size-3.5 text-muted-foreground" />
       <span className="min-w-0 truncate"><span className="text-muted-foreground">#{review.number}</span> <span className="font-medium">{review.title}</span> <span className="text-muted-foreground">{review.repo}</span>{commit !== null ? <span className="text-muted-foreground"> › {commit.from === null ? `commit ${shortSha(commit.to)}` : `${shortSha(commit.from)}..${shortSha(commit.to)}`}</span> : null}</span>
       <span className="ml-auto flex items-center gap-1.5">
@@ -2262,10 +2262,9 @@ function ChatTab() {
 // ---------------------------------------------------------------------------
 
 function PillBanner() {
-  const view = useComposerView();
   const composer = useComposer();
   const rpc = useRpc<Contract>();
-  const scope = view.scope;
+  const scope = composer.scope;
   const threadId = scope.kind === "thread" ? scope.threadId : null;
   const composing = useComposingReview();
   const [seatReview, setSeatReview] = useState<string | null>(null);
@@ -2288,10 +2287,7 @@ function PillBanner() {
     const drain = () => {
       const list = drainAttaches(reviewId);
       if (list.length === 0) return;
-      for (const attach of list) {
-        composerRef.current.insertMention(attach.mention);
-        if (attach.text) composerRef.current.updateText((t) => `${t.trim() === "" ? "" : `${t.trimEnd()} `}${attach.text}`);
-      }
+      for (const attach of list) composerRef.current.insert(attach.text ? [attach.mention, ` ${attach.text}`] : attach.mention, { at: "end" });
       composerRef.current.focus();
     };
     drain();
@@ -2306,7 +2302,7 @@ function PillBanner() {
     <div className="flex items-center gap-2 px-1 pb-1 text-xs text-muted-foreground">
       <Icon name="Code" className="size-3.5 shrink-0" />
       <span className="min-w-0 truncate">Selected <span className="font-mono text-foreground">{label}</span>{splitPath(selection.path).dir ? <span> in {splitPath(selection.path).dir}</span> : null}</span>
-      <button type="button" className="ml-auto shrink-0 rounded-md border border-border px-2 py-0.5 hover:bg-state-hover" onClick={() => { composer.insertMention(selectionPill(reviewId, selection)); composer.focus(); }}>
+      <button type="button" className="ml-auto shrink-0 rounded-md border border-border px-2 py-0.5 hover:bg-state-hover" onClick={() => { composer.insert(selectionPill(reviewId, selection), { at: "end" }); composer.focus(); }}>
         Add to chat
       </button>
     </div>
@@ -2484,18 +2480,176 @@ function CodemapTab() {
 // Page
 // ---------------------------------------------------------------------------
 
-function ReviewsPage({ subPath }: { subPath: string }) {
+// ---------------------------------------------------------------------------
+// The board: every tracked PR as a card under the column GitHub's state puts
+// it in; drag a card to hold it elsewhere until GitHub's state changes.
+// ---------------------------------------------------------------------------
+
+/** Open PRs are synced with GitHub when the board opens, at most this often. */
+const BOARD_AUTO_REFRESH_MS = 10 * 60 * 1000;
+let lastBoardAutoRefresh = 0;
+
+function cardTime(card: ReviewSummary): number {
+  const t = Date.parse(card.ghUpdatedAt);
+  return Number.isNaN(t) ? card.updatedAt : t;
+}
+
+type ChipTone = "ok" | "bad" | "strong" | "muted";
+const CHIP_TONE: Record<ChipTone, string> = {
+  ok: "border-primary/40 text-primary",
+  bad: "border-destructive/40 text-destructive",
+  strong: "border-foreground/30 text-foreground",
+  muted: "border-border text-muted-foreground",
+};
+
+function Chip({ icon, tone = "muted", title, children }: { icon?: IconName; tone?: ChipTone; title?: string; children: ReactNode }) {
+  return (
+    <span title={title} className={cn("inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] leading-4 tabular-nums", CHIP_TONE[tone])}>
+      {icon ? <Icon name={icon} className="size-3" /> : null}
+      {children}
+    </span>
+  );
+}
+
+function PrCard({ card, onOpen, onUnpin, onRemove }: { card: ReviewSummary; onOpen: () => void; onUnpin: () => void; onRemove: () => void }) {
+  const [confirm, setConfirm] = useState(false);
+  const { checks } = card;
+  const checksTone: ChipTone = checks.failed > 0 ? "bad" : checks.pending > 0 ? "strong" : "ok";
+  const checksIcon: IconName = checks.failed > 0 ? "CircleX" : checks.pending > 0 ? "Clock" : "CircleCheck";
+  const prIcon: IconName = card.state === "MERGED" ? "GitMerge" : card.state === "CLOSED" ? "GitPullRequestClosed" : card.isDraft ? "GitPullRequestDraft" : "GitPullRequest";
+  const onDragStart = (e: DragEvent<HTMLDivElement>) => {
+    e.dataTransfer.setData("text/plain", card.id);
+    e.dataTransfer.effectAllowed = "move";
+  };
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      draggable
+      onDragStart={onDragStart}
+      onClick={onOpen}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); } }}
+      data-review-id={card.id}
+      className={cn("group relative cursor-pointer rounded-lg border border-border bg-card p-3 text-left shadow-sm transition-colors hover:bg-state-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring", card.stage === "done" && "opacity-70")}
+    >
+      <div className="flex items-start gap-2">
+        <Icon name={prIcon} className={cn("mt-0.5 size-4 shrink-0", card.state === "CLOSED" ? "text-destructive" : card.isDraft && card.state === "OPEN" ? "text-muted-foreground" : "text-primary")} />
+        <span className="min-w-0 flex-1 overflow-hidden text-sm font-medium leading-5 [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]">{card.title}</span>
+        <button
+          type="button"
+          aria-label="Remove from the board"
+          title="Remove from the board"
+          onClick={(e) => { e.stopPropagation(); setConfirm(true); }}
+          className="-mr-1.5 -mt-1.5 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-state-hover hover:text-foreground focus:opacity-100 group-hover:opacity-100"
+        >
+          <Icon name="X" className="size-3.5" />
+        </button>
+      </div>
+      <div className="mt-1 truncate text-xs text-muted-foreground">
+        {card.owner}/{card.repo} #{card.number}{card.author ? ` · ${card.author}` : ""} · {timeAgo(cardTime(card))}
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-1">
+        {card.isDraft && card.state === "OPEN" ? <Chip>Draft</Chip> : null}
+        {checks.total > 0 ? <Chip icon={checksIcon} tone={checksTone} title={`Checks: ${checks.passed} passed, ${checks.failed} failing, ${checks.pending} pending`}>{checks.passed}/{checks.total}</Chip> : null}
+        {card.unresolvedThreads > 0 ? <Chip icon="MessageSquare" tone="strong" title="Unresolved review threads">{card.unresolvedThreads}</Chip> : null}
+        {card.approvals > 0 ? <Chip icon="Check" tone="ok" title="Approvals">{card.approvals}</Chip> : null}
+        {card.changesRequested > 0 ? <Chip icon="CircleX" tone="bad" title="Reviewers asking for changes">{card.changesRequested}</Chip> : null}
+        {card.mergeable === "CONFLICTING" ? <Chip icon="AlertTriangle" tone="bad" title="Merge conflicts with the base branch">conflicts</Chip> : null}
+        {card.pendingCount > 0 ? <Chip title="Your comments not yet submitted to GitHub">{card.pendingCount} pending</Chip> : null}
+        <span className="ml-auto text-[11px] tabular-nums text-muted-foreground"><span className="text-primary">+{card.additions}</span> <span className="text-destructive">−{card.deletions}</span></span>
+      </div>
+      {card.pinned ? (
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onUnpin(); }}
+          title={`You dragged this card here. GitHub says ${BOARD_STAGE_LABEL[card.autoStage]}; click to follow GitHub again.`}
+          className="mt-2 inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          <Icon name="Pin" className="size-3" />Dragged here · GitHub says {BOARD_STAGE_LABEL[card.autoStage]}
+        </button>
+      ) : null}
+      {confirm ? (
+        <div className="mt-2 flex items-center gap-2 rounded-md border border-destructive/40 bg-background px-2 py-1 text-xs" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+          <span className="min-w-0 flex-1">Remove from the board? Your notes and pending comments on it go too.</span>
+          <Button variant="destructive" size="sm" className="h-6 px-2 text-xs" onClick={() => { setConfirm(false); onRemove(); }}>Remove</Button>
+          <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => setConfirm(false)}>Keep</Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function BoardColumn({ stage, count, over, onOver, onLeave, onDrop, children }: { stage: BoardStage; count: number; over: boolean; onOver: () => void; onLeave: () => void; onDrop: (reviewId: string) => void; children: ReactNode }) {
+  return (
+    <section
+      aria-label={BOARD_STAGE_LABEL[stage]}
+      data-stage={stage}
+      onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; if (!over) onOver(); }}
+      onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) onLeave(); }}
+      onDrop={(e) => { e.preventDefault(); const id = e.dataTransfer.getData("text/plain"); if (id !== "") onDrop(id); }}
+      className={cn("flex min-h-[180px] flex-col rounded-lg border border-transparent bg-foreground/5 transition-colors", over && "border-primary/50 bg-primary/10")}
+    >
+      <header className="flex items-center gap-2 px-3 pb-1.5 pt-2.5" title={BOARD_STAGE_HINT[stage]}>
+        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{BOARD_STAGE_LABEL[stage]}</span>
+        <span className="rounded-full bg-foreground/10 px-1.5 text-[11px] tabular-nums text-muted-foreground">{count}</span>
+      </header>
+      <div className="flex-1 space-y-2 px-2 pb-2">
+        {count === 0 ? <p className="px-1 py-8 text-center text-xs text-muted-foreground">{over ? "Drop here" : BOARD_STAGE_HINT[stage]}</p> : children}
+      </div>
+    </section>
+  );
+}
+
+function BoardPage() {
   const { reviews, error, refetch } = useReviews();
   const rpc = useRpc<Contract>();
   const navigate = useBbNavigate();
   const [ref, setRef] = useState("");
   const [opening, setOpening] = useState(false);
   const [openError, setOpenError] = useState<string | null>(null);
-  const [head, section, target] = subPath.split("/");
-  const reviewId = head !== "" ? head : null;
-  const commit = section === "commits" && target !== undefined ? parseCommitTarget(target) : null;
-  if (reviewId !== null) return <SimpleProvider key={reviewId} reviewId={reviewId}><ReviewView reviewId={reviewId} commit={commit} /></SimpleProvider>;
-  const open = async (e: FormEvent) => {
+  const [refreshing, setRefreshing] = useState(false);
+  const [over, setOver] = useState<BoardStage | null>(null);
+  // Cards you just dragged, drawn in their new column until the server's answer arrives.
+  const [moves, setMoves] = useState<Record<string, BoardStage>>({});
+  useEffect(() => {
+    if (reviews === null) return;
+    setMoves((m) => {
+      const next: Record<string, BoardStage> = {};
+      for (const [id, stage] of Object.entries(m)) {
+        const card = reviews.find((r) => r.id === id);
+        if (card !== undefined && card.stage !== stage) next[id] = stage;
+      }
+      return Object.keys(next).length === Object.keys(m).length ? m : next;
+    });
+  }, [reviews]);
+
+  const refresh = useCallback(async (quiet: boolean) => {
+    setRefreshing(true);
+    try {
+      const result = await rpc.call("board_refresh", null);
+      refetch();
+      if (!quiet) {
+        if (result.failed.length === 0) toast.success(`Synced ${result.synced} PR${result.synced === 1 ? "" : "s"} with GitHub`);
+        else toast.error(`Synced ${result.synced}; ${result.failed.length} failed: ${result.failed[0].error}`);
+      }
+    } catch (cause) {
+      if (!quiet) toast.error(describeError(cause));
+    } finally {
+      setRefreshing(false);
+    }
+  }, [rpc, refetch]);
+
+  // Open PRs that have not been synced for a while are synced when the board opens.
+  useEffect(() => {
+    if (reviews === null) return;
+    const now = Date.now();
+    if (now - lastBoardAutoRefresh < BOARD_AUTO_REFRESH_MS) return;
+    if (!reviews.some((r) => r.stage !== "done" && now - r.syncedAt > BOARD_AUTO_REFRESH_MS)) return;
+    lastBoardAutoRefresh = now;
+    void refresh(true);
+  }, [reviews, refresh]);
+
+  const add = async (e: FormEvent) => {
     e.preventDefault();
     if (ref.trim() === "") return;
     setOpening(true);
@@ -2504,48 +2658,104 @@ function ReviewsPage({ subPath }: { subPath: string }) {
       const { review } = await rpc.call("reviews_open", { ref: ref.trim() });
       setRef("");
       refetch();
-      navigate.toPluginPanel(PANEL_PATH, { subPath: review.id });
+      toast.success(`${review.owner}/${review.repo}#${review.number} is on the board`);
     } catch (cause) {
       setOpenError(describeError(cause));
     } finally {
       setOpening(false);
     }
   };
+
+  const move = async (card: ReviewSummary, stage: BoardStage | null) => {
+    const shown = moves[card.id] ?? card.stage;
+    if (stage !== null && shown === stage) return;
+    setMoves((m) => ({ ...m, [card.id]: stage ?? card.autoStage }));
+    try {
+      await rpc.call("board_move", { reviewId: card.id, stage: stage === card.autoStage ? null : stage });
+      refetch();
+    } catch (cause) {
+      setMoves((m) => { const next = { ...m }; delete next[card.id]; return next; });
+      toast.error(describeError(cause));
+    }
+  };
+
+  const remove = async (card: ReviewSummary) => {
+    try {
+      await rpc.call("reviews_remove", { reviewId: card.id });
+      toast.success(`Removed ${card.owner}/${card.repo}#${card.number} from the board`);
+      refetch();
+    } catch (cause) {
+      toast.error(describeError(cause));
+    }
+  };
+
+  const columns = useMemo(() => {
+    const byStage: Record<BoardStage, ReviewSummary[]> = { unreviewed: [], changes_requested: [], approved: [], done: [] };
+    for (const r of reviews ?? []) byStage[moves[r.id] ?? r.stage].push(r);
+    for (const stage of BOARD_STAGES) byStage[stage].sort((a, b) => cardTime(b) - cardTime(a));
+    return byStage;
+  }, [reviews, moves]);
+  const openCards = (reviews ?? []).filter((r) => r.stage !== "done");
+  const oldestSync = openCards.length === 0 ? null : Math.min(...openCards.map((r) => r.syncedAt));
+
   return (
-    <div className="h-full min-h-0 overflow-y-auto">
-      <div className="mx-auto w-full max-w-2xl px-6 py-12">
-        <h1 className="text-2xl font-semibold tracking-tight">Reviews</h1>
-        <p className="mt-1 text-sm text-muted-foreground">Open a pull request to read it with the diff, the conversation, and an analyst that has the code in front of it.</p>
-        <form onSubmit={open} className="mt-6 flex items-center gap-2">
-          <Input value={ref} onChange={(e) => setRef(e.target.value)} placeholder="https://github.com/owner/repo/pull/123 or owner/repo#123" className="h-10" aria-label="Pull request" />
-          <Button type="submit" className="h-10" disabled={opening || ref.trim() === ""}>
-            {opening ? <Icon name="Loading" className="size-4 animate-spin" /> : <Icon name="GitPullRequest" className="size-4" />}
-            {opening ? "Fetching…" : "Open"}
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-2">
+        <form onSubmit={add} className="flex min-w-[280px] flex-1 items-center gap-2">
+          <Input value={ref} onChange={(e) => setRef(e.target.value)} placeholder="Paste a PR link or owner/repo#123 to put it on the board" className="h-8 text-sm" aria-label="Pull request" />
+          <Button type="submit" size="sm" className="h-8" disabled={opening || ref.trim() === ""}>
+            {opening ? <Icon name="Loading" className="size-4 animate-spin" /> : <Icon name="Plus" className="size-4" />}
+            {opening ? "Fetching…" : "Add"}
           </Button>
         </form>
-        {openError ? <p className="mt-2 text-sm text-destructive">{openError}</p> : null}
-        <div className="mt-10">
-          <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Recent</div>
-          {error ? <p className="text-sm text-destructive">{error}</p> : reviews === null ? <p className="text-sm text-muted-foreground">Loading…</p> : reviews.length === 0 ? <EmptyState>No reviews yet.</EmptyState> : (
-            <ul className="divide-y divide-border/60 rounded-lg border border-border">
-              {reviews.map((r) => (
-                <li key={r.id}>
-                  <button type="button" onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: r.id })} className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-state-hover">
-                    <Icon name="GitPullRequest" className={cn("size-4 shrink-0", r.state === "OPEN" ? "text-primary" : "text-muted-foreground")} />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-medium">{r.title}</span>
-                      <span className="block truncate text-xs text-muted-foreground">{r.owner}/{r.repo} #{r.number} · {r.state.toLowerCase()}{r.pendingCount > 0 ? ` · ${r.pendingCount} pending` : ""}</span>
-                    </span>
-                    <span className="shrink-0 text-xs text-muted-foreground">{timeAgo(r.updatedAt)}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
+        <span className="ml-auto text-xs text-muted-foreground">{oldestSync === null ? "" : `Synced ${timeAgo(oldestSync)}`}</span>
+        <Button variant="ghost" size="sm" className="h-8 text-xs" onClick={() => void refresh(false)} disabled={refreshing || reviews === null} title="Sync every PR that is not done with GitHub">
+          <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", refreshing && "animate-spin")} />{refreshing ? "Syncing…" : "Refresh"}
+        </Button>
+      </div>
+      {openError ? <p role="alert" className="px-4 pt-2 text-sm text-destructive">{openError}</p> : null}
+      {error ? <p role="alert" className="px-4 pt-2 text-sm text-destructive">{error}</p> : null}
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {reviews === null ? <div className="p-6"><EmptyState>Loading…</EmptyState></div> : (
+          <div className="grid gap-3 p-4 [grid-template-columns:repeat(auto-fit,minmax(240px,1fr))]">
+            {BOARD_STAGES.map((stage) => (
+              <BoardColumn
+                key={stage}
+                stage={stage}
+                count={columns[stage].length}
+                over={over === stage}
+                onOver={() => setOver(stage)}
+                onLeave={() => setOver((s) => (s === stage ? null : s))}
+                onDrop={(id) => {
+                  setOver(null);
+                  const card = reviews.find((r) => r.id === id);
+                  if (card !== undefined) void move(card, stage);
+                }}
+              >
+                {columns[stage].map((card) => (
+                  <PrCard
+                    key={card.id}
+                    card={card}
+                    onOpen={() => navigate.toPluginPanel(PANEL_PATH, { subPath: card.id })}
+                    onUnpin={() => void move(card, null)}
+                    onRemove={() => void remove(card)}
+                  />
+                ))}
+              </BoardColumn>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
+}
+
+function ReviewsPage({ subPath }: { subPath: string }) {
+  const [head, section, target] = subPath.split("/");
+  const reviewId = head !== "" ? head : null;
+  const commit = section === "commits" && target !== undefined ? parseCommitTarget(target) : null;
+  if (reviewId !== null) return <SimpleProvider key={reviewId} reviewId={reviewId}><ReviewView reviewId={reviewId} commit={commit} /></SimpleProvider>;
+  return <BoardPage />;
 }
 
 export default definePluginApp((app) => {
