@@ -3,7 +3,7 @@
 A bb plugin that puts several agents on different providers into one group chat and drives them to a decision.
 
 - Rooms hold a shared transcript. Seats are ordinary bb threads, one per agent, in one shared workspace.
-- Seats run on the machine that holds the project's default checkout, in a fresh worktree for a git project. Pick another with `--machine` on `create`, or `bb roundtable machine` before the first seat starts.
+- Seats run on the machine that holds the project's default checkout, in a fresh worktree for a git project. Pick another in the new-room form's Machine list, which offers only machines holding a checkout of the project, with `--machine` on `create`, or with `bb roundtable machine` before the first seat starts.
 - Tag a seat with a chip or `@handle`. It receives the room messages it has not seen yet and its reply is posted back. Tag several and Send, and they answer in parallel.
 - **Turns** is the one knob. On Send it is how many times the tagged agents may relay to each other before you get the floor back. On Discuss it is the cap on a scheduled back-and-forth that ends once everyone agrees.
 - Every reply ends with a `STANCE: agree | disagree | need-info | pass` line and an `OPEN:` list. `need-info` pauses a discussion until you answer.

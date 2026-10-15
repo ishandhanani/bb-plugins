@@ -16,7 +16,7 @@ import { randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { defaultSourceHost, resolveMachine, seatEnvironment } from "./lib/seat-environment";
+import { defaultSourceHost, machineForProject, projectMachines, seatEnvironment } from "./lib/seat-environment";
 
 // ---------------------------------------------------------------------------
 // Wire schemas (shared with app.tsx through type-only imports)
@@ -162,9 +162,18 @@ const providerOptionSchema = z.object({
 });
 export type ProviderOption = z.infer<typeof providerOptionSchema>;
 
+const machineOptionSchema = z.object({ id: z.string(), name: z.string(), connected: z.boolean(), isDefault: z.boolean() });
+export type MachineOption = z.infer<typeof machineOptionSchema>;
+
 const contextOptionsSchema = z.object({
   projects: z.array(
-    z.object({ id: z.string(), name: z.string(), kind: z.string() }),
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      kind: z.string(),
+      /** Machines holding a checkout of the project, default first. Empty: bb's project default. */
+      machines: z.array(machineOptionSchema),
+    }),
   ),
   providers: z.array(providerOptionSchema),
 });
@@ -1681,9 +1690,10 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function contextOptions(): Promise<ContextOptions> {
-    const [projects, providers] = await Promise.all([
+    const [projects, providers, hosts] = await Promise.all([
       bb.sdk.projects.list({ includePersonal: true }),
       bb.sdk.providers.list(),
+      bb.sdk.hosts.list(),
     ]);
     const options = await Promise.all(
       providers.map(async (provider): Promise<ProviderOption> => {
@@ -1708,7 +1718,12 @@ export default async function plugin(bb: BbPluginApi) {
       }),
     );
     return {
-      projects: projects.map((project) => ({ id: project.id, name: project.name, kind: project.kind })),
+      projects: projects.map((project) => ({
+        id: project.id,
+        name: project.name,
+        kind: project.kind,
+        machines: projectMachines(project.sources, hosts),
+      })),
       providers: options,
     };
   }
@@ -1736,8 +1751,9 @@ export default async function plugin(bb: BbPluginApi) {
     defaultTurns?: number;
   }
 
-  async function machineId(selector: string): Promise<string> {
-    return resolveMachine(selector, await bb.sdk.hosts.list());
+  async function machineId(selector: string, projectId: string): Promise<string> {
+    const [project, hosts] = await Promise.all([bb.sdk.projects.get({ projectId }), bb.sdk.hosts.list()]);
+    return machineForProject(selector, project.sources, hosts);
   }
 
   async function createRoom(input: CreateRoomInput): Promise<Room> {
@@ -1759,7 +1775,7 @@ export default async function plugin(bb: BbPluginApi) {
     // checked out only elsewhere. Default to where the project's checkout lives.
     const hostId = environmentId !== null
       ? null
-      : input.machine ? await machineId(input.machine) : defaultSourceHost(project.sources);
+      : input.machine ? await machineId(input.machine, project.id) : defaultSourceHost(project.sources);
     const row = store.createRoom({
       title: input.title,
       projectId: input.projectId,
@@ -1780,7 +1796,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (input.machine !== undefined) {
       // Seats share the room's workspace; moving it after one exists would split them.
       if (room.environment_id !== null) throw new Error("the room already has a workspace; create a new room to use another machine");
-      const hostId = await machineId(input.machine);
+      const hostId = await machineId(input.machine, room.project_id);
       if (hostId !== room.host_id) {
         store.q.setRoomHost.run(hostId, Date.now(), room.id);
         postSystem(room.id, `Seats will run on machine ${input.machine}.`);

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { defaultSourceHost, resolveMachine, seatEnvironment } from "./seat-environment.ts";
+import { defaultSourceHost, machineForProject, projectMachines, resolveMachine, seatEnvironment } from "./seat-environment.ts";
 
 test("a room with a workspace reuses it, whatever its machine", () => {
   assert.deepEqual(
@@ -48,4 +48,28 @@ test("a machine resolves by exact id or unambiguous name", () => {
 test("an unknown or ambiguous machine is an error, not a guess", () => {
   assert.throws(() => resolveMachine("nope", hosts), /unknown machine "nope"/);
   assert.throws(() => resolveMachine("dup", hosts), /ambiguous/);
+});
+const sources = [
+  { hostId: "host_rydt6w8d4j", isDefault: false },
+  { hostId: "host_29rqi9c258", isDefault: true },
+  { hostId: "host_gone", isDefault: false },
+];
+const fleet = [
+  { id: "host_29rqi9c258", name: "brev-x86-cpu", status: "connected" },
+  { id: "host_rydt6w8d4j", name: "spark-p", status: "disconnected" },
+  { id: "host_nu2p93y75d", name: "mac-mini-m6", status: "connected" },
+];
+
+test("a project's machines are the hosts holding its checkout, default first", () => {
+  assert.deepEqual(projectMachines(sources, fleet), [
+    { id: "host_29rqi9c258", name: "brev-x86-cpu", connected: true, isDefault: true },
+    { id: "host_rydt6w8d4j", name: "spark-p", connected: false, isDefault: false },
+  ]);
+  assert.deepEqual(projectMachines([], fleet), []);
+});
+
+test("a machine is accepted only if it holds the project's checkout", () => {
+  assert.equal(machineForProject("spark-p", sources, fleet), "host_rydt6w8d4j");
+  assert.throws(() => machineForProject("mac-mini-m6", sources, fleet), /no checkout of this project on mac-mini-m6/);
+  assert.throws(() => machineForProject("nope", sources, fleet), /unknown machine/);
 });
