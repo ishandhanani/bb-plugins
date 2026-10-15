@@ -16,6 +16,7 @@ import { randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { defaultSourceHost, resolveMachine, seatEnvironment } from "./lib/seat-environment";
 
 // ---------------------------------------------------------------------------
 // Wire schemas (shared with app.tsx through type-only imports)
@@ -89,6 +90,8 @@ const roomSchema = z.object({
   title: z.string(),
   projectId: z.string(),
   environmentId: z.string().nullable(),
+  /** Machine the seats spawn on until the room has a workspace; null leaves it to bb's project default. */
+  hostId: z.string().nullable(),
   docPath: z.string().nullable(),
   docOwner: z.string().nullable(),
   defaultTurns: z.number(),
@@ -190,6 +193,8 @@ export const rpcContract = defineRpcContract({
       title: z.string().trim().min(1).max(120),
       projectId: z.string().min(1),
       environmentId: z.string().min(1).nullable().optional(),
+      /** Machine id or name. Defaults to the machine holding the project's default checkout. */
+      machine: z.string().min(1).nullable().optional(),
       participants: z.array(participantInputSchema).min(1).max(8),
       docPath: z.string().trim().max(400).nullable().optional(),
       docOwner: handleSchema.nullable().optional(),
@@ -201,6 +206,8 @@ export const rpcContract = defineRpcContract({
     input: z.object({
       roomId: z.string(),
       title: z.string().trim().min(1).max(120).optional(),
+      /** Machine id or name. Only before the room has a workspace. */
+      machine: z.string().min(1).optional(),
       docPath: z.string().trim().max(400).nullable().optional(),
       docOwner: handleSchema.nullable().optional(),
       defaultTurns: turnsSchema.optional(),
@@ -326,6 +333,7 @@ const MIGRATIONS = [
      job INTEGER NOT NULL DEFAULT 0,
      PRIMARY KEY (room_id, handle)
    )`,
+  `ALTER TABLE rooms ADD COLUMN host_id TEXT`,
 ];
 
 interface RoomRow {
@@ -333,6 +341,7 @@ interface RoomRow {
   title: string;
   project_id: string;
   environment_id: string | null;
+  host_id: string | null;
   created_at: number;
   updated_at: number;
   archived_at: number | null;
@@ -394,8 +403,11 @@ function createStore(db: Database.Database) {
     rooms: db.prepare<[], RoomRow>(
       `SELECT * FROM rooms WHERE archived_at IS NULL ORDER BY updated_at DESC`,
     ),
-    insertRoom: db.prepare<[string, string, string, string | null, string | null, string | null, number, number, number]>(
-      `INSERT INTO rooms (id, title, project_id, environment_id, doc_path, doc_owner, default_turns, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    insertRoom: db.prepare<[string, string, string, string | null, string | null, string | null, string | null, number, number, number]>(
+      `INSERT INTO rooms (id, title, project_id, environment_id, host_id, doc_path, doc_owner, default_turns, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ),
+    setRoomHost: db.prepare<[string, number, string]>(
+      `UPDATE rooms SET host_id = ?, updated_at = ? WHERE id = ? AND environment_id IS NULL`,
     ),
     updateRoom: db.prepare<[string, string | null, string | null, number, number, string]>(
       `UPDATE rooms SET title = ?, doc_path = ?, doc_owner = ?, default_turns = ?, updated_at = ? WHERE id = ?`,
@@ -512,6 +524,7 @@ function createStore(db: Database.Database) {
       title: string;
       projectId: string;
       environmentId: string | null;
+      hostId: string | null;
       participants: ParticipantInput[];
       docPath: string | null;
       docOwner: string | null;
@@ -519,13 +532,14 @@ function createStore(db: Database.Database) {
     }): RoomRow => {
       const id = randomBytes(5).toString("hex");
       const now = Date.now();
-      q.insertRoom.run(id, input.title, input.projectId, input.environmentId, input.docPath, input.docOwner, input.defaultTurns, now, now);
+      q.insertRoom.run(id, input.title, input.projectId, input.environmentId, input.hostId, input.docPath, input.docOwner, input.defaultTurns, now, now);
       for (const p of input.participants) insertParticipant(id, p, 0);
       return {
         id,
         title: input.title,
         project_id: input.projectId,
         environment_id: input.environmentId,
+        host_id: input.hostId,
         created_at: now,
         updated_at: now,
         archived_at: null,
@@ -646,6 +660,7 @@ function toRoom(row: RoomRow): Room {
     title: row.title,
     projectId: row.project_id,
     environmentId: row.environment_id,
+    hostId: row.host_id,
     docPath: row.doc_path,
     docOwner: row.doc_owner,
     defaultTurns: row.default_turns,
@@ -977,11 +992,12 @@ export default async function plugin(bb: BbPluginApi) {
       const providers = await providerDirectory();
       const provider = providers.get(fresh.provider_id);
       const permissionMode = permissionModeFor(provider?.capabilities.permissionModes ?? []);
+      const project = freshRoom.environment_id === null && freshRoom.host_id !== null
+        ? await bb.sdk.projects.get({ projectId: freshRoom.project_id })
+        : { gitRemoteUrl: null };
       const thread = await bb.sdk.threads.spawn({
         projectId: freshRoom.project_id,
-        environment: freshRoom.environment_id === null
-          ? { type: "project-default" }
-          : { type: "reuse", environmentId: freshRoom.environment_id },
+        environment: seatEnvironment({ environmentId: freshRoom.environment_id, hostId: freshRoom.host_id }, project),
         providerId: fresh.provider_id,
         ...(fresh.model === null ? {} : { model: fresh.model }),
         ...(isReasoningLevel(fresh.reasoning_level) ? { reasoningLevel: fresh.reasoning_level } : {}),
@@ -1713,10 +1729,15 @@ export default async function plugin(bb: BbPluginApi) {
     title: string;
     projectId: string;
     environmentId?: string | null;
+    machine?: string | null;
     participants: ParticipantInput[];
     docPath?: string | null;
     docOwner?: string | null;
     defaultTurns?: number;
+  }
+
+  async function machineId(selector: string): Promise<string> {
+    return resolveMachine(selector, await bb.sdk.hosts.list());
   }
 
   async function createRoom(input: CreateRoomInput): Promise<Room> {
@@ -1730,12 +1751,20 @@ export default async function plugin(bb: BbPluginApi) {
       if (!providers.has(p.providerId)) throw new Error(`unknown provider ${p.providerId}`);
     }
     const projects = await bb.sdk.projects.list({ includePersonal: true });
-    if (!projects.some((project) => project.id === input.projectId)) throw new Error(`unknown project ${input.projectId}`);
+    const project = projects.find((p) => p.id === input.projectId);
+    if (project === undefined) throw new Error(`unknown project ${input.projectId}`);
     const docPath = input.docPath?.trim() ? input.docPath.trim() : null;
+    const environmentId = input.environmentId ?? null;
+    // Without a machine bb spawns seats on the server, which fails for a project
+    // checked out only elsewhere. Default to where the project's checkout lives.
+    const hostId = environmentId !== null
+      ? null
+      : input.machine ? await machineId(input.machine) : defaultSourceHost(project.sources);
     const row = store.createRoom({
       title: input.title,
       projectId: input.projectId,
-      environmentId: input.environmentId ?? null,
+      environmentId,
+      hostId,
       participants: input.participants,
       docPath,
       docOwner: docPath === null ? null : docOwner,
@@ -1745,9 +1774,19 @@ export default async function plugin(bb: BbPluginApi) {
     return toRoom(row);
   }
 
-  function updateRoom(input: { roomId: string; title?: string; docPath?: string | null; docOwner?: string | null; defaultTurns?: number }): Room {
-    const room = store.room(input.roomId);
+  async function updateRoom(input: { roomId: string; title?: string; machine?: string; docPath?: string | null; docOwner?: string | null; defaultTurns?: number }): Promise<Room> {
+    let room = store.room(input.roomId);
     if (room === undefined) throw new Error(`room ${input.roomId} not found`);
+    if (input.machine !== undefined) {
+      // Seats share the room's workspace; moving it after one exists would split them.
+      if (room.environment_id !== null) throw new Error("the room already has a workspace; create a new room to use another machine");
+      const hostId = await machineId(input.machine);
+      if (hostId !== room.host_id) {
+        store.q.setRoomHost.run(hostId, Date.now(), room.id);
+        postSystem(room.id, `Seats will run on machine ${input.machine}.`);
+        room = store.room(room.id) ?? room;
+      }
+    }
     const title = input.title ?? room.title;
     const docPath = input.docPath === undefined ? room.doc_path : (input.docPath?.trim() ? input.docPath.trim() : null);
     let docOwner = input.docOwner === undefined ? room.doc_owner : input.docOwner;
@@ -1797,7 +1836,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     rooms_list: () => ({ rooms: roomSummaries() }),
     rooms_create: async (input) => ({ room: await createRoom(input) }),
-    rooms_update: (input) => ({ room: updateRoom(input) }),
+    rooms_update: async (input) => ({ room: await updateRoom(input) }),
     rooms_get: ({ roomId }) => roomDetail(roomId),
     rooms_changes: ({ roomId }) => roomChanges(roomId),
     rooms_post: async ({ roomId, text, tags, turns }) => {
@@ -1855,11 +1894,12 @@ export default async function plugin(bb: BbPluginApi) {
     "Usage:",
     "  bb roundtable list [--json]",
     "  bb roundtable show <room> [--since <seq>] [--json]",
-    "  bb roundtable create --title <title> [--project <id>] [--participants claude=claude-code,codex=codex,devin=acp-devin:edit] [--doc <path> --owner <handle>] [--turns N]",
+    "  bb roundtable create --title <title> [--project <id>] [--machine <id-or-name>] [--participants claude=claude-code,codex=codex,devin=acp-devin:edit] [--doc <path> --owner <handle>] [--turns N]",
     "  bb roundtable say <room> [--to a,b] [--turns N] [--as <handle>] <message...>",
     "  bb roundtable discuss <room> --between a,b [--turns N] <message...>",
     "  bb roundtable add <room> <handle>=<provider>[=model][:edit] [--brief full|summary|none] [--summarizer <handle>]",
     "  bb roundtable doc <room> --path <path> [--owner <handle>]",
+    "  bb roundtable machine <room> <id-or-name>",
     "  bb roundtable intro <room> <handle>",
     "  bb roundtable compact|reset|remove <room> <handle>",
     "  bb roundtable resume|cancel|stop|archive <room>",
@@ -1867,7 +1907,8 @@ export default async function plugin(bb: BbPluginApi) {
     "<room> is a room id or its exact title. Inside a participant thread, `say`",
     "posts as that participant. @handle mentions tag participants even without",
     "--to. --turns bounds how long the agents may keep talking among themselves:",
-    "a relay allowance on `say`, the turn cap on `discuss`.",
+    "a relay allowance on `say`, the turn cap on `discuss`. Seats run on the",
+    "machine holding the project's default checkout unless --machine says otherwise.",
   ].join("\n");
 
   interface ParsedArgs {
@@ -1924,11 +1965,12 @@ export default async function plugin(bb: BbPluginApi) {
     commands: [
       { name: "list", summary: "List rooms", usage: "bb roundtable list [--json]" },
       { name: "show", summary: "Print a room transcript", usage: "bb roundtable show <room> [--since <seq>] [--json]" },
-      { name: "create", summary: "Create a room", usage: "bb roundtable create --title <title> [--project <id>] [--participants claude=claude-code,codex=codex,devin=acp-devin:edit] [--doc <path> --owner <handle>] [--turns N]" },
+      { name: "create", summary: "Create a room", usage: "bb roundtable create --title <title> [--project <id>] [--machine <id-or-name>] [--participants claude=claude-code,codex=codex,devin=acp-devin:edit] [--doc <path> --owner <handle>] [--turns N]" },
       { name: "say", summary: "Post to a room and optionally tag participants", usage: "bb roundtable say <room> [--to a,b] [--turns N] [--as <handle>] <message...>" },
       { name: "discuss", summary: "Scheduled back-and-forth between participants until they agree or the cap", usage: "bb roundtable discuss <room> --between a,b [--turns N] <message...>" },
       { name: "add", summary: "Add a participant with a briefing", usage: "bb roundtable add <room> <handle>=<provider>[=model][:edit] [--brief full|summary|none] [--summarizer <handle>]" },
       { name: "doc", summary: "Pin the room's working document", usage: "bb roundtable doc <room> --path <path> [--owner <handle>]" },
+      { name: "machine", summary: "Choose the machine a room's seats run on, before its first seat starts", usage: "bb roundtable machine <room> <id-or-name>" },
       { name: "intro", summary: "Print exactly what a participant is told on first contact", usage: "bb roundtable intro <room> <handle>" },
       { name: "compact", summary: "Compact a participant's context", usage: "bb roundtable compact <room> <handle>" },
       { name: "reset", summary: "Give a participant a fresh thread", usage: "bb roundtable reset <room> <handle> [--brief full|summary|none] [--summarizer <handle>]" },
@@ -1979,6 +2021,7 @@ export default async function plugin(bb: BbPluginApi) {
               .join(", ");
             const header = [
               `${room.title} (${room.id}) — ${roster}`,
+              room.environment_id === null && room.host_id !== null ? `Machine: ${room.host_id} (seats not started)` : null,
               room.doc_path ? `Pinned document: ${room.doc_path}${room.doc_owner ? ` (owner @${room.doc_owner})` : ""}` : null,
               detail.job ? `Discussion: turn ${detail.job.turn}/${detail.job.totalTurns}${detail.job.paused ? ` paused on @${detail.job.paused.handle}` : ""}` : null,
             ].filter((line): line is string => line !== null).join("\n");
@@ -2007,6 +2050,7 @@ export default async function plugin(bb: BbPluginApi) {
               title,
               projectId,
               participants,
+              machine: flagString(flags, "machine") ?? null,
               docPath: flagString(flags, "doc") ?? null,
               docOwner: flagString(flags, "owner") ?? null,
               defaultTurns: parseTurns(flagString(flags, "turns"), 4),
@@ -2059,8 +2103,15 @@ export default async function plugin(bb: BbPluginApi) {
             if (room === undefined) return fail(`Unknown room "${rest[0] ?? ""}".`);
             const path = flagString(flags, "path");
             if (path === undefined) return fail("doc needs --path <path>");
-            const updated = updateRoom({ roomId: room.id, docPath: path, docOwner: flagString(flags, "owner") ?? null });
+            const updated = await updateRoom({ roomId: room.id, docPath: path, docOwner: flagString(flags, "owner") ?? null });
             return ok(updated, `Pinned ${updated.docPath}${updated.docOwner ? ` (owner @${updated.docOwner})` : ""}.`);
+          }
+          case "machine": {
+            const room = resolveRoom(rest[0]);
+            if (room === undefined) return fail(`Unknown room "${rest[0] ?? ""}".`);
+            if (rest[1] === undefined) return fail("machine needs <id-or-name>");
+            const updated = await updateRoom({ roomId: room.id, machine: rest[1] });
+            return ok(updated, `Seats in ${updated.title} will run on ${rest[1]} (${updated.hostId}).`);
           }
           case "intro": {
             const room = resolveRoom(rest[0]);

@@ -2,6 +2,9 @@
   "name": "bb-plugin-roundtable",
   "version": "0.1.0",
   "type": "module",
+  "scripts": {
+    "test": "node --test lib/*.test.ts"
+  },
   "engines": {
     "bb": ">=0.42",
     "bbPluginSdk": ">=0.4.47"

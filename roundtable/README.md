@@ -3,6 +3,7 @@
 A bb plugin that puts several agents on different providers into one group chat and drives them to a decision.
 
 - Rooms hold a shared transcript. Seats are ordinary bb threads, one per agent, in one shared workspace.
+- Seats run on the machine that holds the project's default checkout, in a fresh worktree for a git project. Pick another with `--machine` on `create`, or `bb roundtable machine` before the first seat starts.
 - Tag a seat with a chip or `@handle`. It receives the room messages it has not seen yet and its reply is posted back. Tag several and Send, and they answer in parallel.
 - **Turns** is the one knob. On Send it is how many times the tagged agents may relay to each other before you get the floor back. On Discuss it is the cap on a scheduled back-and-forth that ends once everyone agrees.
 - Every reply ends with a `STANCE: agree | disagree | need-info | pass` line and an `OPEN:` list. `need-info` pauses a discussion until you answer.
@@ -13,6 +14,7 @@ A bb plugin that puts several agents on different providers into one group chat 
 
 ## Layout
 
+- `lib/seat-environment.ts` — where seats spawn: the room's workspace, its machine, or bb's project default. Tests: `npm test`.
 - `server.ts` — SQLite store; relay with the turns allowance; footer parsing; the discussion job with pause and resume; briefings; document read and create; workspace diff; RPC; the `bb roundtable` CLI.
 - `app.tsx` — the **Roundtable** nav panel, the **Agent thread** and **Document** fixed tabs, and the thread panel action.
 - `skills/roundtable/SKILL.md` — the skill seats get.
@@ -24,6 +26,7 @@ npm install
 bb plugin install .      # register this directory in place
 bb plugin dev            # rebuild and reload on save
 npx tsc -p .             # type-check
+npm test                 # unit tests (node --test)
 bb plugin logs roundtable
 ```
 
@@ -34,11 +37,12 @@ Schema changes are append-only in `MIGRATIONS`. To start over, disable the plugi
 ```
 bb roundtable list
 bb roundtable show <room> [--since <seq>]
-bb roundtable create --title <title> [--project <id>] [--participants claude=claude-code,codex=codex,devin=acp-devin:edit] [--doc <path> --owner <handle>] [--turns N]
+bb roundtable create --title <title> [--project <id>] [--machine <id-or-name>] [--participants claude=claude-code,codex=codex,devin=acp-devin:edit] [--doc <path> --owner <handle>] [--turns N]
 bb roundtable say <room> [--to a,b] [--turns N] [--as <handle>] <message...>
 bb roundtable discuss <room> --between a,b [--turns N] <message...>
 bb roundtable add <room> <handle>=<provider>[=model][:edit] [--brief full|summary|none] [--summarizer <handle>]
 bb roundtable doc <room> --path <path> [--owner <handle>]
+bb roundtable machine <room> <id-or-name>
 bb roundtable intro <room> <handle>
 bb roundtable compact|reset|remove <room> <handle>
 bb roundtable resume|cancel|archive <room>
