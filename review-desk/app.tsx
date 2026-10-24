@@ -16,7 +16,6 @@ import {
   UrlLink,
   useBbNavigate,
   useComposer,
-  useComposerView,
   useRealtime,
   useRpc,
   experimental_FileLink as FileLink,
@@ -31,17 +30,19 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { FileDiff, type DiffLineAnnotation, type FileDiffMetadata, type SelectedLineRange } from "@pierre/diffs/react";
 import { parsePatchFiles } from "@pierre/diffs";
-import type { BriefState, CodemapState, CommitInfo, FileEntry, GuideState, Note, NoteKind, PendingComment, ProviderOption, Review, ReviewSummary, Seat, SelectionRef, SimpleMode, SimpleState, rpcContract } from "./server";
+import type { BriefState, CodemapState, CommitInfo, FileEntry, GuideState, Note, NoteKind, PendingComment, ProviderOption, Review, Seat, SelectionRef, SimpleMode, SimpleState, rpcContract } from "./server";
 import type { ChangedFile } from "./host-contract";
 import type { Codemap, GhThread } from "./host-contract";
 import type { Brief, BriefEvidence, ClaimVerdict } from "./brief-spec";
 import type { Guide, GuideFile, GuideRole } from "./guide-spec";
 import type { Evidence as SlopEvidence, SlopReport } from "./slop";
 import { MENTION_PROVIDER_ID, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
+import { BoardPage } from "./board";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
+import { describeError, timeAgo } from "@/lib/format";
 
 type Contract = typeof rpcContract;
 
@@ -70,7 +71,7 @@ function requestJump(reviewId: string, path: string, line: number | null = null)
 // is sent. The diff page cannot write into a composer directly (it lives in
 // the nav panel; the composer lives in the Chat tab), so it queues the pill
 // per review and the composer banner, mounted inside the composer, drains the
-// queue with `useComposer().insertMention`.
+// queue with `useComposer().insert`.
 // ---------------------------------------------------------------------------
 
 interface Attach { mention: PluginComposerMention; text?: string }
@@ -168,9 +169,6 @@ const SHIKI_THEMES = new Set([
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-function describeError(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
-}
 
 function payloadReview(payload: unknown): { reviewId: string; what: string } | null {
   if (typeof payload !== "object" || payload === null) return null;
@@ -195,18 +193,6 @@ function writeStorage(key: string, value: unknown): void {
   }
 }
 
-function timeAgo(iso: string | number): string {
-  const ms = typeof iso === "number" ? iso : Date.parse(iso);
-  if (!Number.isFinite(ms)) return "";
-  const diff = Math.max(0, Date.now() - ms);
-  const m = Math.round(diff / 60_000);
-  if (m < 1) return "just now";
-  if (m < 60) return `${m} minute${m === 1 ? "" : "s"} ago`;
-  const h = Math.round(m / 60);
-  if (h < 48) return `${h} hour${h === 1 ? "" : "s"} ago`;
-  const d = Math.round(h / 24);
-  return `${d} day${d === 1 ? "" : "s"} ago`;
-}
 
 function shortSha(sha: string): string {
   return sha.slice(0, 7);
@@ -266,23 +252,6 @@ let pendingJump: { reviewId: string; path: string; line: number | null; side: "o
 // Data hooks
 // ---------------------------------------------------------------------------
 
-function useReviews() {
-  const rpc = useRpc<Contract>();
-  const [reviews, setReviews] = useState<ReviewSummary[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const refetch = useCallback(() => {
-    rpc.call("reviews_list").then(
-      (result) => {
-        setReviews(result.reviews);
-        setError(null);
-      },
-      (cause: unknown) => setError(describeError(cause)),
-    );
-  }, [rpc]);
-  useEffect(refetch, [refetch]);
-  useRealtime(REVIEW_CHANGED, refetch);
-  return { reviews, error, refetch };
-}
 
 function useReview(reviewId: string | null) {
   const rpc = useRpc<Contract>();
@@ -1783,7 +1752,7 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
   const { review, files, threads, pending } = detail;
   const topBar = (
     <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-xs">
-      <Button variant="ghost" size="sm" className="h-7 px-1.5" onClick={() => (commit === null ? navigate.toPluginPanel(PANEL_PATH) : openCommit(null))} aria-label={commit === null ? "Back to reviews" : "Back to the pull request"}><Icon name="ChevronLeft" className="size-4" /></Button>
+      <Button variant="ghost" size="sm" className="h-7 px-1.5" onClick={() => (commit === null ? navigate.toPluginPanel(PANEL_PATH) : openCommit(null))} aria-label={commit === null ? "Back to the board" : "Back to the pull request"}><Icon name="ChevronLeft" className="size-4" /></Button>
       <Icon name="GitPullRequest" className="size-3.5 text-muted-foreground" />
       <span className="min-w-0 truncate"><span className="text-muted-foreground">#{review.number}</span> <span className="font-medium">{review.title}</span> <span className="text-muted-foreground">{review.repo}</span>{commit !== null ? <span className="text-muted-foreground"> › {commit.from === null ? `commit ${shortSha(commit.to)}` : `${shortSha(commit.from)}..${shortSha(commit.to)}`}</span> : null}</span>
       <span className="ml-auto flex items-center gap-1.5">
@@ -2262,10 +2231,9 @@ function ChatTab() {
 // ---------------------------------------------------------------------------
 
 function PillBanner() {
-  const view = useComposerView();
   const composer = useComposer();
   const rpc = useRpc<Contract>();
-  const scope = view.scope;
+  const scope = composer.scope;
   const threadId = scope.kind === "thread" ? scope.threadId : null;
   const composing = useComposingReview();
   const [seatReview, setSeatReview] = useState<string | null>(null);
@@ -2288,10 +2256,7 @@ function PillBanner() {
     const drain = () => {
       const list = drainAttaches(reviewId);
       if (list.length === 0) return;
-      for (const attach of list) {
-        composerRef.current.insertMention(attach.mention);
-        if (attach.text) composerRef.current.updateText((t) => `${t.trim() === "" ? "" : `${t.trimEnd()} `}${attach.text}`);
-      }
+      for (const attach of list) composerRef.current.insert(attach.text ? [attach.mention, ` ${attach.text}`] : attach.mention, { at: "end" });
       composerRef.current.focus();
     };
     drain();
@@ -2306,7 +2271,7 @@ function PillBanner() {
     <div className="flex items-center gap-2 px-1 pb-1 text-xs text-muted-foreground">
       <Icon name="Code" className="size-3.5 shrink-0" />
       <span className="min-w-0 truncate">Selected <span className="font-mono text-foreground">{label}</span>{splitPath(selection.path).dir ? <span> in {splitPath(selection.path).dir}</span> : null}</span>
-      <button type="button" className="ml-auto shrink-0 rounded-md border border-border px-2 py-0.5 hover:bg-state-hover" onClick={() => { composer.insertMention(selectionPill(reviewId, selection)); composer.focus(); }}>
+      <button type="button" className="ml-auto shrink-0 rounded-md border border-border px-2 py-0.5 hover:bg-state-hover" onClick={() => { composer.insert(selectionPill(reviewId, selection), { at: "end" }); composer.focus(); }}>
         Add to chat
       </button>
     </div>
@@ -2485,67 +2450,12 @@ function CodemapTab() {
 // ---------------------------------------------------------------------------
 
 function ReviewsPage({ subPath }: { subPath: string }) {
-  const { reviews, error, refetch } = useReviews();
-  const rpc = useRpc<Contract>();
   const navigate = useBbNavigate();
-  const [ref, setRef] = useState("");
-  const [opening, setOpening] = useState(false);
-  const [openError, setOpenError] = useState<string | null>(null);
   const [head, section, target] = subPath.split("/");
   const reviewId = head !== "" ? head : null;
   const commit = section === "commits" && target !== undefined ? parseCommitTarget(target) : null;
   if (reviewId !== null) return <SimpleProvider key={reviewId} reviewId={reviewId}><ReviewView reviewId={reviewId} commit={commit} /></SimpleProvider>;
-  const open = async (e: FormEvent) => {
-    e.preventDefault();
-    if (ref.trim() === "") return;
-    setOpening(true);
-    setOpenError(null);
-    try {
-      const { review } = await rpc.call("reviews_open", { ref: ref.trim() });
-      setRef("");
-      refetch();
-      navigate.toPluginPanel(PANEL_PATH, { subPath: review.id });
-    } catch (cause) {
-      setOpenError(describeError(cause));
-    } finally {
-      setOpening(false);
-    }
-  };
-  return (
-    <div className="h-full min-h-0 overflow-y-auto">
-      <div className="mx-auto w-full max-w-2xl px-6 py-12">
-        <h1 className="text-2xl font-semibold tracking-tight">Reviews</h1>
-        <p className="mt-1 text-sm text-muted-foreground">Open a pull request to read it with the diff, the conversation, and an analyst that has the code in front of it.</p>
-        <form onSubmit={open} className="mt-6 flex items-center gap-2">
-          <Input value={ref} onChange={(e) => setRef(e.target.value)} placeholder="https://github.com/owner/repo/pull/123 or owner/repo#123" className="h-10" aria-label="Pull request" />
-          <Button type="submit" className="h-10" disabled={opening || ref.trim() === ""}>
-            {opening ? <Icon name="Loading" className="size-4 animate-spin" /> : <Icon name="GitPullRequest" className="size-4" />}
-            {opening ? "Fetching…" : "Open"}
-          </Button>
-        </form>
-        {openError ? <p className="mt-2 text-sm text-destructive">{openError}</p> : null}
-        <div className="mt-10">
-          <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Recent</div>
-          {error ? <p className="text-sm text-destructive">{error}</p> : reviews === null ? <p className="text-sm text-muted-foreground">Loading…</p> : reviews.length === 0 ? <EmptyState>No reviews yet.</EmptyState> : (
-            <ul className="divide-y divide-border/60 rounded-lg border border-border">
-              {reviews.map((r) => (
-                <li key={r.id}>
-                  <button type="button" onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: r.id })} className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-state-hover">
-                    <Icon name="GitPullRequest" className={cn("size-4 shrink-0", r.state === "OPEN" ? "text-primary" : "text-muted-foreground")} />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-medium">{r.title}</span>
-                      <span className="block truncate text-xs text-muted-foreground">{r.owner}/{r.repo} #{r.number} · {r.state.toLowerCase()}{r.pendingCount > 0 ? ` · ${r.pendingCount} pending` : ""}</span>
-                    </span>
-                    <span className="shrink-0 text-xs text-muted-foreground">{timeAgo(r.updatedAt)}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      </div>
-    </div>
-  );
+  return <BoardPage onOpen={(reviewId) => navigate.toPluginPanel(PANEL_PATH, { subPath: reviewId })} />;
 }
 
 export default definePluginApp((app) => {
