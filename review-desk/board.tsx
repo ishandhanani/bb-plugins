@@ -84,8 +84,8 @@ function CiBar({ card }: { card: ReviewSummary }) {
       </div>
       {card.failingChecks.length > 0 ? (
         <ul className="space-y-0.5">
-          {card.failingChecks.map((c) => (
-            <li key={c.name} className="flex items-center gap-1 truncate text-[11px] text-destructive">
+          {card.failingChecks.map((c, i) => (
+            <li key={`${i}-${c.name}`} className="flex items-center gap-1 truncate text-[11px] text-destructive">
               <Icon name="CircleX" className="size-3 shrink-0" />
               {c.url ? <UrlLink href={c.url} className="min-w-0 truncate hover:underline">{c.name}</UrlLink> : <span className="min-w-0 truncate">{c.name}</span>}
             </li>
