@@ -14,8 +14,7 @@ import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi, type PluginMentionItem, type PluginMentionSearchContext } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { MENTION_PROVIDER_ID, decodeMentionRef, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
-import { computeSlop, type SlopReport } from "./slop";
-import { BRIEF_FENCE, type Brief, type BriefEvidence } from "./brief-spec";
+import { BRIEF_FENCE, type Brief } from "./brief-spec";
 import { GUIDE_FENCE, GUIDE_ROLES, type Guide, type GuideFile, type GuideHop, type GuideRole, type GuideStep } from "./guide-spec";
 import { BOARD_STAGES, BOARD_STAGE_LABEL, isBoardStage, type BoardStage } from "./board-spec";
 import {
@@ -182,12 +181,9 @@ const providerOptionSchema = z.object({
 });
 export type ProviderOption = z.infer<typeof providerOptionSchema>;
 
-/** The Brief tab's state: deterministic slop signals plus the helper-written brief. Payloads stay loose on the wire; app.tsx casts to the shared types. */
+/** The Brief tab's state: the helper-written brief. Payloads stay loose on the wire; app.tsx casts to the shared types. */
 const briefStateSchema = z.object({
   headSha: z.string(),
-  signalsStatus: z.enum(["missing", "computing", "ready", "failed"]),
-  signals: z.record(z.string(), z.unknown()).nullable(),
-  signalsError: z.string().nullable(),
   briefStatus: z.enum(["missing", "writing", "ready", "failed"]),
   brief: z.record(z.string(), z.unknown()).nullable(),
   briefError: z.string().nullable(),
@@ -350,16 +346,14 @@ export const rpcContract = defineRpcContract({
     output: okSchema,
   },
   context_providers: { input: z.null(), output: z.object({ providers: z.array(providerOptionSchema), defaultProvider: z.string() }) },
-  /** Signals compute on first call for a head; the brief is written on first call too when autoBrief is on. */
-  brief_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: briefStateSchema },
+  /** The brief is written on first call when autoBrief is on. */
+  brief_get: { input: reviewIdSchema, output: briefStateSchema },
   /** (Re)write the plain-English brief at the current head. */
   brief_write: { input: reviewIdSchema, output: briefStateSchema },
   /** Simple English rewrites of the comments. In eager mode missing ones are queued on each call; `refresh` throws the cache away and rewrites everything. */
   simple_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: simpleStateSchema },
   /** Rewrite these comments now, ahead of anything else queued; a failed one is tried again. */
   simple_request: { input: z.object({ reviewId: z.string(), keys: z.array(z.string()).min(1).max(200) }), output: simpleStateSchema },
-  /** Put one slop signal's evidence lines into the diff as notes (or take them out again). */
-  notes_from_signal: { input: z.object({ reviewId: z.string(), signalId: z.string(), show: z.boolean() }), output: z.object({ count: z.number() }) },
   /** Ask the helper to find slop and cleanups; notes arrive over realtime. */
   notes_find: { input: reviewIdSchema, output: okSchema },
   note_add: {
@@ -645,15 +639,11 @@ function createStore(db: Database.Database) {
     resetSimpleWriting: db.prepare<[]>(`UPDATE simple_comments SET status = 'queued' WHERE status = 'writing'`),
     brief: db.prepare<[string], BriefRow>(`SELECT * FROM briefs WHERE review_id = ?`),
     ensureBrief: db.prepare<[string, string, number]>(`INSERT INTO briefs (review_id, head_sha, updated_at) VALUES (?, ?, ?) ON CONFLICT(review_id) DO NOTHING`),
-    setSignals: db.prepare<[string, string, string | null, string | null, number, string]>(
-      `UPDATE briefs SET head_sha = ?, signals_status = ?, signals_json = ?, signals_error = ?, updated_at = ? WHERE review_id = ?`,
-    ),
     setBrief: db.prepare<[string, string | null, string | null, string | null, string | null, number, string]>(
       `UPDATE briefs SET brief_status = ?, brief_head_sha = ?, brief_json = ?, brief_raw = ?, brief_error = ?, updated_at = ? WHERE review_id = ?`,
     ),
     notes: db.prepare<[string], NoteRow>(`SELECT * FROM notes WHERE review_id = ? ORDER BY path ASC, line ASC, created_at ASC`),
     noteById: db.prepare<[string], NoteRow>(`SELECT * FROM notes WHERE id = ?`),
-    notesBySignal: db.prepare<[string, string], NoteRow>(`SELECT * FROM notes WHERE review_id = ? AND signal_id = ?`),
     insertNote: db.prepare<[string, string, string, string, number, number | null, string, string, string, string, string, string | null, string, string | null, string | null, number, number]>(
       `INSERT INTO notes (id, review_id, head_sha, path, line, start_line, side, kind, severity, title, body, suggestion, source, signal_id, anchor_hash, state, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
@@ -662,7 +652,6 @@ function createStore(db: Database.Database) {
     setNoteBody: db.prepare<[string, number, string]>(`UPDATE notes SET body = ?, updated_at = ? WHERE id = ?`),
     setNoteLine: db.prepare<[number, number | null, string, number, string]>(`UPDATE notes SET line = ?, start_line = ?, head_sha = ?, updated_at = ? WHERE id = ?`),
     deleteNote: db.prepare<[string]>(`DELETE FROM notes WHERE id = ?`),
-    deleteSignalNotes: db.prepare<[string, string]>(`DELETE FROM notes WHERE review_id = ? AND signal_id = ? AND state IN ('open', 'stale')`),
     deleteNotesBySource: db.prepare<[string, string]>(`DELETE FROM notes WHERE review_id = ? AND source = ? AND state <> 'promoted'`),
     deleteDismissedNotes: db.prepare<[string]>(`DELETE FROM notes WHERE review_id = ? AND state = 'dismissed'`),
     deleteAllNotes: db.prepare<[string]>(`DELETE FROM notes WHERE review_id = ? AND state <> 'promoted'`),
@@ -1894,72 +1883,19 @@ export default async function plugin(bb: BbPluginApi) {
     return start !== -1 && end > start ? text.slice(start, end + 1) : null;
   }
 
-  // -- brief: slop signals + plain-English summary ---------------------------
-
-  const signalRuns = new Set<string>();
+  // -- brief: the helper's plain-English summary ------------------------------
 
   function briefState(row: ReviewRow): BriefState {
     const b = q.brief.get(row.id);
-    const signalsCurrent = b !== undefined && b.head_sha === row.head_sha;
-    const signalsStatus = signalRuns.has(row.id) ? "computing" : !signalsCurrent ? "missing" : b.signals_status === "ready" || b.signals_status === "failed" ? b.signals_status : "missing";
     const briefStatus = b === undefined ? "missing" : b.brief_status === "writing" || b.brief_status === "ready" || b.brief_status === "failed" ? b.brief_status : "missing";
     return {
       headSha: row.head_sha,
-      signalsStatus,
-      signals: signalsCurrent && b.signals_status === "ready" ? parseJson<Record<string, unknown> | null>(b.signals_json, null) : null,
-      signalsError: signalsCurrent ? b.signals_error : null,
       briefStatus,
       brief: b?.brief_status === "ready" ? parseJson<Record<string, unknown> | null>(b.brief_json, null) : null,
       briefError: b?.brief_error ?? null,
       stale: b?.brief_status === "ready" && b.brief_head_sha !== row.head_sha,
       updatedAt: b?.updated_at ?? null,
     };
-  }
-
-  async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-    const out: R[] = new Array(items.length);
-    let next = 0;
-    await Promise.all(
-      Array.from({ length: Math.min(limit, items.length) }, async () => {
-        while (next < items.length) {
-          const i = next++;
-          out[i] = await fn(items[i]);
-        }
-      }),
-    );
-    return out;
-  }
-
-  function startSignals(row: ReviewRow): void {
-    if (signalRuns.has(row.id)) return;
-    signalRuns.add(row.id);
-    q.ensureBrief.run(row.id, row.head_sha, Date.now());
-    publish(row.id, "brief");
-    void (async () => {
-      try {
-        const files = (await filesFor(row)).filter((f) => !f.binary && f.additions + f.deletions > 0);
-        const patches = new Map<string, string>();
-        await mapLimit(files, 8, async (f) => {
-          const result = await host.call("git_patch", { worktree: row.worktree, baseSha: row.base_sha, headSha: row.head_sha, path: f.path, oldPath: f.oldPath }, hostOptions(row));
-          patches.set(f.path, result.patch);
-        });
-        const codemap = codemapState(row);
-        const moduleOf = codemap.status === "ready" && codemap.codemap !== null ? new Map(codemap.codemap.files.map((f) => [f.path, f.module])) : null;
-        const report = computeSlop({ files: await filesFor(row), patches, title: row.title, body: row.body, moduleOf });
-        q.setSignals.run(row.head_sha, "ready", JSON.stringify(report), null, Date.now(), row.id);
-      } catch (cause) {
-        q.setSignals.run(row.head_sha, "failed", null, errorMessage(cause), Date.now(), row.id);
-      } finally {
-        signalRuns.delete(row.id);
-        publish(row.id, "brief");
-      }
-    })();
-  }
-
-  function signalsSummary(report: SlopReport | null): string {
-    if (report === null) return "(not computed)";
-    if (report.signals.length === 0) return "none";
-    return report.signals.map((s) => `- ${s.label} (${s.count}): ${s.evidence.slice(0, 3).map((e) => (e.line === null ? e.note : `${e.path}:${e.line} ${e.note}`)).join("; ")}`).join("\n");
   }
 
   /**
@@ -2013,24 +1949,15 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function briefPrompt(row: ReviewRow): Promise<string> {
     const files = await filesFor(row);
-    const state = briefState(row);
-    const report = state.signals as unknown as SlopReport | null;
     return [
       `Job: write the brief for this PR. Reply with exactly one fenced block tagged ${BRIEF_FENCE} containing this JSON:`,
       "{",
       '  "summary": string,',
-      '  "areas": [{ "module": string, "what": string, "path": string }],',
-      '  "claims": [{ "claim": string, "verdict": "matches" | "partly" | "no-evidence" | "contradicted", "evidence": [{ "path": string, "line": number }], "note": string }],',
-      '  "ai": { "score": number, "reasons": [{ "reason": string, "evidence": [{ "path": string, "line": number }] }] }',
+      '  "areas": [{ "module": string, "what": string, "path": string }]',
       "}",
       "",
-      "summary: plain English for a reader who knows this codebase but has not read the diff. Say what the code does now that it did not do before, and what changes for callers or operators. 5 to 10 sentences, each under 20 words, active voice, everyday words. Name code by its identifiers. No marketing words (robust, seamless, comprehensive, leverage, enhance). Describe the diff, not the description.",
+      "summary: a Markdown bullet list for a reader who knows this codebase but has not read the diff. 4 to 8 bullets, each starting with `- `. One bullet per behavior change: what the code does now that it did not do before, or what changes for callers or operators. Each bullet is one sentence under 20 words, active voice, everyday words. No heading and no prose outside the list. Name code by its identifiers. No marketing words (robust, seamless, comprehensive, leverage, enhance). Describe the diff, not the description.",
       "areas: one entry per module touched, at most 8, what changed there in one sentence, path = the file that matters most.",
-      "claims: every concrete claim the PR description makes, at most 12. Check each against the diff and the code. verdict: matches, partly, no-evidence (the diff has nothing for it), or contradicted. evidence: head line numbers in changed files. note: one sentence when the verdict is not matches, else empty.",
-      "ai.score: how much this PR reads like unedited AI output, 0 = clearly written and edited by a person, 100 = raw generation. Judge the comments, naming, defensive noise, tests, and description shape from the code itself. Give exactly 3 reasons with evidence lines. The deterministic signals below are for orientation; verify before agreeing with them.",
-      "",
-      `Deterministic signals (score ${report?.score ?? "n/a"}):`,
-      signalsSummary(report),
       "",
       `PR title: ${row.title}`,
       "PR description:",
@@ -2047,8 +1974,6 @@ export default async function plugin(bb: BbPluginApi) {
   const rawBriefSchema = z.object({
     summary: z.string().optional(),
     areas: z.array(z.object({ module: z.coerce.string(), what: z.string().optional(), path: z.string().nullable().optional() })).optional(),
-    claims: z.array(z.object({ claim: z.string(), verdict: z.string().optional(), evidence: z.array(z.object({ path: z.string(), line: z.coerce.number().nullable().optional() })).optional(), note: z.string().nullable().optional() })).optional(),
-    ai: z.object({ score: z.coerce.number().optional(), reasons: z.array(z.object({ reason: z.string(), evidence: z.array(z.object({ path: z.string(), line: z.coerce.number().nullable().optional() })).optional() })).optional() }).optional(),
   });
 
   function normalizeBrief(raw: unknown, files: ChangedFile[]): Brief {
@@ -2059,25 +1984,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (paths.has(clean)) return clean;
       return files.find((f) => f.path.endsWith(`/${clean}`))?.path ?? null;
     };
-    const evidence = (list: { path: string; line?: number | null }[] | undefined): BriefEvidence[] =>
-      (list ?? []).slice(0, 6).map((e) => {
-        const resolved = resolvePath(e.path);
-        return { path: resolved ?? e.path, line: typeof e.line === "number" && e.line > 0 ? Math.round(e.line) : null, found: resolved !== null };
-      });
-    const verdicts = new Set(["matches", "partly", "no-evidence", "contradicted"]);
     return {
       summary: (parsed.summary ?? "").trim(),
       areas: (parsed.areas ?? []).slice(0, 8).map((a) => ({ module: a.module, what: (a.what ?? "").trim(), path: a.path ? resolvePath(a.path) : null })),
-      claims: (parsed.claims ?? []).slice(0, 12).map((c) => ({
-        claim: c.claim.trim(),
-        verdict: (verdicts.has((c.verdict ?? "").toLowerCase()) ? (c.verdict ?? "").toLowerCase() : "no-evidence") as Brief["claims"][number]["verdict"],
-        evidence: evidence(c.evidence),
-        note: (c.note ?? "").trim(),
-      })),
-      ai: {
-        score: Math.max(0, Math.min(100, Math.round(parsed.ai?.score ?? 0))),
-        reasons: (parsed.ai?.reasons ?? []).slice(0, 4).map((r) => ({ reason: r.reason.trim(), evidence: evidence(r.evidence) })),
-      },
     };
   }
 
@@ -2575,9 +2484,9 @@ export default async function plugin(bb: BbPluginApi) {
   // -- private notes ----------------------------------------------------------
   //
   // Notes live only in this plugin until promoted to a pending comment. They
-  // come from slop signals (per signal, on request), from the helper's
-  // "find slop and cleanups" job, or from the reviewer marking a comment
-  // private. Each carries a content hash of its line so it follows pushes.
+  // come from the helper's "find slop and cleanups" job or from the reviewer
+  // marking a comment private. Each carries a content hash of its line so it
+  // follows pushes.
 
   const NOTES_FENCE = "review-notes";
 
@@ -2611,42 +2520,8 @@ export default async function plugin(bb: BbPluginApi) {
     return out;
   }
 
-  const SIGNAL_TITLES: Record<string, string> = {
-    "ai-phrasing": "AI phrasing in a comment",
-    "restating-comments": "Comment repeats the code",
-    "defensive-noise": "Defensive noise",
-    "tests-weakened": "Test weakened",
-    stubs: "Stub or deferral",
-    "commented-code": "Commented-out code",
-    duplication: "Duplicated block",
-    scope: "Outside the stated scope",
-    description: "Description shape",
-    "over-commenting": "Over-commented",
-  };
-
-  async function notesFromSignal(row: ReviewRow, signalId: string, show: boolean): Promise<number> {
-    if (!show) {
-      const before = q.notesBySignal.all(row.id, signalId).length;
-      q.deleteSignalNotes.run(row.id, signalId);
-      publish(row.id, "notes");
-      return before;
-    }
-    const report = briefState(row).signals as unknown as SlopReport | null;
-    const signal = report?.signals.find((s) => s.id === signalId);
-    if (signal === undefined) throw new Error("that signal is not in the current report; recompute first");
-    const kind: Note["kind"] = signalId === "tests-weakened" || signalId === "defensive-noise" || signalId === "stubs" ? "risk" : signalId === "scope" ? "question" : "slop";
-    const severity: Note["severity"] = signalId === "tests-weakened" ? "high" : signalId === "stubs" || signalId === "defensive-noise" || signalId === "duplication" ? "medium" : "low";
-    const inputs: NoteInput[] = signal.evidence
-      .filter((e) => e.path !== "" && e.line !== null)
-      .map((e) => ({ path: e.path, line: e.line ?? 1, startLine: null, side: e.side === "old" ? "LEFT" : "RIGHT", kind, severity, title: SIGNAL_TITLES[signalId] ?? signal.label, body: `${e.note}\n\n${signal.description}`, suggestion: null, source: "signal", signalId }));
-    const added = await insertNotes(row, inputs);
-    publish(row.id, "notes");
-    return added.length;
-  }
-
   async function notesPrompt(row: ReviewRow): Promise<string> {
     const files = await filesFor(row);
-    const report = briefState(row).signals as unknown as SlopReport | null;
     return [
       `Job: find AI slop and cleanups in this PR. Reply with exactly one fenced block tagged ${NOTES_FENCE} containing a JSON array:`,
       '[{ "path": string, "line": number, "endLine"?: number, "kind": "slop" | "cleanup" | "risk" | "question", "severity": "low" | "medium" | "high", "title": string, "body": string, "suggestion"?: string }]',
@@ -2655,9 +2530,6 @@ export default async function plugin(bb: BbPluginApi) {
       "kind: slop = generated residue a person would cut (narrating comments, filler docstrings on private helpers, boilerplate, names that read generated); cleanup = dead or duplicated code, leftovers, stubs, inconsistent patterns; risk = weakened or skipped tests, swallowed errors, defensive noise that hides failures, behavior the description does not mention; question = something the reviewer should ask the author.",
       "title: at most 12 words. body: one to three plain-English sentences saying what and why, no filler. suggestion: replacement code for the lines only when a concrete rewrite is obvious; leave it out otherwise.",
       "At most 25 notes, most important first. Skip anything a formatter fixes. Read the diff; do not invent lines. Skip lines that already carry a GitHub review thread if the thread says the same thing.",
-      "",
-      `Deterministic signals for orientation (verify before repeating them):`,
-      signalsSummary(report),
       "",
       `PR title: ${row.title}`,
       `Changed files (${files.length}):`,
@@ -2737,10 +2609,9 @@ export default async function plugin(bb: BbPluginApi) {
     return parts.join("\n\n").trim();
   }
 
-  /** Signals for the head, computing when missing or on refresh; the brief starts once per review when autoBrief is on. Rewrites go through brief_write. */
-  function briefGet(row: ReviewRow, refresh: boolean): BriefState {
+  /** The brief starts once per review when autoBrief is on. Rewrites go through brief_write. */
+  function briefGet(row: ReviewRow): BriefState {
     const state = briefState(row);
-    if (refresh || state.signalsStatus === "missing") startSignals(row);
     if (autoBrief && state.briefStatus === "missing") void writeBrief(row);
     // A brief re-queued by a plugin reload goes out on the first look at the review.
     else if (state.briefStatus === "writing") pumpHelper(row.id);
@@ -2917,10 +2788,9 @@ export default async function plugin(bb: BbPluginApi) {
       wantGuide(row, true);
       return guideState(row);
     },
-    brief_get: ({ reviewId, refresh }) => briefGet(requireReview(reviewId), refresh === true),
+    brief_get: ({ reviewId }) => briefGet(requireReview(reviewId)),
     brief_write: async ({ reviewId }) => {
       const row = requireReview(reviewId);
-      if (briefState(row).signalsStatus === "missing") startSignals(row);
       await writeBrief(row);
       return briefState(row);
     },
@@ -2934,7 +2804,6 @@ export default async function plugin(bb: BbPluginApi) {
       requestSimple(row, keys);
       return simpleState(row);
     },
-    notes_from_signal: async ({ reviewId, signalId, show }) => ({ count: await notesFromSignal(requireReview(reviewId), signalId, show) }),
     notes_find: async ({ reviewId }) => {
       await findNotes(requireReview(reviewId));
       return { ok: true as const };

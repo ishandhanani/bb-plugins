@@ -33,9 +33,8 @@ import { parsePatchFiles } from "@pierre/diffs";
 import type { BriefState, CodemapState, CommitInfo, FileEntry, GuideState, Note, NoteKind, PendingComment, ProviderOption, Review, Seat, SelectionRef, SimpleMode, SimpleState, rpcContract } from "./server";
 import type { ChangedFile } from "./host-contract";
 import type { Codemap, GhThread } from "./host-contract";
-import type { Brief, BriefEvidence, ClaimVerdict } from "./brief-spec";
+import type { Brief } from "./brief-spec";
 import type { Guide, GuideFile, GuideRole } from "./guide-spec";
-import type { Evidence as SlopEvidence, SlopReport } from "./slop";
 import { MENTION_PROVIDER_ID, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
 import { BoardPage } from "./board";
 import { Button } from "@/components/ui/button";
@@ -50,9 +49,8 @@ const PANEL_ID = "reviews";
 const PANEL_PATH = "reviews";
 const REVIEW_CHANGED = "review-changed";
 const PROVIDER_KEY = "review-desk:provider";
-const SIMPLE_KEY = "review-desk:simple-english";
 const selectionKey = (reviewId: string) => `review-desk:selection:${reviewId}`;
-/** How the Changes list is ordered: as the guide reads the PR, or by path. A preference, not per review. */
+/** How the Changes list is ordered: by path (the default), or as the guide reads the PR. A preference, not per review. */
 const ORDER_KEY = "review-desk:order";
 const ORDER_EVENT = "review-desk:order";
 type FileOrder = "guide" | "path";
@@ -316,9 +314,9 @@ function useBrief(reviewId: string | null) {
   const [state, setState] = useState<BriefState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const load = useCallback(
-    (refresh = false) => {
+    () => {
       if (reviewId === null) return;
-      rpc.call("brief_get", { reviewId, refresh }).then(
+      rpc.call("brief_get", { reviewId }).then(
         (result) => {
           setState(result);
           setError(null);
@@ -336,7 +334,7 @@ function useBrief(reviewId: string | null) {
     const p = payloadReview(payload);
     if (p !== null && p.reviewId === reviewId && (p.what === "brief" || p.what === "synced" || p.what === "codemap")) load();
   });
-  const busy = state !== null && (state.signalsStatus === "computing" || state.briefStatus === "writing");
+  const busy = state !== null && state.briefStatus === "writing";
   useEffect(() => {
     if (!busy) return;
     const timer = setInterval(() => load(), 6000);
@@ -346,7 +344,7 @@ function useBrief(reviewId: string | null) {
     if (reviewId === null) return;
     rpc.call("brief_write", { reviewId }).then(setState, (cause: unknown) => toast.error(describeError(cause)));
   }, [rpc, reviewId]);
-  return { state, error, refresh: () => load(true), rewrite };
+  return { state, error, rewrite };
 }
 
 /** The helper-written guide over the codemap: overview, flow, reading steps, one line per file. */
@@ -387,7 +385,7 @@ function useGuide(reviewId: string | null) {
 }
 
 function useFileOrder(): [FileOrder, (order: FileOrder) => void] {
-  const read = (): FileOrder => (readStorage<FileOrder>(ORDER_KEY) === "path" ? "path" : "guide");
+  const read = (): FileOrder => (readStorage<FileOrder>(ORDER_KEY) === "guide" ? "guide" : "path");
   const [order, setOrderState] = useState<FileOrder>(read);
   useEffect(() => {
     const onChange = () => setOrderState(read());
@@ -406,13 +404,10 @@ function useFileOrder(): [FileOrder, (order: FileOrder) => void] {
 //
 // The server rewrites GitHub comments through a hidden thread. Each comment
 // body flips between the original and its rewrite, asking for the rewrite the
-// first time it is shown; the top-bar toggle sets which side comments start on.
+// first time it is shown; every comment starts on the original.
 // ---------------------------------------------------------------------------
 
 interface SimpleContext {
-  /** Comments start on the Simple English side. */
-  on: boolean;
-  setOn(on: boolean): void;
   mode: SimpleMode;
   items: Record<string, string>;
   pending: string[];
@@ -420,12 +415,11 @@ interface SimpleContext {
   /** Ask the server to rewrite this comment now; calls within a tick are sent as one request. */
   request(key: string): void;
 }
-const SimpleCtx = createContext<SimpleContext>({ on: false, setOn: () => undefined, mode: "off", items: {}, pending: [], error: null, request: () => undefined });
+const SimpleCtx = createContext<SimpleContext>({ mode: "off", items: {}, pending: [], error: null, request: () => undefined });
 
 function SimpleProvider({ reviewId, children }: { reviewId: string; children: ReactNode }) {
   const rpc = useRpc<Contract>();
   const [state, setState] = useState<SimpleState | null>(null);
-  const [on, setOnState] = useState<boolean>(() => readStorage<boolean>(SIMPLE_KEY) ?? false);
   const load = useCallback(() => {
     rpc.call("simple_get", { reviewId }).then(setState, () => undefined);
   }, [rpc, reviewId]);
@@ -461,30 +455,13 @@ function SimpleProvider({ reviewId, children }: { reviewId: string; children: Re
     return () => clearInterval(timer);
   }, [busy, load]);
   const value = useMemo<SimpleContext>(() => ({
-    on,
-    setOn: (next) => {
-      setOnState(next);
-      writeStorage(SIMPLE_KEY, next);
-    },
     mode: state?.mode ?? "lazy",
     items: state?.items ?? {},
     pending: state?.pending ?? [],
     error: state?.error ?? null,
     request,
-  }), [on, state, request]);
+  }), [state, request]);
   return <SimpleCtx.Provider value={value}>{children}</SimpleCtx.Provider>;
-}
-
-function SimpleToggle() {
-  const simple = useContext(SimpleCtx);
-  if (simple.mode === "off") return null;
-  const title = `${simple.on ? "Comments start in Simple English; press to start on the original." : "Start every comment in Simple English; each comment keeps its own switch."}${simple.error !== null ? ` Last error: ${simple.error}` : ""}`;
-  const busy = simple.pending.length > 0;
-  return (
-    <Button variant="ghost" size="sm" className={cn("h-7 text-xs", simple.on && "text-primary")} onClick={() => simple.setOn(!simple.on)} aria-pressed={simple.on} title={title}>
-      <Icon name={busy ? "Loading" : "TextWrap"} className={cn("size-3.5", busy && "animate-spin")} />Simple English{busy ? ` · ${simple.pending.length}` : ""}
-    </Button>
-  );
 }
 
 function useProviders() {
@@ -708,7 +685,7 @@ function CommentBody({ body, className, simpleKey }: { body: string; className?:
   const simple = useContext(SimpleCtx);
   const [flipped, setFlipped] = useState<boolean | null>(null);
   const canSimple = simpleKey !== undefined && simple.mode !== "off";
-  const showSimple = canSimple && (flipped ?? simple.on);
+  const showSimple = canSimple && flipped === true;
   const rewrite = showSimple && simpleKey !== undefined ? simple.items[simpleKey] : undefined;
   const writing = showSimple && rewrite === undefined && simpleKey !== undefined && simple.pending.includes(simpleKey);
   useEffect(() => {
@@ -1059,7 +1036,7 @@ function FileCard(props: FileCardProps) {
       ) : fileDiff === null ? (
         <div className="px-3 py-3 text-xs text-muted-foreground">No textual diff.</div>
       ) : (
-        <div className="overflow-x-auto text-[12.5px]">
+        <div className="text-[12.5px]">
           <FileDiff<Anno>
             fileDiff={fileDiff}
             options={{
@@ -1075,7 +1052,7 @@ function FileCard(props: FileCardProps) {
               onGutterUtilityClick: (range) => props.onOpenComposer(file.path, range),
               loadDiffFiles,
               hunkSeparators: "line-info",
-              overflow: "scroll",
+              overflow: "wrap",
             }}
             selectedLines={selected}
             lineAnnotations={annotations}
@@ -1416,121 +1393,19 @@ function CommitView({ reviewId, review, target, theme, diffStyle, selection, onS
 }
 
 // ---------------------------------------------------------------------------
-// Brief: slop meter from deterministic signals, plus the helper's plain-English
-// summary, areas, claims checked against the diff, and its own AI read.
+// Brief: the helper's plain-English summary of the PR as bullets, plus the
+// areas it touches.
 // ---------------------------------------------------------------------------
 
 type JumpFn = (path: string, line: number | null, side: "old" | "new") => void;
 
-function scoreTone(score: number): string {
-  return score < 20 ? "text-primary" : score < 45 ? "text-amber-600 dark:text-amber-400" : score < 70 ? "text-orange-600 dark:text-orange-400" : "text-destructive";
-}
-
-const VERDICT_STYLE: Record<ClaimVerdict, { label: string; className: string }> = {
-  matches: { label: "matches", className: "border-primary/40 bg-primary/10 text-primary" },
-  partly: { label: "partly", className: "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300" },
-  "no-evidence": { label: "no evidence", className: "border-border bg-muted text-muted-foreground" },
-  contradicted: { label: "contradicted", className: "border-destructive/50 bg-destructive/10 text-destructive" },
-};
-
-function EvidenceLink({ path, line, side, note, onJump }: { path: string; line: number | null; side: "old" | "new"; note?: string; onJump: JumpFn }) {
-  if (path === "") return <span className="text-muted-foreground">{note}</span>;
-  return (
-    <span className="inline-flex min-w-0 flex-wrap items-baseline gap-x-1.5">
-      <button type="button" onClick={() => onJump(path, line, side)} className="shrink-0 font-mono text-[11px] text-foreground hover:underline" title={path}>
-        {splitPath(path).name}{line !== null ? `:${line}` : ""}
-      </button>
-      {note ? <span className="min-w-0 text-muted-foreground">{note}</span> : null}
-    </span>
-  );
-}
-
-function SlopMeter({ report, aiScore, onJump, onRecompute, computing, signalNotes, onToggleSignal }: { report: SlopReport | null; aiScore: number | null; onJump: JumpFn; onRecompute: () => void; computing: boolean; signalNotes: Set<string>; onToggleSignal: (signalId: string, show: boolean) => void }) {
-  const [open, setOpen] = useState<string | null>(null);
-  const det = report?.score ?? null;
-  const combined = det === null ? aiScore : aiScore === null ? det : Math.round(0.6 * det + 0.4 * aiScore);
-  const verdict = combined === null ? "" : combined < 20 ? "Reads hand-made" : combined < 45 ? "Some polish needed" : combined < 70 ? "Heavy AI residue" : "Reads like unedited generation";
-  const maxScore = Math.max(1, ...(report?.signals.map((s) => s.score) ?? [1]));
-  return (
-    <section className="rounded-lg border border-border bg-card p-4">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-semibold">Slop meter</span>
-        <span className="text-xs text-muted-foreground">a heuristic, every number opens its evidence</span>
-        {report?.aiAttributed ? <span className="rounded-full border border-violet-500/40 bg-violet-500/10 px-1.5 text-[10px] text-violet-700 dark:text-violet-300">description credits an AI</span> : null}
-        <Button variant="ghost" size="sm" className="ml-auto h-6 px-1.5 text-xs" onClick={onRecompute} disabled={computing} title="Recompute the signals from the diff">
-          <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", computing && "animate-spin")} />
-        </Button>
-      </div>
-      {report === null ? (
-        <p className="mt-3 inline-flex items-center gap-1.5 text-xs text-muted-foreground"><Icon name="Loading" className="size-3.5 animate-spin" />Reading every changed line…</p>
-      ) : (
-        <>
-          <div className="mt-3 flex items-center gap-4">
-            <div className={cn("text-4xl font-semibold tabular-nums leading-none", scoreTone(combined ?? 0))}>{combined}</div>
-            <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium">{verdict}</div>
-              <div className="relative mt-1.5 h-2 rounded-full bg-gradient-to-r from-primary/40 via-amber-400/60 to-destructive/70">
-                <div className="absolute -top-0.5 size-3 -translate-x-1/2 rounded-full border-2 border-background bg-foreground shadow" style={{ left: `${combined ?? 0}%` }} />
-              </div>
-              <div className="mt-1 flex justify-between text-[10px] text-muted-foreground"><span>hand-made</span><span>unedited generation</span></div>
-              <div className="mt-1 text-xs text-muted-foreground">
-                signals {det}{aiScore !== null ? ` · helper's read ${aiScore} · shown 60/40` : " · helper's read pending"} · {report.stats.addedLines.toLocaleString()} added lines in {report.stats.codeFiles} code files
-              </div>
-            </div>
-          </div>
-          {report.signals.length === 0 ? <p className="mt-3 text-xs text-muted-foreground">No signals fired.</p> : (
-            <ul className="mt-3 divide-y divide-border/60 rounded-md border border-border/60">
-              {report.signals.map((s) => (
-                <li key={s.id}>
-                  <button type="button" onClick={() => setOpen((o) => (o === s.id ? null : s.id))} className="flex w-full items-center gap-3 px-3 py-2 text-left text-xs hover:bg-state-hover" aria-expanded={open === s.id}>
-                    <Icon name={open === s.id ? "ChevronDown" : "ChevronRight"} className="size-3.5 shrink-0 text-muted-foreground" />
-                    <span className="w-44 shrink-0 font-medium">{s.label}</span>
-                    <span className="w-10 shrink-0 rounded-full bg-foreground/10 px-1.5 text-center tabular-nums">{s.count}</span>
-                    <span className="min-w-0 flex-1 truncate text-muted-foreground">{s.description}</span>
-                    <span className="h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-border"><span className="block h-full rounded-full bg-amber-500/80" style={{ width: `${Math.round((100 * s.score) / maxScore)}%` }} /></span>
-                  </button>
-                  {open === s.id ? (
-                    <ul className="space-y-1 border-t border-border/60 bg-background/60 px-3 py-2 text-xs">
-                      {s.evidence.some((e: SlopEvidence) => e.line !== null) ? (
-                        <li className="flex items-center gap-2 pb-1">
-                          <Button variant={signalNotes.has(s.id) ? "default" : "outline"} size="sm" className="h-6 text-xs" onClick={() => onToggleSignal(s.id, !signalNotes.has(s.id))}>
-                            {signalNotes.has(s.id) ? "Hide notes in the diff" : "Show as notes in the diff"}
-                          </Button>
-                          <span className="text-muted-foreground">private notes on each line, promote the ones worth a comment</span>
-                        </li>
-                      ) : null}
-                      {s.evidence.map((e: SlopEvidence, i) => (
-                        <li key={i} className="flex gap-2"><span className="w-3 shrink-0 text-muted-foreground">·</span><EvidenceLink path={e.path} line={e.line} side={e.side} note={e.note} onJump={onJump} /></li>
-                      ))}
-                      {s.count > s.evidence.length ? <li className="text-muted-foreground">and {s.count - s.evidence.length} more</li> : null}
-                    </ul>
-                  ) : null}
-                </li>
-              ))}
-            </ul>
-          )}
-        </>
-      )}
-    </section>
-  );
-}
-
-function BriefPanel({ reviewId, onJump, signalNotes, onToggleSignal }: { reviewId: string; onJump: JumpFn; signalNotes: Set<string>; onToggleSignal: (signalId: string, show: boolean) => void }) {
-  const { state, error, refresh, rewrite } = useBrief(reviewId);
+function BriefPanel({ reviewId, onJump }: { reviewId: string; onJump: JumpFn }) {
+  const { state, error, rewrite } = useBrief(reviewId);
   if (error) return <p className="text-sm text-destructive">{error}</p>;
-  const report = (state?.signalsStatus === "ready" ? (state.signals as unknown as SlopReport | null) : null) ?? null;
   const brief = (state?.briefStatus === "ready" ? (state.brief as unknown as Brief | null) : null) ?? null;
   const writing = state?.briefStatus === "writing";
-  const evidenceList = (list: BriefEvidence[]) => (
-    <span className="inline-flex flex-wrap gap-x-2">
-      {list.map((e, i) => (e.found ? <EvidenceLink key={i} path={e.path} line={e.line} side="new" onJump={onJump} /> : <span key={i} className="font-mono text-[11px] text-muted-foreground line-through" title="not in this diff">{splitPath(e.path).name}{e.line !== null ? `:${e.line}` : ""}</span>))}
-    </span>
-  );
   return (
     <div className="space-y-4 text-sm">
-      <SlopMeter report={report} aiScore={brief?.ai.score ?? null} onJump={onJump} onRecompute={refresh} computing={state?.signalsStatus === "computing"} signalNotes={signalNotes} onToggleSignal={onToggleSignal} />
-      {state?.signalsStatus === "failed" ? <p className="text-xs text-destructive">Signals failed: {state.signalsError}</p> : null}
-
       <section className="rounded-lg border border-border bg-card p-4">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-sm font-semibold">What it does</span>
@@ -1560,44 +1435,6 @@ function BriefPanel({ reviewId, onJump, signalNotes, onToggleSignal }: { reviewI
           </>
         )}
       </section>
-
-      {brief !== null && brief.claims.length > 0 ? (
-        <section className="rounded-lg border border-border bg-card p-4">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold">Claims versus diff</span>
-            <span className="text-xs text-muted-foreground">
-              {brief.claims.filter((c) => c.verdict === "matches").length} of {brief.claims.length} hold up
-            </span>
-          </div>
-          <ul className="mt-3 space-y-2 text-xs">
-            {brief.claims.map((c, i) => (
-              <li key={i} className="flex gap-3 rounded-md border border-border/60 px-3 py-2">
-                <span className={cn("mt-0.5 h-fit shrink-0 rounded-full border px-1.5 text-[10px] font-medium", VERDICT_STYLE[c.verdict].className)}>{VERDICT_STYLE[c.verdict].label}</span>
-                <span className="min-w-0 flex-1">
-                  <span className="text-foreground">{c.claim}</span>
-                  {c.note ? <span className="block text-muted-foreground">{c.note}</span> : null}
-                  {c.evidence.length > 0 ? <span className="mt-0.5 block">{evidenceList(c.evidence)}</span> : null}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
-
-      {brief !== null && brief.ai.reasons.length > 0 ? (
-        <section className="rounded-lg border border-border bg-card p-4">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold">The helper's read</span>
-            <span className={cn("text-sm font-semibold tabular-nums", scoreTone(brief.ai.score))}>{brief.ai.score}</span>
-            <span className="text-xs text-muted-foreground">how much this reads like unedited AI output, from the code itself</span>
-          </div>
-          <ul className="mt-3 space-y-1.5 text-xs">
-            {brief.ai.reasons.map((r, i) => (
-              <li key={i} className="flex gap-2"><span className="w-3 shrink-0 text-muted-foreground">·</span><span className="min-w-0"><span className="text-foreground">{r.reason}</span>{r.evidence.length > 0 ? <span className="ml-2">{evidenceList(r.evidence)}</span> : null}</span></li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
     </div>
   );
 }
@@ -1615,12 +1452,13 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
     rpc.call("review_seen", { reviewId }).then(() => refetch(), () => undefined);
   }, [rpc, reviewId, refetch]);
   const [tab, setTab] = useState<Tab>("brief");
-  const [diffStyle, setDiffStyle] = useState<"unified" | "split">("unified");
+  const [diffStyle, setDiffStyle] = useState<"unified" | "split">("split");
   const [selection, setSelectionState] = useState<Selection | null>(null);
   const [composer, setComposer] = useState<Extract<Anno, { kind: "composer" }> | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [expandedOverride, setExpandedOverride] = useState<Set<string>>(new Set());
-  const [allCollapsed, setAllCollapsed] = useState(false);
+  // Every file starts collapsed; Expand all, a toggle, or a jump opens one.
+  const [allCollapsed, setAllCollapsed] = useState(true);
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [roomText, setRoomText] = useState<string | null>(null);
@@ -1759,7 +1597,6 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
         <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => void run("sync", async () => { await rpc.call("reviews_sync", { reviewId }); refetch(); toast.success("Synced with GitHub"); })} disabled={busy !== null} title="Refresh PR metadata, head, and threads">
           <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", busy === "sync" && "animate-spin")} />Sync
         </Button>
-        <SimpleToggle />
         <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: CODEMAP_TAB, target: { reviewId } })}><Icon name="Layers" className="size-3.5" />Codemap</Button>
         <Button variant="outline" size="sm" className="h-7 text-xs" onClick={openChat}><Icon name="Brain" className="size-3.5" />Chat</Button>
         <Button size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: INFO_TAB, target: { reviewId } })}>
@@ -1806,13 +1643,6 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
     notesByPath.set(n.path, [...(notesByPath.get(n.path) ?? []), n]);
   }
   const openNotes = notes.filter((n) => n.state === "open" || n.state === "stale").length;
-  const signalNotes = new Set(notes.filter((n) => n.signalId !== null).map((n) => n.signalId as string));
-  const toggleSignalNotes = (signalId: string, show: boolean) =>
-    void run("notes", async () => {
-      const r = await rpc.call("notes_from_signal", { reviewId, signalId, show });
-      refetch();
-      toast.success(show ? `${r.count} private note${r.count === 1 ? "" : "s"} added to the diff` : "Notes removed from the diff");
-    });
   const findNotes = () =>
     void run("notes", async () => {
       await rpc.call("notes_find", { reviewId });
@@ -1930,7 +1760,7 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
             ))}
           </div>
           <div className="mt-4">
-            {tab === "brief" ? <BriefPanel reviewId={reviewId} onJump={jumpToLine} signalNotes={signalNotes} onToggleSignal={toggleSignalNotes} /> : tab === "description" ? <Description body={review.body} /> : tab === "discussion" ? <Discussion reviewId={reviewId} threads={threads} /> : <Commits review={review} seen={detail.seen} onOpen={openCommit} />}
+            {tab === "brief" ? <BriefPanel reviewId={reviewId} onJump={jumpToLine} /> : tab === "description" ? <Description body={review.body} /> : tab === "discussion" ? <Discussion reviewId={reviewId} threads={threads} /> : <Commits review={review} seen={detail.seen} onOpen={openCommit} />}
           </div>
 
           <div className="mt-10 flex flex-wrap items-center gap-3">
@@ -1962,7 +1792,6 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
                     </div>
                     <div className="flex flex-wrap gap-1 border-t border-border/60 px-1 pt-1.5">
                       <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => void run("notes", async () => { await rpc.call("notes_clear", { reviewId, source: "helper" }); refetch(); })}>Clear helper notes</Button>
-                      <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => void run("notes", async () => { await rpc.call("notes_clear", { reviewId, source: "signal" }); refetch(); })}>Clear signal notes</Button>
                       <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => void run("notes", async () => { await rpc.call("notes_clear", { reviewId, dismissedOnly: true }); refetch(); })}>Clear dismissed</Button>
                     </div>
                   </div>
