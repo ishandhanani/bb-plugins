@@ -150,6 +150,11 @@ export const hostContract = defineRpcContract({
     }),
     output: z.object({ worktree: z.string(), headSha: z.string(), baseSha: z.string() }),
   },
+  /** Remove a PR worktree the plugin created, unless it has local changes. */
+  repo_remove_worktree: {
+    input: z.object({ repoPath: z.string(), worktree: z.string() }),
+    output: z.object({ removed: z.boolean(), reason: z.string().nullable() }),
+  },
   repo_clone: {
     input: z.object({ owner: z.string(), repo: z.string(), dest: z.string() }),
     output: z.object({ repoPath: z.string() }),

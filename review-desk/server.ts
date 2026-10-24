@@ -2798,12 +2798,22 @@ export default async function plugin(bb: BbPluginApi) {
     reviews_get: ({ reviewId }) => reviewDetail(reviewId),
     reviews_sync: ({ reviewId }) => syncReview(reviewId),
     reviews_remove: async ({ reviewId }) => {
+      const row = q.review.get(reviewId);
       for (const seat of q.seats.all(reviewId)) await chatReset(reviewId, seat.provider_id);
       q.deleteSimplifier.run(reviewId);
       q.deleteSimple.run(reviewId);
       q.deleteBoardStage.run(reviewId);
       q.deleteReview.run(reviewId);
       publish(reviewId, "removed");
+      // The worktree goes with the card, unless it has local changes.
+      if (row !== undefined) {
+        try {
+          const result = await host.call("repo_remove_worktree", { repoPath: row.repo_path, worktree: row.worktree }, hostOptions(row));
+          if (!result.removed) bb.log.info(`kept worktree ${row.worktree}: ${result.reason}`);
+        } catch (cause) {
+          bb.log.warn(`worktree for ${row.owner}/${row.repo}#${row.number}: ${errorMessage(cause)}`);
+        }
+      }
       return { ok: true as const };
     },
     review_patch: async ({ reviewId, path }) => {
