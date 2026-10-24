@@ -105,10 +105,14 @@ const reviewSummarySchema = z.object({
   createdAt: z.string(),
   ghUpdatedAt: z.string(),
   syncedAt: z.number(),
-  /** The column the card is in. */
-  stage: boardStageSchema,
-  /** The column GitHub's state puts it in. */
-  autoStage: boardStageSchema,
+  /** Failing checks by name (at most five), for the babysit card. */
+  failingChecks: z.array(z.object({ name: z.string(), url: z.string().nullable() })),
+  /** Date of the newest commit on the PR. */
+  lastCommitAt: z.string().nullable(),
+  /** The column the card is in; null once the PR is merged or closed. */
+  stage: boardStageSchema.nullable(),
+  /** The column GitHub's state puts it in; null once the PR is merged or closed. */
+  autoStage: boardStageSchema.nullable(),
   /** You dragged the card; it holds its column until GitHub's state changes. */
   pinned: z.boolean(),
 });
@@ -943,6 +947,7 @@ export default async function plugin(bb: BbPluginApi) {
     // A dragged card follows GitHub again once GitHub's state has moved on.
     const pin = q.boardStage.get(row.id);
     if (pin !== undefined && pin.auto_stage !== autoStage(requireReview(row.id))) {
+      // (a merged or closed PR has no auto stage, so its pin goes too)
       q.deleteBoardStage.run(row.id);
       publish(row.id, "board");
     }
@@ -1044,19 +1049,17 @@ export default async function plugin(bb: BbPluginApi) {
   // -- board -----------------------------------------------------------------
 
   /**
-   * The column GitHub's state puts a PR in. `reviewDecision` is null on
-   * repositories without required reviews, so the latest review per reviewer
-   * decides when it is missing.
+   * The column GitHub's state puts a PR in, or null once it is merged or
+   * closed. Any approval (the decision, or a reviewer's latest review; gh
+   * reports a missing decision as "") puts the PR in Babysit: approved by
+   * you or others, now watching CI until it merges.
    */
-  function autoStage(row: ReviewRow): BoardStage {
-    if (row.state !== "OPEN") return "done";
-    // gh reports a missing decision as "" on repositories without required reviews.
+  function autoStage(row: ReviewRow): BoardStage | null {
+    if (row.state !== "OPEN") return null;
     const decision = row.review_decision === "" ? null : row.review_decision;
     const reviewers = parseJson<Review["reviewers"]>(row.reviewers_json, []);
     if (decision === "CHANGES_REQUESTED" || reviewers.some((r) => r.state === "CHANGES_REQUESTED")) return "changes_requested";
-    if (decision === "APPROVED") return "approved";
-    // REVIEW_REQUIRED stays unreviewed even with approvals: a required reviewer is still missing.
-    if (decision === null && reviewers.some((r) => r.state === "APPROVED")) return "approved";
+    if (decision === "APPROVED" || reviewers.some((r) => r.state === "APPROVED")) return "babysit";
     return "unreviewed";
   }
 
@@ -1067,16 +1070,23 @@ export default async function plugin(bb: BbPluginApi) {
   function summarize(row: ReviewRow): ReviewSummary {
     const auto = autoStage(row);
     const pin = q.boardStage.get(row.id);
-    const pinned = pin !== undefined && pin.auto_stage === auto && isBoardStage(pin.stage);
+    const pinnedStage = auto !== null && pin !== undefined && pin.auto_stage === auto && isBoardStage(pin.stage) ? pin.stage : null;
     const checks = parseJson<Review["checks"]>(row.checks_json, []);
     const reviewers = parseJson<Review["reviewers"]>(row.reviewers_json, []);
+    const commits = parseJson<Review["commits"]>(row.commits_json, []);
     let passed = 0;
     let failed = 0;
+    const failingChecks: { name: string; url: string | null }[] = [];
     for (const c of checks) {
       const verdict = (c.conclusion ?? "").toLowerCase();
       if (CHECK_OK.has(verdict)) passed++;
-      else if (CHECK_FAILED.has(verdict)) failed++;
+      else if (CHECK_FAILED.has(verdict)) {
+        failed++;
+        if (failingChecks.length < 5) failingChecks.push({ name: c.name, url: c.url });
+      }
     }
+    let lastCommitAt: string | null = null;
+    for (const c of commits) if (lastCommitAt === null || c.date > lastCommitAt) lastCommitAt = c.date;
     return {
       id: row.id,
       owner: row.owner,
@@ -1103,9 +1113,11 @@ export default async function plugin(bb: BbPluginApi) {
       createdAt: row.gh_created_at,
       ghUpdatedAt: row.gh_updated_at,
       syncedAt: row.synced_at,
-      stage: pinned && isBoardStage(pin.stage) ? pin.stage : auto,
+      failingChecks,
+      lastCommitAt,
+      stage: pinnedStage ?? auto,
       autoStage: auto,
-      pinned,
+      pinned: pinnedStage !== null,
     };
   }
 
@@ -1115,8 +1127,10 @@ export default async function plugin(bb: BbPluginApi) {
 
   function moveCard(reviewId: string, stage: BoardStage | null): ReviewSummary {
     const row = requireReview(reviewId);
-    if (stage === null || stage === autoStage(row)) q.deleteBoardStage.run(reviewId);
-    else q.setBoardStage.run(reviewId, stage, autoStage(row), Date.now());
+    const auto = autoStage(row);
+    if (auto === null) throw new Error(`${row.owner}/${row.repo}#${row.number} is ${row.state.toLowerCase()}; it is not on the board`);
+    if (stage === null || stage === auto) q.deleteBoardStage.run(reviewId);
+    else q.setBoardStage.run(reviewId, stage, auto, Date.now());
     publish(reviewId, "board");
     return summarize(row);
   }
@@ -1159,11 +1173,11 @@ export default async function plugin(bb: BbPluginApi) {
     if (boardRefreshing !== null) return boardRefreshing;
     boardRefreshing = (async () => {
       const rows = q.reviews.all();
-      const queue = rows.filter((r) => autoStage(r) !== "done");
+      const queue = rows.filter((r) => r.state === "OPEN");
       const failed: BoardRefreshResult["failed"] = [];
       let synced = 0;
-      // Done PRs are not synced, but their worktrees still follow the setting.
-      for (const row of rows.filter((r) => autoStage(r) === "done")) {
+      // Merged and closed PRs are not synced, but their worktrees still follow the setting.
+      for (const row of rows.filter((r) => r.state !== "OPEN")) {
         await ensureWorktree(row).catch((cause: unknown) => bb.log.warn(`worktree for ${row.owner}/${row.repo}#${row.number}: ${errorMessage(cause)}`));
       }
       await Promise.all(
@@ -3012,8 +3026,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "open", summary: "Open or refresh a PR review", usage: "bb review-desk open <url | owner/repo#N>" },
       { name: "list", summary: "List reviews", usage: "bb review-desk list [--json]" },
       { name: "board", summary: "Print the board: every tracked PR under its column", usage: "bb review-desk board [--json]" },
-      { name: "move", summary: "Drag a card to a column, or back to the column GitHub's state gives it", usage: "bb review-desk move <reviewId> <unreviewed|changes_requested|approved|done|auto> [--json]" },
-      { name: "refresh", summary: "Sync every PR that is not done with GitHub", usage: "bb review-desk refresh [--json]" },
+      { name: "move", summary: "Drag a card to a column, or back to the column GitHub's state gives it", usage: "bb review-desk move <reviewId> <unreviewed|changes_requested|babysit|auto> [--json]" },
+      { name: "refresh", summary: "Sync every open PR with GitHub", usage: "bb review-desk refresh [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "codemap", summary: "Build or print the codemap", usage: "bb review-desk codemap <reviewId> [--json]" },
       { name: "guide", summary: "Write or print the reading guide over the codemap", usage: "bb review-desk guide <reviewId> [--rewrite] [--json]" },
@@ -3059,13 +3073,16 @@ export default async function plugin(bb: BbPluginApi) {
                 lines.push(`  ${c.id}  ${c.owner}/${c.repo}#${c.number}  ${c.title}${bits.length > 0 ? `  [${bits.join(", ")}]` : ""}`);
               }
             }
+            const closed = cards.filter((c) => c.stage === null);
+            lines.push(`Merged or closed (${closed.length})`);
+            for (const c of closed) lines.push(`  ${c.id}  ${c.owner}/${c.repo}#${c.number}  ${c.title}  [${c.state.toLowerCase()}]`);
             return ok(cards, cards.length === 0 ? "No PRs on the board." : lines.join("\n"));
           }
           case "move": {
             const [reviewId, stage] = rest;
             if (!reviewId || !stage || (stage !== "auto" && !isBoardStage(stage))) return { exitCode: 1, stderr: `usage: bb review-desk move <reviewId> <${BOARD_STAGES.join("|")}|auto>` };
             const card = moveCard(reviewId, stage === "auto" ? null : stage);
-            return ok(card, `${card.owner}/${card.repo}#${card.number} is in ${BOARD_STAGE_LABEL[card.stage]}${card.pinned ? " (dragged; follows GitHub again when its state changes)" : " (GitHub's state)"}`);
+            return ok(card, `${card.owner}/${card.repo}#${card.number} is in ${card.stage === null ? "merged or closed" : BOARD_STAGE_LABEL[card.stage]}${card.pinned ? " (dragged; follows GitHub again when its state changes)" : " (GitHub's state)"}`);
           }
           case "refresh": {
             const result = await refreshBoard();

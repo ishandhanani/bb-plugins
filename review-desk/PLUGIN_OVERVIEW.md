@@ -2,7 +2,7 @@ Review a GitHub pull request inside bb the way you would online, with a chat par
 
 ## What you get
 
-- A **board** of the pull requests you are tracking: paste a link, and the PR becomes a card under Unreviewed, Changes requested, Approved, or Done, following GitHub's state; drag a card to hold it elsewhere until GitHub moves it. Each card says in one glance what is in the way: failing checks, open threads, approvals, conflicts, your unsent comments.
+- A **board** of the pull requests you are tracking: paste a link, and the PR becomes a card under Unreviewed, Changes requested, or Babysit (approved, now watching CI until it merges), following GitHub's state; drag a card to hold it elsewhere until GitHub moves it. Each card says in one glance what is in the way: failing checks by name, open threads, approvals, conflicts, your unsent comments; a Babysit card ends in one verdict, from merge conflicts to ready to merge. Merged and closed PRs fold away under the columns.
 - A **Brief** first: a plain-English account of what the PR really does, written from the diff by a helper that reads the code, each description claim checked against the code, and a slop meter that scores how much the PR reads like unedited AI output, with every signal pointing at its lines.
 - A **PR page**: state, title, author and branches, then Description, Discussion, and Commits, then the changes as file cards with syntax-highlighted diffs, expandable context, viewed marks, and a lines-left counter.
 - **GitHub threads inline** on their lines, with reply and resolve. Checks, reviewers, assignees, and labels live in the Info tab.

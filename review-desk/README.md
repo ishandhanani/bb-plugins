@@ -4,7 +4,7 @@ Review GitHub pull requests inside bb: a document-style PR page with the diff, t
 
 ## What it does
 
-- **The board** is the landing page: paste a PR link and it becomes a card under **Unreviewed**, **Changes requested**, **Approved**, or **Done** (merged or closed). The column follows GitHub (the review decision, or the latest review per reviewer where the repository has no required reviews); drag a card to hold it elsewhere until GitHub's state changes, then it follows GitHub again. A card shows the title, `owner/repo #N`, the author, when GitHub last saw activity, and chips for what is in the way: checks passed/total (red when one fails), unresolved threads, approvals, reviewers asking for changes, merge conflicts, and your pending comments. Click a card for the PR page below. Open PRs are synced with GitHub when the board opens if they are more than ten minutes stale, on **Refresh**, and in the background on the `boardRefresh` cron; a sync skips the git fetch when the head did not move.
+- **The board** is the landing page: paste a PR link and it becomes a card under **Unreviewed** (nobody has approved), **Changes requested** (a reviewer asked for changes), or **Babysit** (approved by you or others: the decision, or any reviewer's latest review; now you watch CI until it merges). Drag a card to hold it elsewhere until GitHub's state changes, then it follows GitHub again. A card shows the title, `owner/repo #N`, the author, when GitHub last saw activity, and chips for what is in the way: checks passed/total (red when one fails), unresolved threads, approvals, reviewers asking for changes, merge conflicts, and your pending comments. A Babysit card leads with CI: a bar of passed checks, the failing checks by name linking to their runs, one verdict chip (merge conflicts, CI failing, CI running, needs a required review, still a draft, or ready to merge) and when the last commit was pushed. Merged and closed PRs leave the columns and fold into a strip under them until you remove them. Click a card for the PR page below. Open PRs are synced with GitHub when the board opens if they are more than ten minutes stale, on **Refresh**, and in the background on the `boardRefresh` cron; a sync skips the git fetch when the head did not move.
 - **Open a PR** by URL or `owner/repo#123`. The host entry finds the local checkout among your bb projects (or clones it), fetches the PR head, and keeps a detached worktree under `~/.review-desk/worktrees` on that machine (or `worktreesDir`), outside bb's data dir so the chat and helper threads can run in it.
 - **PR page**: state, title, author, base and head branches, then Description, Discussion (reviews, comments, open threads), and Commits tabs, then Changes as file cards. Files load lazily as you scroll; viewed marks and a "lines left" counter track progress.
 - **Diff** per file with Pierre diffs: unified or split, syntax highlighting from bb's code theme, expandable context, line selection.
@@ -29,6 +29,8 @@ Review GitHub pull requests inside bb: a document-style PR page with the diff, t
 - `brief-spec.ts` — the brief the helper thread returns, shared by server and app.
 - `guide-spec.ts` — the guide over the codemap the helper thread returns, shared by server and app.
 - `board-spec.ts` — the board's columns and their labels, shared by server and app.
+- `board.tsx` — the board page: columns, cards, drag and drop, the merged-or-closed strip.
+- `lib/format.ts` — `timeAgo` and `describeError`, shared by the review page and the board.
 - `mention-ref.ts` — pill identity shared by server and app (what a pill points at, how its id is encoded, its label).
 - `skills/review-desk/SKILL.md` — instructions the analyst threads receive.
 
@@ -50,7 +52,7 @@ Requires `gh` authenticated on the machine that holds the repository.
 bb review-desk open <url | owner/repo#N>
 bb review-desk list
 bb review-desk board
-bb review-desk move <reviewId> <unreviewed|changes_requested|approved|done|auto>
+bb review-desk move <reviewId> <unreviewed|changes_requested|babysit|auto>
 bb review-desk refresh
 bb review-desk ask <reviewId> <text...> [--provider <id>]
 bb review-desk codemap <reviewId>
