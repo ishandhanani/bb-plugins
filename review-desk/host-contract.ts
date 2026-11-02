@@ -167,5 +167,20 @@ export const hostContract = defineRpcContract({
     input: z.object({ threadId: z.string(), resolve: z.boolean() }),
     output: z.object({ ok: z.literal(true) }),
   },
+  /** Build diffmap's viewer once per pinned commit (clone, patch, npm ci, vite build); returns the built files. */
+  diffmap_prepare: {
+    input: z.object({}),
+    output: z.object({ assets: z.array(z.string()) }),
+  },
+  /** One built viewer file, base64. */
+  diffmap_asset: {
+    input: z.object({ path: z.string() }),
+    output: z.object({ base64: z.string() }),
+  },
+  /** The gist-shaped payload the viewer renders: the spec plus the diffs and files it references, read from the worktree. */
+  diffmap_gist: {
+    input: z.object({ worktree: z.string(), markdown: z.string(), label: z.string(), htmlUrl: z.string() }),
+    output: z.object({ json: z.string() }),
+  },
 });
 export type HostContract = typeof hostContract;

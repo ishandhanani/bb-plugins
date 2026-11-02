@@ -189,6 +189,10 @@ const mapStateSchema = z.object({
   stale: z.boolean(),
   /** The spec on file, kept while a newer one is queued or writing. */
   markdown: z.string().nullable(),
+  /** diffmap's viewer for the spec on file; null shows the Markdown. */
+  viewerUrl: z.string().nullable(),
+  /** Why the viewer cannot show it: the viewer is not built, or the spec does not resolve against the worktree. */
+  viewerError: z.string().nullable(),
   error: z.string().nullable(),
   updatedAt: z.number().nullable(),
 });
@@ -1976,7 +1980,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   function mapState(row: ReviewRow): MapState {
     const m = q.map.get(row.id);
-    if (m === undefined) return { status: "missing", headSha: null, stale: false, markdown: null, error: null, updatedAt: null };
+    if (m === undefined) return { status: "missing", headSha: null, stale: false, markdown: null, viewerUrl: null, viewerError: null, error: null, updatedAt: null };
     const known = m.status === "queued" || m.status === "writing" || m.status === "ready" || m.status === "failed" ? m.status : "missing";
     // A finished status about an older head says nothing about this one.
     const status = m.head_sha !== row.head_sha && (known === "ready" || known === "failed") ? "missing" : known;
@@ -1985,10 +1989,16 @@ export default async function plugin(bb: BbPluginApi) {
       headSha: m.markdown_head_sha,
       stale: m.markdown !== null && m.markdown_head_sha !== row.head_sha,
       markdown: m.markdown,
+      viewerUrl: viewerUrl(row),
+      viewerError: m.markdown === null ? null : viewerGistErrors.get(row.id) ?? (viewerReady ? null : viewerError ?? "the map viewer is being built (first time only)"),
       error: status === "failed" ? m.error : null,
       updatedAt: m.updated_at,
     };
   }
+
+  /** Fixes sent for a review's latest map after diffmap rejected it; a fresh map starts over. */
+  const mapFixes = new Map<string, number>();
+  const MAX_MAP_FIXES = 2;
 
   /** Queue the map at the current head; `force` writes it again even when one is on file. */
   function wantMap(row: ReviewRow, force: boolean): void {
@@ -1996,6 +2006,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (!force && (state.status === "queued" || state.status === "writing" || state.status === "ready")) return;
     if (state.status === "writing") return;
     q.setMapStatus.run(row.id, row.head_sha, "queued", null, Date.now());
+    mapFixes.delete(row.id);
     mapWanted.add(row.id);
     publish(row.id, "map");
     pumpHelper(row.id);
@@ -2003,6 +2014,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** The map is written on first look at a new head when autoMap is on; rewrites go through map_write. */
   function mapGet(row: ReviewRow): MapState {
+    ensureViewer();
     const state = mapState(row);
     if (autoMap && state.status === "missing") wantMap(row, false);
     // A map re-queued by a plugin reload goes out on the first look at the review.
@@ -2022,7 +2034,7 @@ export default async function plugin(bb: BbPluginApi) {
       `- Explain the PR as it stands at head ${row.head_sha}. Start from what changes for the person using it, then work down the layers as far as a reviewer needs.`,
       "- Write one phase per logical part of the change, in the order a reviewer should read them, each marked ✅ because the code exists. Use the PR's commits as phases only when they are meaningful steps.",
       `- End each phase with a changes fence whose first line is ${row.base_sha}..${row.head_sha}, followed by that phase's files in reading order.`,
-      `- Source references resolve at ${row.head_sha}; read the code there before you cite it.`,
+      `- References: [[path#symbol]] and [[path#L10-L20]] read the file at the head; [[${row.base_sha}..${row.head_sha}:path]] opens that file's diff in this PR. A single sha, [[sha:path]], means the file as changed in that one commit, so use it only for a file that commit touches.`,
       `- Do not write any file, do not run diffmap serve or share, and do not commit. Reply with the whole spec between a line containing only ${MAP_OPEN} and a line containing only ${MAP_CLOSE}, with nothing before or after.`,
       "",
       `PR: ${row.owner}/${row.repo}#${row.number} "${row.title}"${row.author ? ` by ${row.author}` : ""}. Description and conversation: gh pr view ${row.number} --repo ${row.owner}/${row.repo} --comments`,
@@ -2056,10 +2068,158 @@ export default async function plugin(bb: BbPluginApi) {
     if (q.map.get(reviewId) === undefined) return;
     const markdown = text === null ? null : extractMap(text);
     if (error !== null || markdown === null || markdown === "") q.setMapFailed.run(error ?? "the helper returned no spec", text, Date.now(), reviewId);
-    else q.setMapReady.run(markdown, text ?? "", Date.now(), reviewId);
+    else {
+      q.setMapReady.run(markdown, text ?? "", Date.now(), reviewId);
+      // Build the viewer payload now, so it is ready when the tab opens. diffmap checks
+      // every reference against the repository; a spec it rejects goes back to the helper.
+      if (viewerReady) void viewerGist(reviewId).catch(() => undefined);
+    }
     publish(reviewId, "map");
     pumpHelper(reviewId);
   }
+
+  /** Send diffmap's complaint back to the helper that wrote the spec, up to MAX_MAP_FIXES times per map. */
+  function fixMap(reviewId: string, complaint: string): void {
+    const row = q.review.get(reviewId);
+    const fixes = mapFixes.get(reviewId) ?? 0;
+    if (row === undefined || fixes >= MAX_MAP_FIXES || helperBusy(row)) return;
+    mapFixes.set(reviewId, fixes + 1);
+    // The diffmap error names the file and line in diffmap's own source first; the reason is the part after it.
+    const reason = complaint.split("\n").filter((l) => /Error:|\[\[|not |missing|unknown|invalid/i.test(l)).slice(0, 8).join("\n") || complaint.slice(-1500);
+    q.setMapStatus.run(row.id, row.head_sha, "writing", null, Date.now());
+    publish(row.id, "map");
+    void runHelperJob(row, "map", async () => [
+      "Job: diffmap rejected the spec you just wrote when it resolved it against the repository:",
+      "```",
+      reason,
+      "```",
+      "Fix every problem of that kind in the spec (check each reference against the code and the commits it names), then reply with the whole corrected spec between a line containing only <<<DIFFMAP and a line containing only DIFFMAP>>>, with nothing before or after.",
+    ].join("\n"), (message) => {
+      q.setMapStatus.run(row.id, row.head_sha, "failed", message, Date.now());
+      publish(row.id, "map");
+    });
+  }
+
+  // -- Map viewer: diffmap's own viewer, served from plugin routes ------------
+  //
+  // The host builds diffmap's static gist app once (diffmap-toolkit.ts); the
+  // server serves its files from exact-match GET routes under /diffmap/ and
+  // answers its one data request, gist.json?review=<id>, with the payload the
+  // host builds from the review's spec and worktree. Same origin as bb, so the
+  // Map tab can frame it.
+
+  const VIEWER_BASE = `/api/v1/plugins/${bb.pluginId}/http/diffmap`;
+  const CONTENT_TYPES: Record<string, string> = {
+    ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+    ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2", ".woff": "font/woff", ".ttf": "font/ttf", ".wasm": "application/wasm",
+  };
+  // Links out of the framed viewer (the PR, GitHub) open in a new tab; github.com refuses to be framed.
+  const VIEWER_LINKS = `<script>document.addEventListener("click",function(e){var a=e.target&&e.target.closest?e.target.closest("a[href]"):null;if(!a)return;var u=new URL(a.href,location.href);if(u.origin!==location.origin){e.preventDefault();window.open(u.href,"_blank","noopener");}},true);</script>`;
+  let viewerReady = false;
+  let viewerError: string | null = null;
+  let viewerHostId: string | null = null;
+  const viewerFiles = new Map<string, Uint8Array<ArrayBuffer>>();
+  /** Built payloads per review, keyed by the map and head they were built from; and the last build error. */
+  const viewerGists = new Map<string, { key: string; json: string }>();
+  const viewerGistErrors = new Map<string, string>();
+
+  async function viewerFile(relative: string): Promise<Uint8Array<ArrayBuffer>> {
+    const cached = viewerFiles.get(relative);
+    if (cached !== undefined) return cached;
+    if (viewerHostId === null) throw new Error("the map viewer is not built yet");
+    const { base64 } = await host.call("diffmap_asset", { path: relative }, { hostId: viewerHostId });
+    const decoded = Buffer.from(base64, "base64");
+    const bytes = new Uint8Array(new ArrayBuffer(decoded.byteLength));
+    bytes.set(decoded);
+    viewerFiles.set(relative, bytes);
+    return bytes;
+  }
+
+  const contentType = (relative: string) => CONTENT_TYPES[relative.slice(relative.lastIndexOf(".")).toLowerCase()] ?? "application/octet-stream";
+
+  let viewerPreparing: Promise<void> | null = null;
+  /** Build the viewer once (or retry after a failure); safe to call from any handler. */
+  function ensureViewer(): void {
+    if (viewerReady || viewerPreparing !== null) return;
+    viewerPreparing = prepareViewer().finally(() => {
+      viewerPreparing = null;
+    });
+  }
+
+  /** Build the viewer on the primary machine and mount its files; the Map tab shows the spec as Markdown until this is done. */
+  async function prepareViewer(attempt = 0): Promise<void> {
+    try {
+      const hostId = await primaryHostId();
+      const { assets } = await host.call("diffmap_prepare", {}, { hostId, timeoutMs: 20 * 60_000 });
+      viewerHostId = hostId;
+      for (const relative of assets) {
+        if (relative === "index.html") continue;
+        bb.http.route("GET", `/diffmap/${relative}`, async () => {
+          const bytes = await viewerFile(relative);
+          return new Response(bytes, { headers: { "content-type": contentType(relative), "cache-control": relative.startsWith("assets/") ? "public, max-age=31536000, immutable" : "no-store" } });
+        });
+      }
+      const index = async () => {
+        const html = new TextDecoder().decode(await viewerFile("index.html")).replace("</head>", `${VIEWER_LINKS}</head>`);
+        return new Response(html, { headers: { "content-type": CONTENT_TYPES[".html"], "cache-control": "no-store" } });
+      };
+      bb.http.route("GET", "/diffmap/", index);
+      bb.http.route("GET", "/diffmap/index.html", index);
+      bb.http.route("GET", "/diffmap/gist.json", async (c) => {
+        const reviewId = new URL(c.req.url).searchParams.get("review") ?? "";
+        try {
+          return new Response(await viewerGist(reviewId), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+        } catch (cause) {
+          return Response.json({ message: errorMessage(cause) }, { status: 500 });
+        }
+      });
+      viewerReady = true;
+      viewerError = null;
+      bb.log.info(`map viewer ready (${assets.length} files)`);
+    } catch (cause) {
+      viewerError = errorMessage(cause);
+      // Host calls are refused until the plugin has finished registering; try again shortly.
+      if (/unavailable during factory registration/.test(viewerError) && attempt < 10) {
+        await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+        return prepareViewer(attempt + 1);
+      }
+      bb.log.warn(`map viewer: ${viewerError}`);
+    }
+    for (const row of q.reviews.all()) publish(row.id, "map");
+  }
+
+  /** The viewer's payload for a review's map, built on the review's machine from its worktree. */
+  async function viewerGist(reviewId: string): Promise<string> {
+    const row = requireReview(reviewId);
+    const m = q.map.get(reviewId);
+    if (m === undefined || m.markdown === null) throw new Error("this PR has no map yet");
+    const key = `${m.updated_at}:${row.head_sha}`;
+    const cached = viewerGists.get(reviewId);
+    if (cached?.key === key) return cached.json;
+    try {
+      const { json } = await host.call("diffmap_gist", { worktree: row.worktree, markdown: m.markdown, label: prLabel(row), htmlUrl: row.url }, { hostId: row.host_id, timeoutMs: 5 * 60_000 });
+      viewerGists.set(reviewId, { key, json });
+      if (viewerGistErrors.delete(reviewId)) publish(reviewId, "map");
+      return json;
+    } catch (cause) {
+      viewerGistErrors.set(reviewId, errorMessage(cause));
+      publish(reviewId, "map");
+      // diffmap checks every reference against the repository; a spec it rejects goes back to the helper.
+      fixMap(reviewId, errorMessage(cause));
+      throw cause;
+    }
+  }
+
+  /** Where the Map tab frames the viewer, or null to show the spec as Markdown. */
+  function viewerUrl(row: ReviewRow): string | null {
+    const m = q.map.get(row.id);
+    if (!viewerReady || m === undefined || m.markdown === null || viewerGistErrors.has(row.id)) return null;
+    const params = new URLSearchParams({ review: row.id, label: prLabel(row), v: String(m.updated_at) });
+    return `${VIEWER_BASE}/index.html?${params.toString()}`;
+  }
+
+  // Host calls are not available while the plugin registers, so the build starts on the next tick.
+  setTimeout(ensureViewer, 0);
 
   // -- Simple English: GitHub comments rewritten by a second hidden thread ----
   //

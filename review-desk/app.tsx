@@ -1258,6 +1258,7 @@ type JumpFn = (path: string, line: number | null, side: "old" | "new") => void;
 /** The Map tab: the PR's diffmap, written by the helper from the code. */
 function MapPanel({ reviewId }: { reviewId: string }) {
   const { state, error, rewrite } = useMap(reviewId);
+  const [asText, setAsText] = useState(false);
   if (error) return <p className="text-sm text-destructive">{error}</p>;
   const working = state?.status === "queued" || state?.status === "writing";
   const status =
@@ -1273,11 +1274,31 @@ function MapPanel({ reviewId }: { reviewId: string }) {
         {working ? <Icon name="Loading" className="size-3.5 animate-spin" /> : null}
         <span>{status}</span>
         {state?.stale ? <span className="rounded-full border border-border px-1.5 text-[10px]" title="The head moved since this map was written">stale</span> : null}
-        <Button variant="ghost" size="sm" className="ml-auto h-6 px-1.5 text-xs" onClick={rewrite} disabled={working} title="Write the map again at the current head">
-          <Icon name="ArrowReloadHorizontal" className="size-3.5" />{state?.markdown ? "Rewrite" : "Write"}
-        </Button>
+        <span className="ml-auto flex items-center gap-1">
+          {state?.viewerUrl ? (
+            <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs" onClick={() => setAsText((v) => !v)} title={asText ? "Show the map in diffmap's viewer" : "Show the spec as plain Markdown"}>
+              <Icon name={asText ? "Layers" : "FileText"} className="size-3.5" />{asText ? "Viewer" : "Text"}
+            </Button>
+          ) : null}
+          <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs" onClick={rewrite} disabled={working} title="Write the map again at the current head">
+            <Icon name="ArrowReloadHorizontal" className="size-3.5" />{state?.markdown ? "Rewrite" : "Write"}
+          </Button>
+        </span>
       </div>
-      {state?.markdown ? <div className={cn(PROSE, "text-sm")}><Markdown content={state.markdown} /></div> : null}
+      {state?.markdown && state.viewerUrl && !asText ? (
+        <iframe
+          key={state.viewerUrl}
+          src={state.viewerUrl}
+          title="diffmap"
+          allow="clipboard-write"
+          className="h-[calc(100vh-15rem)] min-h-[520px] w-full rounded-lg border border-border bg-background"
+        />
+      ) : state?.markdown ? (
+        <>
+          {state.viewerError && !asText ? <p className="rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">Showing the spec as text: {state.viewerError}</p> : null}
+          <div className={cn(PROSE, "text-sm")}><Markdown content={state.markdown} /></div>
+        </>
+      ) : null}
     </div>
   );
 }
