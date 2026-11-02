@@ -30,11 +30,8 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { FileDiff, type DiffLineAnnotation, type FileDiffMetadata, type SelectedLineRange } from "@pierre/diffs/react";
 import { parsePatchFiles } from "@pierre/diffs";
-import type { BriefState, CodemapState, CommitInfo, FileEntry, GuideState, Note, NoteKind, PendingComment, ProviderOption, Review, Seat, SelectionRef, SimpleMode, SimpleState, rpcContract } from "./server";
-import type { ChangedFile } from "./host-contract";
-import type { Codemap, GhThread } from "./host-contract";
-import type { Brief } from "./brief-spec";
-import type { Guide, GuideFile, GuideRole } from "./guide-spec";
+import type { CommitInfo, FileEntry, MapState, Note, NoteKind, PendingComment, ProviderOption, Review, Seat, SelectionRef, SimpleMode, SimpleState, rpcContract } from "./server";
+import type { ChangedFile, GhThread } from "./host-contract";
 import { MENTION_PROVIDER_ID, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
 import { BoardPage } from "./board";
 import { Button } from "@/components/ui/button";
@@ -51,17 +48,6 @@ const REVIEW_CHANGED = "review-changed";
 const PROVIDER_KEY = "review-desk:provider";
 const selectionKey = (reviewId: string) => `review-desk:selection:${reviewId}`;
 /** How the Changes list is ordered: by path (the default), or as the guide reads the PR. A preference, not per review. */
-const ORDER_KEY = "review-desk:order";
-const ORDER_EVENT = "review-desk:order";
-type FileOrder = "guide" | "path";
-
-/** A jump into the PR diff asked for from a side tab (the Codemap); ReviewView listens and expands, selects, and scrolls. */
-const JUMP_EVENT = "review-desk:jump";
-interface JumpRequest { reviewId: string; path: string; line: number | null }
-function requestJump(reviewId: string, path: string, line: number | null = null): void {
-  window.dispatchEvent(new CustomEvent<JumpRequest>(JUMP_EVENT, { detail: { reviewId, path, line } }));
-}
-
 // ---------------------------------------------------------------------------
 // Code pills
 //
@@ -152,7 +138,6 @@ function isReviewTarget(value: JsonValue): value is ReviewTarget {
 }
 const INFO_TAB: ExperimentalPluginFixedTabReference<ReviewTarget> = { panelId: PANEL_ID, id: "info", experimental_target: { validate: isReviewTarget } };
 const CHAT_TAB: ExperimentalPluginFixedTabReference<ReviewTarget> = { panelId: PANEL_ID, id: "chat", experimental_target: { validate: isReviewTarget } };
-const CODEMAP_TAB: ExperimentalPluginFixedTabReference<ReviewTarget> = { panelId: PANEL_ID, id: "codemap", experimental_target: { validate: isReviewTarget } };
 
 const SHIKI_THEMES = new Set([
   "andromeeda", "aurora-x", "ayu-dark", "catppuccin-frappe", "catppuccin-latte", "catppuccin-macchiato", "catppuccin-mocha", "dark-plus", "dracula", "dracula-soft",
@@ -277,84 +262,13 @@ function useReview(reviewId: string | null) {
   return { rpc, detail, error, refetch };
 }
 
-function useCodemap(reviewId: string | null, enabled: boolean) {
+/** The PR's diffmap; written by the helper on first look at a new head. */
+function useMap(reviewId: string) {
   const rpc = useRpc<Contract>();
-  const [state, setState] = useState<CodemapState | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const load = useCallback(
-    (refresh = false) => {
-      if (reviewId === null || !enabled) return;
-      rpc.call("codemap_get", { reviewId, refresh }).then(
-        (result) => {
-          setState(result);
-          setError(null);
-        },
-        (cause: unknown) => setError(describeError(cause)),
-      );
-    },
-    [rpc, reviewId, enabled],
-  );
-  useEffect(() => {
-    load();
-  }, [load]);
-  useRealtime(REVIEW_CHANGED, (payload) => {
-    const p = payloadReview(payload);
-    if (p !== null && p.reviewId === reviewId && p.what === "codemap") load();
-  });
-  useEffect(() => {
-    if (state?.status !== "building") return;
-    const timer = setInterval(() => load(), 4000);
-    return () => clearInterval(timer);
-  }, [state?.status, load]);
-  return { state, error, refresh: () => load(true) };
-}
-
-function useBrief(reviewId: string | null) {
-  const rpc = useRpc<Contract>();
-  const [state, setState] = useState<BriefState | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const load = useCallback(
-    () => {
-      if (reviewId === null) return;
-      rpc.call("brief_get", { reviewId }).then(
-        (result) => {
-          setState(result);
-          setError(null);
-        },
-        (cause: unknown) => setError(describeError(cause)),
-      );
-    },
-    [rpc, reviewId],
-  );
-  useEffect(() => {
-    setState(null);
-    load();
-  }, [load]);
-  useRealtime(REVIEW_CHANGED, (payload) => {
-    const p = payloadReview(payload);
-    if (p !== null && p.reviewId === reviewId && (p.what === "brief" || p.what === "synced" || p.what === "codemap")) load();
-  });
-  const busy = state !== null && state.briefStatus === "writing";
-  useEffect(() => {
-    if (!busy) return;
-    const timer = setInterval(() => load(), 6000);
-    return () => clearInterval(timer);
-  }, [busy, load]);
-  const rewrite = useCallback(() => {
-    if (reviewId === null) return;
-    rpc.call("brief_write", { reviewId }).then(setState, (cause: unknown) => toast.error(describeError(cause)));
-  }, [rpc, reviewId]);
-  return { state, error, rewrite };
-}
-
-/** The helper-written guide over the codemap: overview, flow, reading steps, one line per file. */
-function useGuide(reviewId: string | null) {
-  const rpc = useRpc<Contract>();
-  const [state, setState] = useState<GuideState | null>(null);
+  const [state, setState] = useState<MapState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const load = useCallback(() => {
-    if (reviewId === null) return;
-    rpc.call("guide_get", { reviewId }).then(
+    rpc.call("map_get", { reviewId }).then(
       (result) => {
         setState(result);
         setError(null);
@@ -368,44 +282,13 @@ function useGuide(reviewId: string | null) {
   }, [load]);
   useRealtime(REVIEW_CHANGED, (payload) => {
     const p = payloadReview(payload);
-    if (p !== null && p.reviewId === reviewId && (p.what === "guide" || p.what === "codemap" || p.what === "synced")) load();
+    if (p !== null && p.reviewId === reviewId && (p.what === "map" || p.what === "synced")) load();
   });
-  const busy = state !== null && (state.status === "queued" || state.status === "writing");
-  useEffect(() => {
-    if (!busy) return;
-    const timer = setInterval(() => load(), 6000);
-    return () => clearInterval(timer);
-  }, [busy, load]);
   const rewrite = useCallback(() => {
-    if (reviewId === null) return;
-    rpc.call("guide_write", { reviewId }).then(setState, (cause: unknown) => toast.error(describeError(cause)));
+    rpc.call("map_write", { reviewId }).then(setState, (cause: unknown) => toast.error(describeError(cause)));
   }, [rpc, reviewId]);
-  const guide = useMemo(() => (state?.guide ? (state.guide as unknown as Guide) : null), [state?.guide]);
-  return { state, guide, busy, error, rewrite };
+  return { state, error, rewrite };
 }
-
-function useFileOrder(): [FileOrder, (order: FileOrder) => void] {
-  const read = (): FileOrder => (readStorage<FileOrder>(ORDER_KEY) === "guide" ? "guide" : "path");
-  const [order, setOrderState] = useState<FileOrder>(read);
-  useEffect(() => {
-    const onChange = () => setOrderState(read());
-    window.addEventListener(ORDER_EVENT, onChange);
-    return () => window.removeEventListener(ORDER_EVENT, onChange);
-  }, []);
-  const setOrder = useCallback((next: FileOrder) => {
-    writeStorage(ORDER_KEY, next);
-    window.dispatchEvent(new CustomEvent(ORDER_EVENT));
-  }, []);
-  return [order, setOrder];
-}
-
-// ---------------------------------------------------------------------------
-// Simple English
-//
-// The server rewrites GitHub comments through a hidden thread. Each comment
-// body flips between the original and its rewrite, asking for the rewrite the
-// first time it is shown; every comment starts on the original.
-// ---------------------------------------------------------------------------
 
 interface SimpleContext {
   mode: SimpleMode;
@@ -850,24 +733,6 @@ function toSelectionRef(selection: Selection): SelectionRef {
   };
 }
 
-const ROLE_STYLE: Record<GuideRole, string> = {
-  core: "border-primary/50 text-primary",
-  types: "border-foreground/40 text-foreground",
-  wiring: "border-border text-muted-foreground",
-  tests: "border-amber-500/50 text-amber-800 dark:text-amber-200",
-  docs: "border-border text-muted-foreground",
-  config: "border-border text-muted-foreground",
-  generated: "border-border text-muted-foreground",
-  moved: "border-border text-muted-foreground",
-};
-/** The guide's role for a file: core, types, wiring, tests, docs, config, generated, moved. */
-function RoleChip({ role }: { role: GuideRole }) {
-  return <span className={cn("shrink-0 rounded-full border px-1.5 text-[10px] uppercase", ROLE_STYLE[role])}>{role}</span>;
-}
-function SkimChip() {
-  return <span className="shrink-0 rounded-full border border-dashed border-border px-1.5 text-[10px] text-muted-foreground" title="Mechanical change: rename, imports, lockfile, formatting">skim</span>;
-}
-
 /** Where a file card's diff comes from: the PR (base..head) or an arbitrary commit range. */
 type DiffSource = { kind: "pr" } | { kind: "range"; base: string; head: string };
 
@@ -876,8 +741,6 @@ interface FileCardProps {
   file: FileEntry;
   /** Commit view: no GitHub threads, notes, viewed marks, or comment composer. */
   source?: DiffSource;
-  /** The guide's line for this file, shown under the path. */
-  guide?: GuideFile | null;
   threads: GhThread[];
   pending: PendingComment[];
   notes: Note[];
@@ -1003,13 +866,6 @@ function FileCard(props: FileCardProps) {
             ) : null}
           </span>
         </div>
-        {props.guide ? (
-          <div className="mt-1 flex min-w-0 items-center gap-1.5 pl-[22px] text-[11px] text-muted-foreground">
-            <RoleChip role={props.guide.role} />
-            {props.guide.skim ? <SkimChip /> : null}
-            <span className="min-w-0 truncate" title={props.guide.what}>{props.guide.what}</span>
-          </div>
-        ) : null}
       </div>
 
       {selected ? (
@@ -1399,47 +1255,34 @@ function CommitView({ reviewId, review, target, theme, diffStyle, selection, onS
 
 type JumpFn = (path: string, line: number | null, side: "old" | "new") => void;
 
-function BriefPanel({ reviewId, onJump }: { reviewId: string; onJump: JumpFn }) {
-  const { state, error, rewrite } = useBrief(reviewId);
+/** The Map tab: the PR's diffmap, written by the helper from the code. */
+function MapPanel({ reviewId }: { reviewId: string }) {
+  const { state, error, rewrite } = useMap(reviewId);
   if (error) return <p className="text-sm text-destructive">{error}</p>;
-  const brief = (state?.briefStatus === "ready" ? (state.brief as unknown as Brief | null) : null) ?? null;
-  const writing = state?.briefStatus === "writing";
+  const working = state?.status === "queued" || state?.status === "writing";
+  const status =
+    state === null ? "Loading…"
+    : state.status === "queued" ? "Waiting for the helper…"
+    : state.status === "writing" ? "The helper is reading the PR and writing its map. A few minutes on large PRs."
+    : state.status === "failed" ? `Failed: ${state.error ?? "unknown error"}`
+    : state.markdown === null ? "No map yet."
+    : `Written for ${shortSha(state.headSha ?? "")}`;
   return (
-    <div className="space-y-4 text-sm">
-      <section className="rounded-lg border border-border bg-card p-4">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm font-semibold">What it does</span>
-          <span className="text-xs text-muted-foreground">written from the diff, not the description</span>
-          {state?.stale ? <span className="rounded-full border border-border px-1.5 text-[10px] text-muted-foreground" title="The head moved since this was written">stale</span> : null}
-          <Button variant="ghost" size="sm" className="ml-auto h-6 px-1.5 text-xs" onClick={rewrite} disabled={writing} title="Write the brief again at the current head">
-            <Icon name={writing ? "Loading" : "ArrowReloadHorizontal"} className={cn("size-3.5", writing && "animate-spin")} />{brief ? "Rewrite" : "Write"}
-          </Button>
-        </div>
-        {brief === null ? (
-          <p className="mt-3 text-xs text-muted-foreground">
-            {writing ? "The helper is reading the diff and writing. A minute for small PRs, several for large ones." : state?.briefStatus === "failed" ? `Failed: ${state.briefError ?? "unknown error"}` : state === null ? "Loading…" : "Press Write to get a plain-English brief of this PR."}
-          </p>
-        ) : (
-          <>
-            <div className={cn(PROSE, "mt-3 text-sm")}><Markdown content={brief.summary} /></div>
-            {brief.areas.length > 0 ? (
-              <ul className="mt-4 divide-y divide-border/60 rounded-md border border-border/60 text-xs">
-                {brief.areas.map((a) => (
-                  <li key={a.module} className="flex items-baseline gap-3 px-3 py-1.5">
-                    {a.path ? <button type="button" onClick={() => onJump(a.path ?? "", null, "new")} className="w-48 shrink-0 truncate text-left font-mono hover:underline" title={a.path}>{a.module}</button> : <span className="w-48 shrink-0 truncate font-mono">{a.module}</span>}
-                    <span className="min-w-0 text-foreground">{a.what}</span>
-                  </li>
-                ))}
-              </ul>
-            ) : null}
-          </>
-        )}
-      </section>
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+        {working ? <Icon name="Loading" className="size-3.5 animate-spin" /> : null}
+        <span>{status}</span>
+        {state?.stale ? <span className="rounded-full border border-border px-1.5 text-[10px]" title="The head moved since this map was written">stale</span> : null}
+        <Button variant="ghost" size="sm" className="ml-auto h-6 px-1.5 text-xs" onClick={rewrite} disabled={working} title="Write the map again at the current head">
+          <Icon name="ArrowReloadHorizontal" className="size-3.5" />{state?.markdown ? "Rewrite" : "Write"}
+        </Button>
+      </div>
+      {state?.markdown ? <div className={cn(PROSE, "text-sm")}><Markdown content={state.markdown} /></div> : null}
     </div>
   );
 }
 
-type Tab = "brief" | "description" | "discussion" | "commits";
+type Tab = "map" | "diff" | "comments";
 
 function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarget | null }) {
   const { rpc, detail, error, refetch } = useReview(reviewId);
@@ -1451,7 +1294,7 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
   useEffect(() => {
     rpc.call("review_seen", { reviewId }).then(() => refetch(), () => undefined);
   }, [rpc, reviewId, refetch]);
-  const [tab, setTab] = useState<Tab>("brief");
+  const [tab, setTab] = useState<Tab>("map");
   const [diffStyle, setDiffStyle] = useState<"unified" | "split">("split");
   const [selection, setSelectionState] = useState<Selection | null>(null);
   const [composer, setComposer] = useState<Extract<Anno, { kind: "composer" }> | null>(null);
@@ -1464,9 +1307,6 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
   const [roomText, setRoomText] = useState<string | null>(null);
   const [noteFilter, setNoteFilter] = useState<{ kinds: Set<NoteKind>; showDismissed: boolean }>({ kinds: new Set<NoteKind>(["slop", "cleanup", "risk", "question"]), showDismissed: false });
   const [notesMenu, setNotesMenu] = useState(false);
-  const { state: guideState, guide, busy: guideBusy } = useGuide(reviewId);
-  const [order, setOrder] = useFileOrder();
-  const guideByPath = useMemo(() => new Map((guide?.files ?? []).map((f) => [f.path, f])), [guide]);
 
   const setSelection = useCallback((next: Selection | null) => {
     setSelectionState(next);
@@ -1521,6 +1361,7 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
 
   /** Show a place in the diff: expand the file, select the line, and settle the scroll onto it. */
   const jumpToLine = useCallback<JumpFn>((path, line, side) => {
+    setTab("diff");
     setFilter("");
     setCollapsed((s) => { const n = new Set(s); n.delete(path); return n; });
     setExpandedOverride((s) => new Set(s).add(path));
@@ -1540,17 +1381,6 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
     };
     settle();
   }, [setSelection]);
-
-  // Jumps asked for from the Codemap tab land here while the PR diff is on screen.
-  useEffect(() => {
-    if (commit !== null) return;
-    const onJump = (e: Event) => {
-      const d = (e as CustomEvent<JumpRequest>).detail;
-      if (d.reviewId === reviewId) jumpToLine(d.path, d.line, "new");
-    };
-    window.addEventListener(JUMP_EVENT, onJump);
-    return () => window.removeEventListener(JUMP_EVENT, onJump);
-  }, [reviewId, commit, jumpToLine]);
 
   // `a` with lines selected drops them into the chat; ignored while typing.
   // In a commit view the pill points at the lines as they were at that commit.
@@ -1597,7 +1427,6 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
         <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => void run("sync", async () => { await rpc.call("reviews_sync", { reviewId }); refetch(); toast.success("Synced with GitHub"); })} disabled={busy !== null} title="Refresh PR metadata, head, and threads">
           <Icon name="ArrowReloadHorizontal" className={cn("size-3.5", busy === "sync" && "animate-spin")} />Sync
         </Button>
-        <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: CODEMAP_TAB, target: { reviewId } })}><Icon name="Layers" className="size-3.5" />Codemap</Button>
         <Button variant="outline" size="sm" className="h-7 text-xs" onClick={openChat}><Icon name="Brain" className="size-3.5" />Chat</Button>
         <Button size="sm" className="h-7 text-xs" onClick={() => panel.openFixedTab({ surface: { kind: "current" }, tab: INFO_TAB, target: { reviewId } })}>
           <Icon name="Github" className="size-3.5" />Review{pending.length > 0 ? ` · ${pending.length}` : ""}
@@ -1669,29 +1498,7 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
     }
   };
   const shown = filter.trim() === "" ? files : files.filter((f) => f.path.toLowerCase().includes(filter.trim().toLowerCase()));
-  // Guide order: the file cards follow the guide's steps, with a header per
-  // step. Files the guide does not know (pushed since it was written) close the
-  // list. A path filter shows a flat list.
-  const groups: { title: string; why: string; files: FileEntry[] }[] | null = (() => {
-    if (order !== "guide" || guide === null || filter.trim() !== "") return null;
-    const byPath = new Map(files.map((f) => [f.path, f]));
-    const placed = new Set<string>();
-    const out: { title: string; why: string; files: FileEntry[] }[] = [];
-    for (const step of guide.steps) {
-      const list: FileEntry[] = [];
-      for (const p of step.paths) {
-        const f = byPath.get(p);
-        if (f === undefined || placed.has(p)) continue;
-        placed.add(p);
-        list.push(f);
-      }
-      if (list.length > 0) out.push({ title: step.title, why: step.why, files: list });
-    }
-    const rest = files.filter((f) => !placed.has(f.path));
-    if (rest.length > 0) out.push({ title: "Not in the guide", why: "Changed since the guide was written, or left out of it.", files: rest });
-    return out;
-  })();
-  const sequence = groups === null ? shown : groups.flatMap((g) => g.files);
+  const sequence = shown;
   const renderCard = (f: FileEntry) => {
     const index = sequence.indexOf(f);
     const expanded = isExpanded(f, index);
@@ -1700,7 +1507,6 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
         key={f.path}
         review={review}
         file={f}
-        guide={guideByPath.get(f.path) ?? null}
         threads={threadsByPath.get(f.path) ?? []}
         pending={pendingByPath.get(f.path) ?? []}
         notes={notesByPath.get(f.path) ?? []}
@@ -1753,18 +1559,30 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
           </div>
 
           <div className="mt-6 flex items-center gap-1 border-b border-border text-sm">
-            {([["brief", "Brief", null], ["description", "Description", null], ["discussion", "Discussion", openThreads], ["commits", "Commits", review.commits.length]] as const).map(([id, label, count]) => (
+            {([["map", "Map", null], ["diff", "Diff", files.length], ["comments", "Comments", openThreads]] as const).map(([id, label, count]) => (
               <button key={id} type="button" onClick={() => setTab(id)} className={cn("-mb-px border-b-2 px-3 py-2", tab === id ? "border-foreground font-medium" : "border-transparent text-muted-foreground hover:text-foreground")}>
                 {label}{count !== null && count > 0 ? <span className="ml-1.5 rounded-full bg-foreground/10 px-1.5 text-[11px]">{count}</span> : null}
               </button>
             ))}
           </div>
-          <div className="mt-4">
-            {tab === "brief" ? <BriefPanel reviewId={reviewId} onJump={jumpToLine} /> : tab === "description" ? <Description body={review.body} /> : tab === "discussion" ? <Discussion reviewId={reviewId} threads={threads} /> : <Commits review={review} seen={detail.seen} onOpen={openCommit} />}
-          </div>
 
-          <div className="mt-10 flex flex-wrap items-center gap-3">
-            <h2 className="text-lg font-semibold">Changes</h2>
+          {tab === "map" ? <div className="mt-4"><MapPanel reviewId={reviewId} /></div> : null}
+
+          {tab === "comments" ? (
+            <div className="mt-4 space-y-6">
+              <Description body={review.body} />
+              <Discussion reviewId={reviewId} threads={threads} />
+            </div>
+          ) : null}
+
+          {tab === "diff" ? (
+          <>
+          <details className="mt-4 rounded-lg border border-border">
+            <summary className="cursor-pointer select-none px-3 py-2 text-sm text-muted-foreground">Commits <span className="ml-1 rounded-full bg-foreground/10 px-1.5 text-[11px]">{review.commits.length}</span></summary>
+            <div className="border-t border-border p-3"><Commits review={review} seen={detail.seen} onOpen={openCommit} /></div>
+          </details>
+
+          <div className="mt-4 flex flex-wrap items-center gap-3">
             <span className="text-xs text-muted-foreground">{viewedCount}/{files.length} viewed</span>
             <Progress value={viewedCount} total={files.length} className="w-24" />
             <span className="text-xs text-muted-foreground">{linesLeft.toLocaleString()} lines left</span>
@@ -1797,18 +1615,6 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
                   </div>
                 ) : null}
               </span>
-              {order === "guide" && guide === null ? (
-                <span className="inline-flex items-center gap-1 text-xs text-muted-foreground" title="Guide order applies once the helper has written the guide; see the Codemap tab">
-                  {guideBusy ? <Icon name="Loading" className="size-3 animate-spin" /> : null}
-                  {guideBusy ? "guide writing…" : guideState?.status === "failed" ? "guide failed" : "no guide yet"}
-                </span>
-              ) : order === "guide" && guideState?.stale ? (
-                <span className="rounded-full border border-border px-1.5 text-[10px] text-muted-foreground" title="The head moved since the guide was written">guide stale</span>
-              ) : null}
-              <select value={order} onChange={(e) => setOrder(e.target.value as FileOrder)} className="h-7 rounded-md border border-input bg-background px-1.5 text-xs" aria-label="File order" title="Order the files as the guide reads them, or by path">
-                <option value="guide">Guide order</option>
-                <option value="path">Path order</option>
-              </select>
               <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Find a file…" className="h-7 w-44 text-xs" aria-label="Filter files" />
               <select value={diffStyle} onChange={(e) => setDiffStyle(e.target.value as "unified" | "split")} className="h-7 rounded-md border border-input bg-background px-1.5 text-xs" aria-label="Diff style">
                 <option value="unified">Unified</option>
@@ -1820,22 +1626,10 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
 
           <div className="mt-3 flex flex-col gap-3">
             {sequence.length === 0 ? <EmptyState>No files match.</EmptyState> : null}
-            {groups === null
-              ? shown.map(renderCard)
-              : groups.map((g, gi) => (
-                  <div key={`${gi}:${g.title}`} className={cn("flex flex-col gap-3", gi > 0 && "mt-4")}>
-                    <div className="flex flex-col gap-0.5">
-                      <div className="flex items-baseline gap-2">
-                        <span className="text-xs text-muted-foreground">{gi + 1}.</span>
-                        <span className="text-sm font-semibold">{g.title}</span>
-                        <span className="text-xs text-muted-foreground">{g.files.length} file{g.files.length === 1 ? "" : "s"}</span>
-                      </div>
-                      {g.why ? <p className="pl-5 text-xs text-muted-foreground">{g.why}</p> : null}
-                    </div>
-                    {g.files.map(renderCard)}
-                  </div>
-                ))}
+            {shown.map(renderCard)}
           </div>
+          </>
+          ) : null}
         </div>
       </div>
       {roomText !== null ? <RoomSender text={roomText} onClose={() => setRoomText(null)} /> : null}
@@ -2107,173 +1901,6 @@ function PillBanner() {
   );
 }
 
-/**
- * The Codemap tab: the guide first (what is going on, how it runs, the reading
- * order with one line per file), then the deterministic layer (hotspots and
- * changed symbols). Until the guide is written, the module order from the
- * codemap stands in for the reading order.
- */
-function CodemapTab() {
-  const target = useFixedTabTarget(CODEMAP_TAB);
-  const reviewId = target?.target.reviewId ?? null;
-  const { state, error, refresh } = useCodemap(reviewId, reviewId !== null);
-  const { state: gs, guide, busy: guideBusy, error: guideError, rewrite } = useGuide(reviewId);
-  const [order, setOrder] = useFileOrder();
-  const [filter, setFilter] = useState("");
-  if (reviewId === null) return <div className="p-4"><EmptyState>Open a review and press Codemap to see its structure here.</EmptyState></div>;
-  if (error) return <p className="p-3 text-xs text-destructive">{error}</p>;
-  const c: Codemap | null = state?.status === "ready" ? state.codemap : null;
-  const building = state === null || state.status === "building" || state.status === "missing";
-  const jump = (path: string, line: number | null = null) => requestJump(reviewId, path, line);
-  const fileOf = new Map((guide?.files ?? []).map((f) => [f.path, f]));
-  const files = (c?.files ?? []).filter((f) => f.symbols.some((s) => s.status !== "unchanged")).filter((f) => filter === "" || f.path.toLowerCase().includes(filter.toLowerCase()));
-  const pathLine = (p: string) => {
-    const { name, dir } = splitPath(p);
-    return <><span className="min-w-0 truncate font-mono text-[11px] text-foreground">{name}</span>{dir ? <span className="min-w-0 truncate text-[10px] text-muted-foreground">{dir}</span> : null}</>;
-  };
-  return (
-    <div className="flex h-full min-h-0 flex-col text-xs">
-      <div className="flex flex-wrap items-center gap-2 border-b border-border p-3">
-        <span className="text-sm font-semibold">Codemap</span>
-        {c ? (
-          <span className="text-muted-foreground">{c.stats.files} files · {c.stats.symbols} symbols · +{c.stats.added} ~{c.stats.modified} -{c.stats.removed} · {c.edges.length} references</span>
-        ) : building ? (
-          <span className="inline-flex items-center gap-1.5 text-muted-foreground"><Icon name="Loading" className="size-3.5 animate-spin" />parsing changed files and counting references…</span>
-        ) : (
-          <span className="text-destructive">{state?.error ?? "Codemap failed."}</span>
-        )}
-        <Button variant="ghost" size="sm" className="ml-auto h-7 px-1.5" onClick={refresh} aria-label="Rebuild codemap" title="Rebuild the codemap"><Icon name="ArrowReloadHorizontal" className="size-3.5" /></Button>
-      </div>
-      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="font-medium">Guide</span>
-          <span className="text-muted-foreground">written from the diff by the helper</span>
-          {gs?.stale ? <span className="rounded-full border border-border px-1.5 text-[10px] text-muted-foreground" title="The head moved since this was written">stale</span> : null}
-          {guideBusy ? <span className="inline-flex items-center gap-1 text-muted-foreground"><Icon name="Loading" className="size-3 animate-spin" />{gs?.status === "queued" ? "queued" : "writing"}</span> : null}
-          <Button variant="ghost" size="sm" className="ml-auto h-6 px-1.5 text-xs" onClick={rewrite} disabled={guideBusy} title="Write the guide again at the current head">
-            <Icon name={guideBusy ? "Loading" : "ArrowReloadHorizontal"} className={cn("size-3.5", guideBusy && "animate-spin")} />{guide ? "Rewrite" : "Write"}
-          </Button>
-        </div>
-        {guideError ? <p className="text-destructive">{guideError}</p> : null}
-        {gs?.status === "failed" ? <p className="text-destructive">{gs.error ?? "The guide failed."}</p> : null}
-        {guide === null && guideBusy ? <p className="text-muted-foreground">The helper is reading the diff. A minute for small PRs, several for large ones. The module order below stands in meanwhile.</p> : null}
-        {guide === null && !guideBusy && gs?.status !== "failed" ? <p className="text-muted-foreground">Press Write for what is going on, how the changed code runs, a reading order, and one line per file.</p> : null}
-
-        {guide !== null && guide.overview !== "" ? (
-          <section className="space-y-1.5">
-            <div className="font-medium">What is going on</div>
-            <div className={cn(PROSE, "text-xs")}><Markdown content={guide.overview} /></div>
-          </section>
-        ) : null}
-
-        {guide !== null && guide.flow.length > 0 ? (
-          <section className="space-y-1.5">
-            <div className="font-medium">How it runs</div>
-            <ol className="ml-2 space-y-2 border-l border-border pl-4">
-              {guide.flow.map((h, i) => (
-                <li key={`${i}:${h.symbol}`} className="relative">
-                  <span className="absolute -left-[23px] top-0.5 flex size-3.5 items-center justify-center rounded-full border border-border bg-card text-[8px] text-muted-foreground">{i + 1}</span>
-                  <button type="button" onClick={() => jump(h.path, h.line)} className="block max-w-full truncate text-left font-mono hover:underline" title={`${h.path}${h.line !== null ? `:${h.line}` : ""}`}>{h.symbol}</button>
-                  <div className="truncate font-mono text-[10px] text-muted-foreground">{splitPath(h.path).name}{h.line !== null ? `:${h.line}` : ""}</div>
-                  {h.what ? <div className="text-[11px] text-muted-foreground">{h.what}</div> : null}
-                </li>
-              ))}
-            </ol>
-          </section>
-        ) : null}
-
-        <section className="space-y-1.5">
-          <div className="flex items-center gap-2">
-            <span className="font-medium">Reading order</span>
-            {guide !== null ? (
-              order === "guide" ? <span className="text-muted-foreground">Changes follow this order</span> : <button type="button" className="text-muted-foreground hover:underline" onClick={() => setOrder("guide")}>Order Changes this way</button>
-            ) : c !== null ? (
-              <span className="text-muted-foreground">from references between modules</span>
-            ) : null}
-          </div>
-          {guide !== null ? (
-            <ol className="space-y-1.5">
-              {guide.steps.map((s, i) => (
-                <li key={`${i}:${s.title}`} className="rounded-md border border-border p-2">
-                  <div className="flex items-baseline gap-1.5"><span className="text-muted-foreground">{i + 1}.</span><span className="font-medium">{s.title}</span><span className="ml-auto shrink-0 text-muted-foreground">{s.paths.length} file{s.paths.length === 1 ? "" : "s"}</span></div>
-                  {s.why ? <div className="text-[11px] text-muted-foreground">{s.why}</div> : null}
-                  <ul className="mt-1.5 space-y-1">
-                    {s.paths.map((p) => {
-                      const f = fileOf.get(p);
-                      return (
-                        <li key={p} className="min-w-0">
-                          <button type="button" onClick={() => jump(p)} className="flex w-full items-center gap-1.5 text-left hover:underline" title={p}>
-                            {f ? <RoleChip role={f.role} /> : null}
-                            {pathLine(p)}
-                            {f?.skim ? <span className="ml-auto"><SkimChip /></span> : null}
-                          </button>
-                          {f?.what ? <div className="text-[11px] text-muted-foreground">{f.what}</div> : null}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </li>
-              ))}
-            </ol>
-          ) : c !== null ? (
-            <ol className="space-y-1.5">
-              {c.readingOrder.map((m, i) => (
-                <li key={m.module} className="rounded-md border border-border p-2">
-                  <div className="flex items-center gap-1.5"><span className="text-muted-foreground">{i + 1}.</span><span className="min-w-0 truncate font-mono font-medium">{m.module}</span><span className="ml-auto shrink-0 text-muted-foreground">{m.paths.length} file{m.paths.length === 1 ? "" : "s"}</span></div>
-                  <div className="text-[11px] text-muted-foreground">{m.reason}</div>
-                  <ul className="mt-1 space-y-0.5">
-                    {m.paths.map((p) => <li key={p}><button type="button" onClick={() => jump(p)} className="flex w-full items-center gap-1.5 text-left hover:underline" title={p}>{pathLine(p)}</button></li>)}
-                  </ul>
-                </li>
-              ))}
-            </ol>
-          ) : null}
-        </section>
-
-        {c !== null ? (
-        <section className="space-y-1.5">
-          <div className="flex items-baseline gap-2"><span className="font-medium">Hotspots</span><span className="text-muted-foreground">changed lines weighted by fan-in; tests count a quarter</span></div>
-          <ul className="space-y-0.5">
-            {c.hotspots.slice(0, 12).map((h) => (
-              <li key={`${h.path}#${h.qualified}`}>
-                <button type="button" onClick={() => jump(h.path)} className="flex w-full items-center gap-2 text-left hover:underline" title={`${h.path} · ${h.changedLines} changed lines · fan-in ${h.fanIn}`}>
-                  <span className="w-10 shrink-0 text-right font-mono text-muted-foreground">{Math.round(h.score)}</span>
-                  <span className="min-w-0 flex-1 truncate font-mono">{h.qualified}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        </section>
-        ) : null}
-        {c !== null ? (
-        <section className="space-y-1.5">
-          <div className="flex items-center gap-2"><span className="font-medium">Changed symbols</span><Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter files…" className="ml-auto h-7 w-40 text-xs" /></div>
-          {files.map((f) => (
-            <div key={f.path} className="rounded-md border border-border bg-card">
-              <button type="button" onClick={() => jump(f.path)} className="flex w-full items-center gap-2 border-b border-border/60 px-2 py-1.5 text-left font-mono hover:underline">
-                <span className="min-w-0 flex-1 truncate">{f.path}</span>
-                <span className="text-muted-foreground">{f.changedLines} lines</span>
-              </button>
-              <ul className="divide-y divide-border/60">
-                {f.symbols.filter((s) => s.status !== "unchanged").map((s) => (
-                  <li key={`${s.kind}:${s.qualified}`} className="flex items-center gap-2 px-2 py-1">
-                    <span className={cn("w-14 shrink-0 rounded-full border px-1.5 text-center text-[10px] uppercase", s.status === "added" ? "border-primary/50 text-primary" : s.status === "removed" ? "border-destructive/50 text-destructive" : "border-border text-muted-foreground")}>{s.status}</span>
-                    <span className="text-muted-foreground">{s.kind}</span>
-                    <span className="min-w-0 flex-1 truncate font-mono" title={s.qualified}>{s.qualified}</span>
-                    <span className="shrink-0 text-muted-foreground">{s.status === "removed" ? `old ${s.oldStart}-${s.oldEnd}` : `${s.start}-${s.end}`}{s.fanIn > 0 ? ` · ${s.fanIn} refs` : ""}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
-        </section>
-        ) : null}
-        {state?.status === "failed" ? <Button size="sm" variant="outline" onClick={refresh}>Retry the codemap</Button> : null}
-      </div>
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
@@ -2297,7 +1924,6 @@ export default definePluginApp((app) => {
     fixedTabs: [
       { ...INFO_TAB, title: "Info", icon: "Info", layout: "flush", component: InfoTab },
       { ...CHAT_TAB, title: "Chat", icon: "Brain", layout: "flush", component: ChatTab },
-      { ...CODEMAP_TAB, title: "Codemap", icon: "Layers", layout: "flush", component: CodemapTab },
     ],
   });
   app.composer.customize({

@@ -5,17 +5,14 @@
 // repository through the host entry (git, gh, tree-sitter). Chat with the PR
 // runs on ordinary hidden bb threads (one per provider per review) spawned into
 // the PR worktree; the UI renders them with bb's own ThreadChat.
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi, type PluginMentionItem, type PluginMentionSearchContext } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { MENTION_PROVIDER_ID, decodeMentionRef, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
-import { BRIEF_FENCE, type Brief } from "./brief-spec";
-import { GUIDE_FENCE, GUIDE_ROLES, type Guide, type GuideFile, type GuideHop, type GuideRole, type GuideStep } from "./guide-spec";
 import { BOARD_STAGES, BOARD_STAGE_LABEL, isBoardStage, isPipelineStage, type BoardStage, type PipelineStage } from "./board-spec";
 import {
   AI_ROUND_MARKER,
@@ -34,16 +31,12 @@ import {
   type PostedFinding,
 } from "./factory-spec";
 import {
-  CODEMAP_VERSION,
   changedFileSchema,
-  codemapSchema,
-  fileRole,
   ghIssueCommentSchema,
   ghReviewSchema,
   ghThreadSchema,
   hostContract,
   type ChangedFile,
-  type Codemap,
   type GhPr,
   type GhThread,
 } from "./host-contract";
@@ -186,25 +179,20 @@ const selectionSchema = z.object({
 });
 export type SelectionRef = z.infer<typeof selectionSchema>;
 
-const codemapStateSchema = z.object({
-  status: z.enum(["missing", "building", "ready", "failed"]),
-  codemap: codemapSchema.nullable(),
-  error: z.string().nullable(),
-  updatedAt: z.number().nullable(),
-});
-export type CodemapState = z.infer<typeof codemapStateSchema>;
-
-/** The helper-written guide over the codemap. Payload stays loose on the wire; app.tsx casts to the shared Guide type. */
-const guideStateSchema = z.object({
+/** The Map tab: the helper-written diffmap spec of the PR. */
+const mapStateSchema = z.object({
+  /** About the current head: missing until a map is asked for at it. */
   status: z.enum(["missing", "queued", "writing", "ready", "failed"]),
-  /** The latest guide on file, kept while a newer one is queued or writing. */
-  guide: z.record(z.string(), z.unknown()).nullable(),
-  error: z.string().nullable(),
-  /** The guide on file was written for an older head. */
+  /** The head the map on file was written for; null when there is none. */
+  headSha: z.string().nullable(),
+  /** The map on file was written for an older head. */
   stale: z.boolean(),
+  /** The spec on file, kept while a newer one is queued or writing. */
+  markdown: z.string().nullable(),
+  error: z.string().nullable(),
   updatedAt: z.number().nullable(),
 });
-export type GuideState = z.infer<typeof guideStateSchema>;
+export type MapState = z.infer<typeof mapStateSchema>;
 
 const providerOptionSchema = z.object({
   id: z.string(),
@@ -213,18 +201,6 @@ const providerOptionSchema = z.object({
   models: z.array(z.object({ model: z.string(), displayName: z.string(), isDefault: z.boolean() })),
 });
 export type ProviderOption = z.infer<typeof providerOptionSchema>;
-
-/** The Brief tab's state: the helper-written brief. Payloads stay loose on the wire; app.tsx casts to the shared types. */
-const briefStateSchema = z.object({
-  headSha: z.string(),
-  briefStatus: z.enum(["missing", "writing", "ready", "failed"]),
-  brief: z.record(z.string(), z.unknown()).nullable(),
-  briefError: z.string().nullable(),
-  /** The stored brief was written for an older head. */
-  stale: z.boolean(),
-  updatedAt: z.number().nullable(),
-});
-export type BriefState = z.infer<typeof briefStateSchema>;
 
 /**
  * Simple English rewrites of the PR's GitHub comments, keyed per comment:
@@ -372,21 +348,16 @@ export const rpcContract = defineRpcContract({
   /** Which review a thread belongs to, if it is one of our analyst seats. */
   seat_lookup: { input: z.object({ threadId: z.string() }), output: z.object({ seat: z.object({ reviewId: z.string(), providerId: z.string() }).nullable() }) },
   chat_reset: { input: z.object({ reviewId: z.string(), providerId: z.string() }), output: okSchema },
-  codemap_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: codemapStateSchema },
-  /** The guide over the codemap; queued for writing on first call at a new head when autoGuide is on. */
-  guide_get: { input: reviewIdSchema, output: guideStateSchema },
-  /** (Re)write the guide at the current head. */
-  guide_write: { input: reviewIdSchema, output: guideStateSchema },
+  /** The diffmap of the PR; queued for writing on first call at a new head when autoMap is on. */
+  map_get: { input: reviewIdSchema, output: mapStateSchema },
+  /** (Re)write the diffmap at the current head. */
+  map_write: { input: reviewIdSchema, output: mapStateSchema },
   rooms_list: { input: z.null(), output: z.object({ rooms: z.array(z.object({ id: z.string(), title: z.string(), handles: z.array(z.string()) })), available: z.boolean() }) },
   send_to_room: {
     input: z.object({ roomId: z.string(), text: z.string().trim().min(1).max(20_000), tags: z.array(z.string()).max(8), turns: z.number().int().min(0).max(40).optional() }),
     output: okSchema,
   },
   context_providers: { input: z.null(), output: z.object({ providers: z.array(providerOptionSchema), defaultProvider: z.string() }) },
-  /** The brief is written on first call when autoBrief is on. */
-  brief_get: { input: reviewIdSchema, output: briefStateSchema },
-  /** (Re)write the plain-English brief at the current head. */
-  brief_write: { input: reviewIdSchema, output: briefStateSchema },
   /** Simple English rewrites of the comments. In eager mode missing ones are queued on each call; `refresh` throws the cache away and rewrites everything. */
   simple_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: simpleStateSchema },
   /** Rewrite these comments now, ahead of anything else queued; a failed one is tried again. */
@@ -620,6 +591,21 @@ const MIGRATIONS = [
   // Hidden threads per review for the AI reviewer and the CI babysitter; same shape as helpers.
   `CREATE TABLE IF NOT EXISTS ai_reviewers (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL, intro_hash TEXT)`,
   `CREATE TABLE IF NOT EXISTS babysitters (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL, intro_hash TEXT)`,
+  // The diffmap spec of the PR. head_sha is the head the status is about;
+  // markdown_head_sha is the head the stored spec was written for, so an older
+  // map stays on screen while a newer one is queued or writing. The codemaps,
+  // briefs, and guides tables above belong to removed features and stay
+  // declared so existing databases still match.
+  `CREATE TABLE IF NOT EXISTS maps (
+     review_id TEXT PRIMARY KEY,
+     head_sha TEXT NOT NULL,
+     status TEXT NOT NULL,
+     markdown TEXT,
+     markdown_head_sha TEXT,
+     raw TEXT,
+     error TEXT,
+     updated_at INTEGER NOT NULL
+   )`,
 ];
 
 interface ReviewRow {
@@ -630,7 +616,6 @@ interface ReviewRow {
 }
 interface PendingRow { id: string; review_id: string; path: string; line: number; start_line: number | null; side: string; body: string; created_at: number }
 interface SeatRow { review_id: string; provider_id: string; thread_id: string; environment_id: string | null; created_at: number }
-interface CodemapRow { review_id: string; head_sha: string; status: string; json: string | null; error: string | null; updated_at: number }
 interface CacheRow { review_id: string; json: string; fetched_at: number }
 interface HelperRow { review_id: string; thread_id: string; provider_id: string; environment_id: string | null; job: string | null; created_at: number; intro_hash?: string | null }
 interface SimpleRow { review_id: string; comment_key: string; body_hash: string; status: string; text: string | null; error: string | null; updated_at: number; requested_at: number | null }
@@ -638,11 +623,7 @@ interface NoteRow {
   id: string; review_id: string; head_sha: string; path: string; line: number; start_line: number | null; side: string; kind: string; severity: string; title: string; body: string;
   suggestion: string | null; source: string; signal_id: string | null; state: string; anchor_hash: string | null; created_at: number; updated_at: number;
 }
-interface BriefRow {
-  review_id: string; head_sha: string; signals_status: string; signals_json: string | null; signals_error: string | null;
-  brief_status: string; brief_head_sha: string | null; brief_json: string | null; brief_raw: string | null; brief_error: string | null; updated_at: number;
-}
-interface GuideRow { review_id: string; head_sha: string; status: string; json: string | null; json_head_sha: string | null; raw: string | null; error: string | null; updated_at: number }
+interface MapRow { review_id: string; head_sha: string; status: string; markdown: string | null; markdown_head_sha: string | null; raw: string | null; error: string | null; updated_at: number }
 interface BoardStageRow { review_id: string; stage: string; auto_stage: string; updated_at: number }
 interface PipelineRow {
   review_id: string; stage: string; entered_at: number; head_seen_at: number | null; needs_you: string | null;
@@ -739,11 +720,6 @@ function createStore(db: Database.Database) {
     deleteSimpleRow: db.prepare<[string, string]>(`DELETE FROM simple_comments WHERE review_id = ? AND comment_key = ?`),
     deleteSimple: db.prepare<[string]>(`DELETE FROM simple_comments WHERE review_id = ?`),
     resetSimpleWriting: db.prepare<[]>(`UPDATE simple_comments SET status = 'queued' WHERE status = 'writing'`),
-    brief: db.prepare<[string], BriefRow>(`SELECT * FROM briefs WHERE review_id = ?`),
-    ensureBrief: db.prepare<[string, string, number]>(`INSERT INTO briefs (review_id, head_sha, updated_at) VALUES (?, ?, ?) ON CONFLICT(review_id) DO NOTHING`),
-    setBrief: db.prepare<[string, string | null, string | null, string | null, string | null, number, string]>(
-      `UPDATE briefs SET brief_status = ?, brief_head_sha = ?, brief_json = ?, brief_raw = ?, brief_error = ?, updated_at = ? WHERE review_id = ?`,
-    ),
     notes: db.prepare<[string], NoteRow>(`SELECT * FROM notes WHERE review_id = ? ORDER BY path ASC, line ASC, created_at ASC`),
     noteById: db.prepare<[string], NoteRow>(`SELECT * FROM notes WHERE id = ?`),
     insertNote: db.prepare<[string, string, string, string, number, number | null, string, string, string, string, string, string | null, string, string | null, string | null, number, number]>(
@@ -761,20 +737,16 @@ function createStore(db: Database.Database) {
     upsertSeen: db.prepare<[string, string, string | null, number]>(
       `INSERT INTO review_seen (review_id, seen_head_sha, prev_head_sha, seen_at) VALUES (?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET seen_head_sha = excluded.seen_head_sha, prev_head_sha = excluded.prev_head_sha, seen_at = excluded.seen_at`,
     ),
-    codemap: db.prepare<[string], CodemapRow>(`SELECT * FROM codemaps WHERE review_id = ?`),
-    setCodemap: db.prepare<[string, string, string, string | null, string | null, number]>(
-      `INSERT INTO codemaps (review_id, head_sha, status, json, error, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, status = excluded.status, json = excluded.json, error = excluded.error, updated_at = excluded.updated_at`,
-    ),
     helpersWithJob: db.prepare<[], HelperRow>(`SELECT * FROM helpers WHERE job IS NOT NULL`),
-    briefsWriting: db.prepare<[], { review_id: string }>(`SELECT review_id FROM briefs WHERE brief_status = 'writing'`),
-    guide: db.prepare<[string], GuideRow>(`SELECT * FROM guides WHERE review_id = ?`),
-    guidesPending: db.prepare<[], { review_id: string; head_sha: string }>(`SELECT review_id, head_sha FROM guides WHERE status IN ('queued', 'writing')`),
-    /** Status for a head; the stored guide (json, json_head_sha, raw) is kept. */
-    setGuideStatus: db.prepare<[string, string, string, string | null, number]>(
-      `INSERT INTO guides (review_id, head_sha, status, error, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, status = excluded.status, error = excluded.error, updated_at = excluded.updated_at`,
+    map: db.prepare<[string], MapRow>(`SELECT * FROM maps WHERE review_id = ?`),
+    mapsPending: db.prepare<[], { review_id: string; head_sha: string }>(`SELECT review_id, head_sha FROM maps WHERE status IN ('queued', 'writing')`),
+    /** Status for a head; the stored spec (markdown, markdown_head_sha, raw) is kept. */
+    setMapStatus: db.prepare<[string, string, string, string | null, number]>(
+      `INSERT INTO maps (review_id, head_sha, status, error, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, status = excluded.status, error = excluded.error, updated_at = excluded.updated_at`,
     ),
-    setGuideReady: db.prepare<[string, string | null, number, string]>(`UPDATE guides SET status = 'ready', json = ?, json_head_sha = head_sha, raw = ?, error = NULL, updated_at = ? WHERE review_id = ?`),
-    setGuideFailed: db.prepare<[string, string | null, number, string]>(`UPDATE guides SET status = 'failed', error = ?, raw = ?, updated_at = ? WHERE review_id = ?`),
+    setMapReady: db.prepare<[string, string, number, string]>(`UPDATE maps SET status = 'ready', markdown = ?, markdown_head_sha = head_sha, raw = ?, error = NULL, updated_at = ? WHERE review_id = ?`),
+    setMapFailed: db.prepare<[string, string | null, number, string]>(`UPDATE maps SET status = 'failed', error = ?, raw = ?, updated_at = ? WHERE review_id = ?`),
+    deleteMap: db.prepare<[string]>(`DELETE FROM maps WHERE review_id = ?`),
     boardStage: db.prepare<[string], BoardStageRow>(`SELECT * FROM board_stages WHERE review_id = ?`),
     setBoardStage: db.prepare<[string, string, string, number]>(
       `INSERT INTO board_stages (review_id, stage, auto_stage, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET stage = excluded.stage, auto_stage = excluded.auto_stage, updated_at = excluded.updated_at`,
@@ -944,11 +916,6 @@ function remoteMatches(remote: string | null, owner: string, repo: string): bool
   return normalized.endsWith(`${owner}/${repo}`.toLowerCase());
 }
 
-function wasmDirCandidates(): string[] {
-  const here = fileURLToPath(new URL(".", import.meta.url));
-  return [`${here}node_modules/@vscode/tree-sitter-wasm/wasm`, `${here}../node_modules/@vscode/tree-sitter-wasm/wasm`];
-}
-
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -957,9 +924,8 @@ export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     defaultProvider: { type: "string", label: "Default AI provider id for the PR chat", default: "claude-code" },
     hideSeatThreads: { type: "boolean", label: "Hide analyst threads from the sidebar", default: true },
-    autoBrief: { type: "boolean", label: "Write the plain-English brief when a review is first opened at a new head", default: true },
-    autoGuide: { type: "boolean", label: "Write the codemap guide (overview, flow, reading order, one line per file) when a review is first opened at a new head", default: true },
-    helperModel: { type: "string", label: "Model for the helper thread (brief, guide, notes); empty uses the project's default", default: "" },
+    autoMap: { type: "boolean", label: "Write the PR's diffmap when it is added to the board, and again when it is viewed at a new head", default: true },
+    helperModel: { type: "string", label: "Model for the helper thread (the diffmap, notes); empty uses the project's default", default: "" },
     simpleEnglishMode: { type: "string", label: "Simple English rewrites of GitHub comments: lazy (when you flip a comment), eager (every comment as it loads), or off", default: "lazy" },
     simpleEnglishProvider: { type: "string", label: "Provider id for the Simple English thread; empty uses defaultProvider", default: "" },
     simpleEnglishModel: { type: "string", label: "Model for the Simple English thread; empty uses helperModel, then the project's default", default: "" },
@@ -984,7 +950,7 @@ export default async function plugin(bb: BbPluginApi) {
     eventWebhookSecret: { type: "string", secret: true, label: "PR factory: secret sent as X-Webhook-Secret with each event", default: "" },
   });
   const {
-    defaultProvider, hideSeatThreads, autoBrief, autoGuide, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir, threadSection,
+    defaultProvider, hideSeatThreads, autoMap, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir, threadSection,
     autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
   } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
@@ -996,25 +962,18 @@ export default async function plugin(bb: BbPluginApi) {
   q.resetSimpleWriting.run();
   q.resetSimplifierJobs.run();
   const host = bb.hosts.experimental_client({ contract: hostContract });
-  const codemapBuilds = new Set<string>();
 
-  /** Jobs waiting for the helper: one thread per review, one job at a time. */
-  const helperWanted = new Map<string, Set<"brief" | "guide">>();
-  const want = (reviewId: string, job: "brief" | "guide") => {
-    const set = helperWanted.get(reviewId) ?? new Set<"brief" | "guide">();
-    set.add(job);
-    helperWanted.set(reviewId, set);
-  };
+  /** Reviews whose map waits for the helper: one thread per review, one job at a time. */
+  const mapWanted = new Set<string>();
 
   // The helper across a plugin reload. A thread still working on its job keeps
   // its marker: the idle event arrives later and completes the job as usual. A
   // thread that is idle, gone, or archived lost its reply, so the marker is
-  // cleared and a brief or guide that was writing goes back on the queue, to
-  // be sent on the next look at the review (brief_get, guide_get).
+  // cleared and a map that was queued or writing goes back on the queue, to be
+  // sent on the next look at the review (map_get).
   void (async () => {
     const now = Date.now();
-    const briefs = new Set(q.briefsWriting.all().map((r) => r.review_id));
-    const guides = new Map(q.guidesPending.all().map((r) => [r.review_id, r.head_sha]));
+    const maps = new Map(q.mapsPending.all().map((r) => [r.review_id, r.head_sha]));
     for (const helper of q.helpersWithJob.all()) {
       let running = false;
       try {
@@ -1027,13 +986,11 @@ export default async function plugin(bb: BbPluginApi) {
         q.setHelperJob.run(null, helper.review_id);
         continue;
       }
-      if (helper.job === "brief") briefs.delete(helper.review_id);
-      if (helper.job === "guide") guides.delete(helper.review_id);
+      if (helper.job === "map") maps.delete(helper.review_id);
     }
-    for (const reviewId of briefs) want(reviewId, "brief");
-    for (const [reviewId, headSha] of guides) {
-      q.setGuideStatus.run(reviewId, headSha, "queued", null, now);
-      want(reviewId, "guide");
+    for (const [reviewId, headSha] of maps) {
+      q.setMapStatus.run(reviewId, headSha, "queued", null, now);
+      mapWanted.add(reviewId);
     }
   })();
 
@@ -1133,6 +1090,7 @@ export default async function plugin(bb: BbPluginApi) {
     void refreshThreads(row).catch((cause: unknown) => bb.log.warn(`threads for ${id}: ${errorMessage(cause)}`));
     publish(id, "opened");
     if (autoAiReview && row.state === "OPEN") startFactory(row);
+    if (autoMap) wantMap(row, false);
     return toReview(row);
   }
 
@@ -1152,6 +1110,8 @@ export default async function plugin(bb: BbPluginApi) {
     await refreshThreads(fresh).catch((cause: unknown) => bb.log.warn(`threads for ${reviewId}: ${errorMessage(cause)}`));
     if (headChanged) await reanchorNotes(fresh).catch((cause: unknown) => bb.log.warn(`notes for ${reviewId}: ${errorMessage(cause)}`));
     if (headChanged) q.setHeadSeen.run(Date.now(), reviewId);
+    // A PR someone has a map of gets one at the new head too.
+    if (headChanged && autoMap && q.map.get(reviewId)?.markdown) wantMap(fresh, false);
     publish(reviewId, "synced");
     return { review: toReview(fresh), headChanged };
   }
@@ -1492,7 +1452,7 @@ export default async function plugin(bb: BbPluginApi) {
       `Your working directory is a detached worktree at the PR head ${row.head_sha}. The merge base with ${row.base_ref} is ${row.base_sha}.`,
       `The full diff is: git diff ${row.base_sha} ${row.head_sha}. One file: git diff ${row.base_sha} ${row.head_sha} -- <path>. Base version of a file: git show ${row.base_sha}:<path>.`,
       "You are read-only: never modify files, never commit, never push. Read files and run read-only commands to verify claims before making them.",
-      "The reviewer attaches code as pills: @-mentions of a line range, a changed file, a changed symbol, a GitHub review thread, or the PR description. Each pill's content arrives with the message as a context block titled \"Context for @<pill>\"; in range excerpts, > marks the selected lines. Treat those blocks as the code the reviewer is pointing at.",
+      "The reviewer attaches code as pills: @-mentions of a line range, a changed file, a commit, a GitHub review thread, or the PR description. Each pill's content arrives with the message as a context block titled \"Context for @<pill>\"; in range excerpts, > marks the selected lines. Treat those blocks as the code the reviewer is pointing at.",
       "Answer for the reviewer: specific, concise, citing paths and line numbers. When asked to draft a GitHub comment, write ready-to-post Markdown with no preamble.",
       "",
       "PR description:",
@@ -1625,68 +1585,13 @@ export default async function plugin(bb: BbPluginApi) {
     publish(reviewId, "seats");
   }
 
-  // -- codemap ---------------------------------------------------------------
-
-  function codemapState(row: ReviewRow): CodemapState {
-    const cached = q.codemap.get(row.id);
-    const notBuilt = (): CodemapState => (codemapBuilds.has(row.id) ? { status: "building", codemap: null, error: null, updatedAt: null } : { status: "missing", codemap: null, error: null, updatedAt: null });
-    if (cached === undefined || cached.head_sha !== row.head_sha) return notBuilt();
-    if (cached.status === "ready") {
-      const codemap = parseJson<Codemap | null>(cached.json, null);
-      // A map built by an older version of the builder is rebuilt, not shown.
-      if (codemap === null || codemap.version !== CODEMAP_VERSION) return notBuilt();
-      return { status: "ready", codemap, error: null, updatedAt: cached.updated_at };
-    }
-    if (cached.status === "building") return { status: "building", codemap: null, error: null, updatedAt: cached.updated_at };
-    return { status: "failed", codemap: null, error: cached.error, updatedAt: cached.updated_at };
-  }
-
-  function startCodemap(row: ReviewRow): void {
-    if (codemapBuilds.has(row.id)) return;
-    codemapBuilds.add(row.id);
-    q.setCodemap.run(row.id, row.head_sha, "building", null, null, Date.now());
-    publish(row.id, "codemap");
-    void (async () => {
-      try {
-        const files = await filesFor(row);
-        const wasmDir = wasmDirCandidates().find((dir) => existsSync(`${dir}/tree-sitter.wasm`)) ?? null;
-        const codemap = await host.call("codemap", { worktree: row.worktree, baseSha: row.base_sha, headSha: row.head_sha, files, wasmDir }, hostOptions(row));
-        q.setCodemap.run(row.id, row.head_sha, "ready", JSON.stringify(codemap), null, Date.now());
-      } catch (cause) {
-        q.setCodemap.run(row.id, row.head_sha, "failed", null, errorMessage(cause), Date.now());
-      } finally {
-        codemapBuilds.delete(row.id);
-        publish(row.id, "codemap");
-        // A queued guide waits for the codemap; it can go now.
-        pumpHelper(row.id);
-      }
-    })();
-  }
-
   // -- code pills (mention provider) -----------------------------------------
   //
-  // `@` in a seat's composer searches this PR: changed files, changed symbols
-  // from the codemap, GitHub review threads, the description, and explicit
+  // `@` in a seat's composer searches this PR: changed files, GitHub review
+  // threads, the description, commits, and explicit
   // `path:10-20` ranges. The picked item becomes a pill in the draft; bb calls
   // `resolve` when the message is sent and attaches the text as agent-only
   // context, so the transcript shows the pill and the analyst sees the code.
-
-  interface ChangedSymbol { path: string; qualified: string; kind: string; status: string; start: number; end: number; oldStart: number | null; oldEnd: number | null; changedLines: number; fanIn: number }
-  const symbolCache = new Map<string, { headSha: string; symbols: ChangedSymbol[] }>();
-
-  function changedSymbols(row: ReviewRow): ChangedSymbol[] {
-    const cached = symbolCache.get(row.id);
-    if (cached !== undefined && cached.headSha === row.head_sha) return cached.symbols;
-    const state = codemapState(row);
-    if (state.status !== "ready" || state.codemap === null) return [];
-    const symbols = state.codemap.files.flatMap((f) =>
-      f.symbols
-        .filter((s) => s.status !== "unchanged")
-        .map((s) => ({ path: f.path, qualified: s.qualified.replace(/\s+/g, " "), kind: s.kind, status: s.status, start: s.start, end: s.end, oldStart: s.oldStart, oldEnd: s.oldEnd, changedLines: s.changedLines, fanIn: s.fanIn })),
-    );
-    symbolCache.set(row.id, { headSha: row.head_sha, symbols });
-    return symbols;
-  }
 
   /** The review a composer talks about: the seat's review for a thread composer, else the project's latest review. */
   function reviewForComposer(ctx: PluginMentionSearchContext): ReviewRow | null {
@@ -1750,19 +1655,6 @@ export default async function plugin(bb: BbPluginApi) {
     }
     groups.push(fileItems);
 
-    const symbolItems: ScoredItem[] = [];
-    for (const sym of changedSymbols(row)) {
-      const s = Math.max(matchScore(sym.qualified.split("::").pop() ?? sym.qualified, query, 9), matchScore(sym.qualified, query, 5));
-      if (s === 0) continue;
-      // Removed symbols only exist on the base side.
-      const removed = sym.status === "removed" && sym.oldStart !== null && sym.oldEnd !== null;
-      const ref: MentionRef = removed
-        ? { kind: "symbol", reviewId: row.id, path: sym.path, qualified: sym.qualified, startLine: sym.oldStart ?? 1, endLine: sym.oldEnd ?? 1, side: "old" }
-        : { kind: "symbol", reviewId: row.id, path: sym.path, qualified: sym.qualified, startLine: sym.start, endLine: sym.end, side: "new" };
-      symbolItems.push(scored(ref, sym.qualified, `${sym.kind} ${sym.status} · ${sym.path}:${ref.startLine}-${ref.endLine}${removed ? " (base)" : ""}`, "Workflow", s + Math.min(sym.changedLines, 200) / 100 + Math.min(sym.fanIn, 50) / 50));
-    }
-    groups.push(symbolItems);
-
     const threadItems: ScoredItem[] = [];
     for (const t of cachedThreads(row)) {
       const first = t.comments[0];
@@ -1786,7 +1678,7 @@ export default async function plugin(bb: BbPluginApi) {
     groups.push(commitItems);
 
     // Browsing (empty query) shows a mix; a query ranks everything together.
-    const caps = browsing ? [3, 8, 6, 4, 1, 3] : [5, 40, 40, 40, 1, 10];
+    const caps = browsing ? [3, 8, 4, 1, 3] : [5, 40, 40, 1, 10];
     const items = groups.flatMap((group, i) => group.sort((a, b) => b.score - a.score).slice(0, caps[i]));
     if (!browsing) items.sort((a, b) => b.score - a.score);
     return items.slice(0, 24).map(({ score: _score, ...rest }) => rest);
@@ -1832,9 +1724,8 @@ export default async function plugin(bb: BbPluginApi) {
         const MAX = 250;
         const slice = lines.slice(start - 1, Math.min(end, start - 1 + MAX));
         const width = String(end).length;
-        const sym = changedSymbols(row).find((s) => s.path === ref.path && s.qualified === ref.qualified);
         return [
-          `${prefix} — ${ref.qualified}${sym ? ` (${sym.kind}, ${sym.status}, ${sym.changedLines} changed lines, fan-in ${sym.fanIn})` : ""} in ${ref.path} lines ${start}-${end} at ${ref.side === "old" ? `base ${short(row.base_sha)}` : `head ${short(row.head_sha)}`}:`,
+          `${prefix} — ${ref.qualified} in ${ref.path} lines ${start}-${end} at ${ref.side === "old" ? `base ${short(row.base_sha)}` : `head ${short(row.head_sha)}`}:`,
           "```",
           slice.map((line, i) => `${String(start + i).padStart(width)}| ${line}`).join("\n"),
           ...(end - start + 1 > MAX ? [`... truncated after ${MAX} lines; read the file for the rest`] : []),
@@ -1903,7 +1794,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   function helperIntro(row: ReviewRow): string {
     return [
-      `You are the helper for pull request #${row.number} of ${row.owner}/${row.repo}: "${row.title}". You get one job per message. Each job names the fenced block tag it wants; answer with exactly one fenced block of that tag containing JSON, and nothing else before or after it.`,
+      `You are the helper for pull request #${row.number} of ${row.owner}/${row.repo}: "${row.title}". You get one job per message, and each job says exactly how to answer.`,
       `Your working directory is a detached worktree at the PR head ${row.head_sha}; the merge base with ${row.base_ref} is ${row.base_sha}. Full diff: git diff ${row.base_sha} ${row.head_sha}. One file: git diff ${row.base_sha} ${row.head_sha} -- <path>. Base version: git show ${row.base_sha}:<path>.`,
       "You are read-only: never modify files, never commit, never push. Read the code before writing; every line number you cite must exist in the diff.",
     ].join("\n");
@@ -1954,7 +1845,7 @@ export default async function plugin(bb: BbPluginApi) {
   /** Reviews whose helper job is being prepared: the prompt is building, the job marker is not set yet. */
   const helperSending = new Set<string>();
 
-  /** The helper takes one job at a time; the brief, the guide, and notes all wait for it. */
+  /** The helper takes one job at a time; the map and notes wait for it. */
   function helperBusy(row: ReviewRow): boolean {
     return helperSending.has(row.id) || (q.helper.get(row.id)?.job ?? null) !== null;
   }
@@ -1973,35 +1864,17 @@ export default async function plugin(bb: BbPluginApi) {
     helperSending.delete(row.id);
   }
 
-  /**
-   * Send the next waiting job once the helper is free. The brief goes before
-   * the guide; the guide also waits for the codemap, which it reads for
-   * orientation. Called when a job completes and when a codemap build ends.
-   */
+  /** Send a waiting map once the helper is free. Called when a job completes and when a map is asked for. */
   function pumpHelper(reviewId: string): void {
-    const wanted = helperWanted.get(reviewId);
-    if (wanted === undefined || wanted.size === 0) return;
+    if (!mapWanted.has(reviewId)) return;
     const row = q.review.get(reviewId);
     if (row === undefined) {
-      helperWanted.delete(reviewId);
+      mapWanted.delete(reviewId);
       return;
     }
     if (helperBusy(row)) return;
-    if (wanted.has("brief")) {
-      wanted.delete("brief");
-      void sendBrief(row);
-      return;
-    }
-    if (wanted.has("guide")) {
-      const codemap = codemapState(row);
-      if (codemap.status === "missing") {
-        startCodemap(row);
-        return;
-      }
-      if (codemap.status === "building") return;
-      wanted.delete("guide");
-      void sendGuide(row);
-    }
+    mapWanted.delete(reviewId);
+    void sendMap(row);
   }
 
   let sectionLookup: Promise<string | null> | null = null;
@@ -2090,338 +1963,102 @@ export default async function plugin(bb: BbPluginApi) {
     return start !== -1 && end > start ? text.slice(start, end + 1) : null;
   }
 
-  // -- brief: the helper's plain-English summary ------------------------------
-
-  function briefState(row: ReviewRow): BriefState {
-    const b = q.brief.get(row.id);
-    const briefStatus = b === undefined ? "missing" : b.brief_status === "writing" || b.brief_status === "ready" || b.brief_status === "failed" ? b.brief_status : "missing";
-    return {
-      headSha: row.head_sha,
-      briefStatus,
-      brief: b?.brief_status === "ready" ? parseJson<Record<string, unknown> | null>(b.brief_json, null) : null,
-      briefError: b?.brief_error ?? null,
-      stale: b?.brief_status === "ready" && b.brief_head_sha !== row.head_sha,
-      updatedAt: b?.updated_at ?? null,
-    };
-  }
-
-  /**
-   * The codemap as text for a helper prompt. The brief gets the top symbols
-   * overall; the guide (`perFile`) gets every file's changed symbols and the
-   * references between modules, so it can place files and trace the flow.
-   */
-  function codemapDigest(row: ReviewRow, options: { perFile?: number } = {}): string {
-    const state = codemapState(row);
-    if (state.status !== "ready" || state.codemap === null) return "(codemap not built yet)";
-    const c = state.codemap;
-    const lines = [
-      `Codemap (${c.engine}): ${c.stats.files} files, ${c.stats.symbols} symbols (+${c.stats.added} ~${c.stats.modified} -${c.stats.removed}), ${c.edges.length} references between changed symbols.`,
-      "Module order (dependencies first; tests, config, and docs after the code):",
-      ...c.readingOrder.map((m, i) => `  ${i + 1}. ${m.module} (${m.paths.length} files): ${m.reason}`),
-      "Hotspots (changed lines weighted by fan-in from the repository; tests count a quarter):",
-      ...c.hotspots.slice(0, 10).map((h) => `  ${h.path}#${h.qualified} (${h.changedLines} changed lines, fan-in ${h.fanIn})`),
-    ];
-    if (options.perFile === undefined) {
-      lines.push(
-        "Changed symbols (top 60 by changed lines):",
-        ...[...changedSymbols(row)].sort((a, b) => b.changedLines - a.changedLines).slice(0, 60).map((s) => `  ${s.status.padEnd(8)} ${s.kind.padEnd(9)} ${s.qualified}  ${s.path}:${s.status === "removed" ? `${s.oldStart}-${s.oldEnd} (base)` : `${s.start}-${s.end}`}`),
-      );
-      return lines.join("\n");
-    }
-    lines.push("Changed symbols per file (+ added, ~ modified, - removed; head lines, base lines for removed):");
-    for (const f of c.files) {
-      const changed = f.symbols.filter((s) => s.status !== "unchanged").sort((a, b) => b.changedLines - a.changedLines);
-      if (changed.length === 0) {
-        lines.push(`  ${f.path} [${f.role}, ${f.changedLines} lines]: no symbol-level change`);
-        continue;
-      }
-      const shown = changed.slice(0, options.perFile).map((s) => `${s.status === "added" ? "+" : s.status === "removed" ? "-" : "~"}${s.kind} ${s.qualified} ${s.status === "removed" ? `${s.oldStart}-${s.oldEnd}` : `${s.start}-${s.end}`}`);
-      lines.push(`  ${f.path} [${f.role}, ${f.changedLines} lines]: ${shown.join("; ")}${changed.length > shown.length ? `; and ${changed.length - shown.length} more` : ""}`);
-    }
-    const moduleOf = new Map(c.files.map((f) => [f.path, f.module]));
-    const between = new Map<string, number>();
-    for (const e of c.edges) {
-      const from = moduleOf.get(e.from.split("#")[0]);
-      const to = moduleOf.get(e.to.split("#")[0]);
-      if (from === undefined || to === undefined || from === to) continue;
-      const key = `${from} -> ${to}`;
-      between.set(key, (between.get(key) ?? 0) + 1);
-    }
-    if (between.size > 0) {
-      lines.push("References between modules (from -> to: count):");
-      for (const [key, n] of [...between.entries()].sort((a, b) => b[1] - a[1]).slice(0, 40)) lines.push(`  ${key}: ${n}`);
-    }
-    return lines.join("\n");
-  }
-
-  async function briefPrompt(row: ReviewRow): Promise<string> {
-    const files = await filesFor(row);
-    return [
-      `Job: write the brief for this PR. Reply with exactly one fenced block tagged ${BRIEF_FENCE} containing this JSON:`,
-      "{",
-      '  "summary": string,',
-      '  "areas": [{ "module": string, "what": string, "path": string }]',
-      "}",
-      "",
-      "summary: a Markdown bullet list for a reader who knows this codebase but has not read the diff. 4 to 8 bullets, each starting with `- `. One bullet per behavior change: what the code does now that it did not do before, or what changes for callers or operators. Each bullet is one sentence under 20 words, active voice, everyday words. No heading and no prose outside the list. Name code by its identifiers. No marketing words (robust, seamless, comprehensive, leverage, enhance). Describe the diff, not the description.",
-      "areas: one entry per module touched, at most 8, what changed there in one sentence, path = the file that matters most.",
-      "",
-      `PR title: ${row.title}`,
-      "PR description:",
-      row.body.trim() === "" ? "(none)" : row.body.trim().slice(0, 8000),
-      "",
-      `Changed files (${files.length}):`,
-      ...files.slice(0, 150).map((f) => `  ${f.status.padEnd(8)} ${f.path} (+${f.additions} -${f.deletions})`),
-      ...(files.length > 150 ? [`  ... ${files.length - 150} more`] : []),
-      "",
-      codemapDigest(row),
-    ].join("\n");
-  }
-
-  const rawBriefSchema = z.object({
-    summary: z.string().optional(),
-    areas: z.array(z.object({ module: z.coerce.string(), what: z.string().optional(), path: z.string().nullable().optional() })).optional(),
-  });
-
-  function normalizeBrief(raw: unknown, files: ChangedFile[]): Brief {
-    const parsed = rawBriefSchema.parse(raw);
-    const paths = new Set(files.map((f) => f.path));
-    const resolvePath = (p: string): string | null => {
-      const clean = p.trim().replace(/^\.\//, "");
-      if (paths.has(clean)) return clean;
-      return files.find((f) => f.path.endsWith(`/${clean}`))?.path ?? null;
-    };
-    return {
-      summary: (parsed.summary ?? "").trim(),
-      areas: (parsed.areas ?? []).slice(0, 8).map((a) => ({ module: a.module, what: (a.what ?? "").trim(), path: a.path ? resolvePath(a.path) : null })),
-    };
-  }
-
-  /** Mark the brief as writing and send it, or queue it when the helper has another job. */
-  async function writeBrief(row: ReviewRow): Promise<void> {
-    q.ensureBrief.run(row.id, row.head_sha, Date.now());
-    const current = q.brief.get(row.id);
-    if (current?.brief_status === "writing") return;
-    const busy = helperBusy(row);
-    q.setBrief.run("writing", row.head_sha, null, null, null, Date.now(), row.id);
-    publish(row.id, "brief");
-    if (busy) {
-      want(row.id, "brief");
-      return;
-    }
-    await sendBrief(row);
-  }
-
-  async function sendBrief(row: ReviewRow): Promise<void> {
-    await runHelperJob(row, "brief", () => briefPrompt(row), (message) => {
-      q.setBrief.run("failed", row.head_sha, null, null, message, Date.now(), row.id);
-      publish(row.id, "brief");
-    });
-  }
-
-  async function completeBrief(reviewId: string, text: string | null, error: string | null): Promise<void> {
-    const row = q.review.get(reviewId);
-    const current = q.brief.get(reviewId);
-    if (row === undefined || current === undefined || current.brief_status !== "writing") return;
-    if (error !== null || text === null) {
-      q.setBrief.run("failed", current.brief_head_sha, null, text, error ?? "the helper returned nothing", Date.now(), reviewId);
-    } else {
-      try {
-        const json = extractFenced(text, BRIEF_FENCE);
-        if (json === null) throw new Error(`no ${BRIEF_FENCE} block in the reply`);
-        const brief = normalizeBrief(JSON.parse(json), await filesFor(row));
-        if (brief.summary === "") throw new Error("the brief has no summary");
-        q.setBrief.run("ready", current.brief_head_sha, JSON.stringify(brief), text, null, Date.now(), reviewId);
-      } catch (cause) {
-        q.setBrief.run("failed", current.brief_head_sha, null, text, `could not read the brief: ${errorMessage(cause)}`, Date.now(), reviewId);
-      }
-    }
-    publish(reviewId, "brief");
-    pumpHelper(reviewId);
-  }
-
-  // -- guide: the helper's map over the codemap -------------------------------
+  // -- map: the helper's diffmap of the PR ------------------------------------
   //
-  // The codemap says which symbols changed where. The guide, written by the
-  // helper from the diff with the codemap as orientation, says what the PR
-  // does, how the changed code runs, in what order to read the files, and what
-  // each file does in this PR. One job on the helper lane, after the brief.
+  // A diffmap spec (github.com/tanishqkancharla/diffmap) of the PR at a head,
+  // written by the helper with diffmap's own generate-diffmap skill (bundled
+  // in skills/) and kept per review. The Map tab renders it with diffmap's
+  // viewer. An older map stays on screen while a newer one is queued or
+  // writing.
 
-  function guideState(row: ReviewRow): GuideState {
-    const g = q.guide.get(row.id);
-    const guide = g?.json ? parseJson<Record<string, unknown> | null>(g.json, null) : null;
-    const stale = guide !== null && g?.json_head_sha !== row.head_sha;
-    if (g === undefined || g.head_sha !== row.head_sha) {
-      // No status for this head yet; an older guide may still be on file.
-      return { status: helperWanted.get(row.id)?.has("guide") ? "queued" : "missing", guide, error: null, stale, updatedAt: g?.updated_at ?? null };
-    }
-    const status = g.status === "queued" || g.status === "writing" || g.status === "ready" || g.status === "failed" ? g.status : "missing";
-    return { status, guide, error: status === "failed" ? g.error : null, stale, updatedAt: g.updated_at };
+  const MAP_OPEN = "<<<DIFFMAP";
+  const MAP_CLOSE = "DIFFMAP>>>";
+
+  function mapState(row: ReviewRow): MapState {
+    const m = q.map.get(row.id);
+    if (m === undefined) return { status: "missing", headSha: null, stale: false, markdown: null, error: null, updatedAt: null };
+    const known = m.status === "queued" || m.status === "writing" || m.status === "ready" || m.status === "failed" ? m.status : "missing";
+    // A finished status about an older head says nothing about this one.
+    const status = m.head_sha !== row.head_sha && (known === "ready" || known === "failed") ? "missing" : known;
+    return {
+      status,
+      headSha: m.markdown_head_sha,
+      stale: m.markdown !== null && m.markdown_head_sha !== row.head_sha,
+      markdown: m.markdown,
+      error: status === "failed" ? m.error : null,
+      updatedAt: m.updated_at,
+    };
   }
 
-  /** Ask for the guide at the current head; `force` rewrites one that is already current. */
-  function wantGuide(row: ReviewRow, force: boolean): void {
-    const state = guideState(row);
-    if (state.status === "writing" || state.status === "queued") return;
-    if (!force && state.status === "ready" && !state.stale) return;
-    want(row.id, "guide");
-    q.setGuideStatus.run(row.id, row.head_sha, "queued", null, Date.now());
-    publish(row.id, "guide");
+  /** Queue the map at the current head; `force` writes it again even when one is on file. */
+  function wantMap(row: ReviewRow, force: boolean): void {
+    const state = mapState(row);
+    if (!force && (state.status === "queued" || state.status === "writing" || state.status === "ready")) return;
+    if (state.status === "writing") return;
+    q.setMapStatus.run(row.id, row.head_sha, "queued", null, Date.now());
+    mapWanted.add(row.id);
+    publish(row.id, "map");
     pumpHelper(row.id);
   }
 
-  async function sendGuide(row: ReviewRow): Promise<void> {
-    q.setGuideStatus.run(row.id, row.head_sha, "writing", null, Date.now());
-    publish(row.id, "guide");
-    await runHelperJob(row, "guide", () => guidePrompt(row), (message) => {
-      q.setGuideStatus.run(row.id, row.head_sha, "failed", message, Date.now());
-      publish(row.id, "guide");
-    });
+  /** The map is written on first look at a new head when autoMap is on; rewrites go through map_write. */
+  function mapGet(row: ReviewRow): MapState {
+    const state = mapState(row);
+    if (autoMap && state.status === "missing") wantMap(row, false);
+    // A map re-queued by a plugin reload goes out on the first look at the review.
+    else if (state.status === "queued") {
+      mapWanted.add(row.id);
+      pumpHelper(row.id);
+    }
+    return mapState(row);
   }
 
-  async function guidePrompt(row: ReviewRow): Promise<string> {
+  async function mapPrompt(row: ReviewRow): Promise<string> {
     const files = await filesFor(row);
-    const codemap = codemapState(row).codemap;
-    const roleOf = new Map((codemap?.files ?? []).map((f) => [f.path, f.role]));
+    const commits = parseJson<Review["commits"]>(row.commits_json, []);
     return [
-      `Job: write the reading guide for this PR. Reply with exactly one fenced block tagged ${GUIDE_FENCE} containing this JSON:`,
-      "{",
-      '  "overview": string,',
-      '  "flow": [{ "path": string, "symbol": string, "what": string }],',
-      '  "steps": [{ "title": string, "why": string, "paths": [string] }],',
-      '  "files": [{ "path": string, "role": "core" | "types" | "wiring" | "tests" | "docs" | "config" | "generated" | "moved", "what": string, "skim": boolean }]',
-      "}",
+      "Job: write a diffmap walkthrough of this pull request for the person reviewing it.",
+      "Use the generate-diffmap skill for the spec's shape, prose, diagrams, call stacks, code fences, and source references. This is a walkthrough of an existing pull request, so:",
+      `- Explain the PR as it stands at head ${row.head_sha}. Start from what changes for the person using it, then work down the layers as far as a reviewer needs.`,
+      "- Write one phase per logical part of the change, in the order a reviewer should read them, each marked ✅ because the code exists. Use the PR's commits as phases only when they are meaningful steps.",
+      `- End each phase with a changes fence whose first line is ${row.base_sha}..${row.head_sha}, followed by that phase's files in reading order.`,
+      `- Source references resolve at ${row.head_sha}; read the code there before you cite it.`,
+      `- Do not write any file, do not run diffmap serve or share, and do not commit. Reply with the whole spec between a line containing only ${MAP_OPEN} and a line containing only ${MAP_CLOSE}, with nothing before or after.`,
       "",
-      "The reviewer reads the diff with this guide beside it. It answers three questions: what is going on, in what order to read the files, and what each file does in this PR. Write from the diff and the code, not from the description.",
-      "",
-      "overview: 4 to 8 sentences, each under 20 words. First the one-sentence gist. Then the shape of the change: what was added, moved, removed, or rewired, and where the new behavior lives. Then what to hold in mind while reading: an invariant, a changed contract, a hot path. Name code by its identifiers. Everyday words, active voice, no marketing words (robust, seamless, comprehensive, leverage, enhance).",
-      "flow: the runtime path through the changed code, in call order, 3 to 10 hops. Each hop is one changed or newly called symbol: path = the changed file that holds it, symbol = its qualified name as the codemap spells it when possible, what = one sentence on what happens there and what it hands to the next hop. Skip tests, docs, and config. Empty when the PR has no runtime path (docs, config, pure renames).",
-      "steps: the reading order, 3 to 8 steps. Group files so each step is one idea a reader can hold: contracts and types first, then the core logic, then the callers and wiring that adopt it, then tests, then docs and config. title: at most 8 words. why: 1 to 3 sentences on what happens in this group and why it is read at this point. paths: changed files only, in the order to read them inside the step. Every file that is not skim appears in exactly one step; skim files may share one last step.",
-      "files: one entry for every changed file, no exceptions. role: core = the logic that changes behavior; types = structs, traits, interfaces, schemas, protos; wiring = callers, constructors, exports, registrations, CLI or config plumbing that adopts the change; tests; docs; config = build, CI, deployment, lockfiles; generated = machine-written output; moved = a file whose content moved with little change. what: one sentence, under 25 words, on what this file does in this PR: what it now does that it did not before, or what was removed. For a moved file, say where it came from. skim: true when the change is mechanical (rename, import shuffle, lockfile, formatting, moved without edits) and the reviewer can pass it quickly.",
-      "Read the diff before writing: the whole change, then per file where the summary below is not enough. The codemap below is deterministic orientation: which symbols changed where, who references whom, and a dependency order between modules. Trust the code over it.",
-      "",
-      `PR title: ${row.title}`,
-      "PR description (context only; verify against the code):",
-      row.body.trim() === "" ? "(none)" : row.body.trim().slice(0, 6000),
-      "",
-      `Changed files (${files.length}), with the codemap's role guess:`,
-      ...files.slice(0, 300).map((f) => `  ${f.status.padEnd(8)} ${(roleOf.get(f.path) ?? fileRole(f.path)).padEnd(9)} ${f.path}${f.oldPath && f.oldPath !== f.path ? ` (from ${f.oldPath})` : ""} (+${f.additions} -${f.deletions})`),
-      ...(files.length > 300 ? [`  ... ${files.length - 300} more`] : []),
-      "",
-      codemapDigest(row, { perFile: 8 }),
+      `PR: ${row.owner}/${row.repo}#${row.number} "${row.title}"${row.author ? ` by ${row.author}` : ""}. Description and conversation: gh pr view ${row.number} --repo ${row.owner}/${row.repo} --comments`,
+      `Commits (${commits.length}):`,
+      ...commits.slice(-40).map((c) => `  ${c.sha.slice(0, 10)} ${c.title}`),
+      `Changed files (${files.length}):`,
+      ...files.slice(0, 150).map((f) => `  ${f.status.padEnd(8)} ${f.path} (+${f.additions} -${f.deletions})`),
+      ...(files.length > 150 ? [`  ... ${files.length - 150} more`] : []),
     ].join("\n");
   }
 
-  const rawGuideSchema = z.object({
-    overview: z.string().optional(),
-    flow: z.array(z.object({ path: z.string().optional(), symbol: z.string().optional(), what: z.string().optional() })).optional(),
-    steps: z.array(z.object({ title: z.string().optional(), why: z.string().optional(), paths: z.array(z.string()).optional() })).optional(),
-    files: z.array(z.object({ path: z.string(), role: z.string().optional(), what: z.string().optional(), skim: z.boolean().optional() })).optional(),
-  });
-
-  /**
-   * The helper's guide made whole: paths resolved to the diff, every changed
-   * file given a line and a place in a step (the codemap fills gaps), flow hops
-   * anchored to their symbol's head line when the codemap has it.
-   */
-  async function normalizeGuide(row: ReviewRow, raw: unknown): Promise<Guide> {
-    const parsed = rawGuideSchema.parse(raw);
-    const files = await filesFor(row);
-    const paths = new Set(files.map((f) => f.path));
-    const resolvePath = (p: string | undefined): string | null => {
-      if (p === undefined) return null;
-      const clean = p.trim().replace(/^\.\//, "").replace(/:\d+(-\d+)?$/, "");
-      if (paths.has(clean)) return clean;
-      const bySuffix = files.filter((f) => f.path.endsWith(`/${clean}`));
-      return bySuffix.length === 1 ? bySuffix[0].path : null;
-    };
-    const codemap = codemapState(row).codemap;
-    const codemapFile = new Map((codemap?.files ?? []).map((f) => [f.path, f]));
-    const fallbackRole = (path: string): GuideRole => {
-      const role = codemapFile.get(path)?.role ?? fileRole(path);
-      return role === "code" ? "core" : role;
-    };
-    const fallbackWhat = (path: string): string => {
-      const file = files.find((f) => f.path === path);
-      const changed = codemapFile.get(path)?.symbols.filter((s) => s.status !== "unchanged") ?? [];
-      if (file?.status === "deleted") return "Removed.";
-      if (file?.status === "renamed" && changed.length === 0) return `Moved from ${file.oldPath}.`;
-      if (changed.length === 0) return file?.status === "added" ? "New file." : "Edited.";
-      const part = (status: string, verb: string) => {
-        const list = changed.filter((s) => s.status === status);
-        return list.length === 0 ? null : `${verb} ${list.slice(0, 3).map((s) => s.name).join(", ")}${list.length > 3 ? ` and ${list.length - 3} more` : ""}`;
-      };
-      return `${[part("added", "Adds"), part("modified", "changes"), part("removed", "removes")].filter((s) => s !== null).join("; ")}.`;
-    };
-    const byPath = new Map<string, GuideFile>();
-    for (const f of parsed.files ?? []) {
-      const path = resolvePath(f.path);
-      if (path === null || byPath.has(path)) continue;
-      const role = (GUIDE_ROLES as readonly string[]).includes(f.role ?? "") ? (f.role as GuideRole) : fallbackRole(path);
-      byPath.set(path, { path, role, what: (f.what ?? "").trim() || fallbackWhat(path), skim: f.skim === true });
-    }
-    for (const f of files) {
-      if (byPath.has(f.path)) continue;
-      const role = fallbackRole(f.path);
-      byPath.set(f.path, { path: f.path, role, what: fallbackWhat(f.path), skim: role === "docs" || role === "config" || role === "generated" });
-    }
-    const placed = new Set<string>();
-    const steps: GuideStep[] = [];
-    for (const s of (parsed.steps ?? []).slice(0, 12)) {
-      const stepPaths: string[] = [];
-      for (const p of s.paths ?? []) {
-        const path = resolvePath(p);
-        if (path === null || placed.has(path)) continue;
-        placed.add(path);
-        stepPaths.push(path);
-      }
-      if (stepPaths.length === 0) continue;
-      steps.push({ title: (s.title ?? "").trim().slice(0, 80) || `Step ${steps.length + 1}`, why: (s.why ?? "").trim(), paths: stepPaths });
-    }
-    const rest = files.map((f) => f.path).filter((p) => !placed.has(p));
-    const restRead = rest.filter((p) => byPath.get(p)?.skim !== true);
-    const restSkim = rest.filter((p) => byPath.get(p)?.skim === true);
-    if (restRead.length > 0) steps.push({ title: steps.length === 0 ? "Changed files" : "Also changed", why: "Files the guide did not place in a step.", paths: restRead });
-    if (restSkim.length > 0) steps.push({ title: "Skim", why: "Mechanical changes: renames, lockfiles, formatting, generated output.", paths: restSkim });
-    const norm = (s: string) => s.replace(/\s+/g, "").toLowerCase();
-    const flow: GuideHop[] = [];
-    for (const h of (parsed.flow ?? []).slice(0, 12)) {
-      const path = resolvePath(h.path);
-      const symbol = (h.symbol ?? "").trim();
-      if (path === null || symbol === "") continue;
-      const symbols = (codemapFile.get(path)?.symbols ?? []).filter((s) => s.status !== "removed");
-      const wanted = norm(symbol);
-      const last = wanted.split(/::|\./).pop() ?? wanted;
-      const match = symbols.find((s) => norm(s.qualified) === wanted) ?? symbols.find((s) => norm(s.qualified).endsWith(`::${last}`) || norm(s.qualified).endsWith(`.${last}`)) ?? symbols.find((s) => norm(s.name) === last);
-      flow.push({ path, symbol, what: (h.what ?? "").trim(), line: match?.start ?? null });
-    }
-    return { overview: (parsed.overview ?? "").trim(), flow, steps, files: files.map((f) => byPath.get(f.path) as GuideFile) };
+  async function sendMap(row: ReviewRow): Promise<void> {
+    q.setMapStatus.run(row.id, row.head_sha, "writing", null, Date.now());
+    publish(row.id, "map");
+    await runHelperJob(row, "map", () => mapPrompt(row), (message) => {
+      q.setMapStatus.run(row.id, row.head_sha, "failed", message, Date.now());
+      publish(row.id, "map");
+    });
   }
 
-  async function completeGuide(reviewId: string, text: string | null, error: string | null): Promise<void> {
-    const row = q.review.get(reviewId);
-    const g = q.guide.get(reviewId);
-    if (row === undefined || g === undefined || g.status !== "writing") return;
-    try {
-      if (error !== null || text === null) throw new Error(error ?? "the helper returned nothing");
-      const json = extractFenced(text, GUIDE_FENCE);
-      if (json === null) throw new Error(`no ${GUIDE_FENCE} block in the reply`);
-      const guide = await normalizeGuide(row, JSON.parse(json));
-      if (guide.overview === "" && guide.steps.length === 0) throw new Error("the guide has no overview and no steps");
-      q.setGuideReady.run(JSON.stringify(guide), text, Date.now(), reviewId);
-    } catch (cause) {
-      q.setGuideFailed.run(`could not read the guide: ${errorMessage(cause)}`, text, Date.now(), reviewId);
-    }
-    publish(reviewId, "guide");
+  /** The spec between the markers; a reply that is only a spec (starts with a heading) is taken whole. */
+  function extractMap(text: string): string | null {
+    const open = text.indexOf(MAP_OPEN);
+    const close = text.lastIndexOf(MAP_CLOSE);
+    if (open !== -1 && close > open) return text.slice(open + MAP_OPEN.length, close).trim();
+    const trimmed = text.trim();
+    return trimmed.startsWith("#") ? trimmed : null;
+  }
+
+  function completeMap(reviewId: string, text: string | null, error: string | null): void {
+    if (q.map.get(reviewId) === undefined) return;
+    const markdown = text === null ? null : extractMap(text);
+    if (error !== null || markdown === null || markdown === "") q.setMapFailed.run(error ?? "the helper returned no spec", text, Date.now(), reviewId);
+    else q.setMapReady.run(markdown, text ?? "", Date.now(), reviewId);
+    publish(reviewId, "map");
     pumpHelper(reviewId);
-  }
-
-  /** The guide for the UI; queues a write on the first look at a new head when autoGuide is on. */
-  function guideGet(row: ReviewRow): GuideState {
-    const state = guideState(row);
-    if (autoGuide && state.status === "missing") wantGuide(row, false);
-    else if (state.status === "queued") pumpHelper(row.id);
-    return guideState(row);
   }
 
   // -- Simple English: GitHub comments rewritten by a second hidden thread ----
@@ -2661,9 +2298,8 @@ export default async function plugin(bb: BbPluginApi) {
     const helper = q.helperByThread.get(thread.id);
     if (helper !== undefined) {
       q.setHelperJob.run(null, helper.review_id);
-      if (helper.job === "brief") void completeBrief(helper.review_id, lastAssistantText, null);
+      if (helper.job === "map") completeMap(helper.review_id, lastAssistantText, null);
       if (helper.job === "notes") void completeNotes(helper.review_id, lastAssistantText, null);
-      if (helper.job === "guide") void completeGuide(helper.review_id, lastAssistantText, null);
       if (helper.job === null) pumpHelper(helper.review_id);
       return;
     }
@@ -2678,9 +2314,8 @@ export default async function plugin(bb: BbPluginApi) {
     const helper = q.helperByThread.get(thread.id);
     if (helper !== undefined) {
       q.setHelperJob.run(null, helper.review_id);
-      if (helper.job === "brief") void completeBrief(helper.review_id, null, error ?? "the helper thread failed");
+      if (helper.job === "map") completeMap(helper.review_id, null, error ?? "the helper thread failed");
       if (helper.job === "notes") void completeNotes(helper.review_id, null, error ?? "the helper thread failed");
-      if (helper.job === "guide") void completeGuide(helper.review_id, null, error ?? "the helper thread failed");
       if (helper.job === null) pumpHelper(helper.review_id);
       return;
     }
@@ -2816,15 +2451,6 @@ export default async function plugin(bb: BbPluginApi) {
     const parts = [note.title.trim() === "" ? note.body.trim() : `**${note.title.trim()}**\n\n${note.body.trim()}`];
     if (note.suggestion !== null && note.suggestion.trim() !== "") parts.push("```suggestion\n" + note.suggestion.replace(/\n$/, "") + "\n```");
     return parts.join("\n\n").trim();
-  }
-
-  /** The brief starts once per review when autoBrief is on. Rewrites go through brief_write. */
-  function briefGet(row: ReviewRow): BriefState {
-    const state = briefState(row);
-    if (autoBrief && state.briefStatus === "missing") void writeBrief(row);
-    // A brief re-queued by a plugin reload goes out on the first look at the review.
-    else if (state.briefStatus === "writing") pumpHelper(row.id);
-    return briefState(row);
   }
 
   // -- PR factory -------------------------------------------------------------
@@ -3395,7 +3021,7 @@ export default async function plugin(bb: BbPluginApi) {
       q.deleteSimplifier.run(reviewId);
       q.deleteSimple.run(reviewId);
       q.deleteBoardStage.run(reviewId);
-      for (const stmt of [q.deletePipeline, q.deleteRounds, q.deleteFindings, q.deleteAiReviewer, q.deleteBabysitter]) stmt.run(reviewId);
+      for (const stmt of [q.deletePipeline, q.deleteRounds, q.deleteFindings, q.deleteAiReviewer, q.deleteBabysitter, q.deleteMap]) stmt.run(reviewId);
       q.deleteReview.run(reviewId);
       publish(reviewId, "removed");
       // The worktree goes with the card, unless it has local changes.
@@ -3498,23 +3124,11 @@ export default async function plugin(bb: BbPluginApi) {
       await chatReset(reviewId, providerId);
       return { ok: true as const };
     },
-    codemap_get: ({ reviewId, refresh }) => {
+    map_get: ({ reviewId }) => mapGet(requireReview(reviewId)),
+    map_write: ({ reviewId }) => {
       const row = requireReview(reviewId);
-      const state = codemapState(row);
-      if (refresh || state.status === "missing") startCodemap(row);
-      return codemapState(row);
-    },
-    guide_get: ({ reviewId }) => guideGet(requireReview(reviewId)),
-    guide_write: ({ reviewId }) => {
-      const row = requireReview(reviewId);
-      wantGuide(row, true);
-      return guideState(row);
-    },
-    brief_get: ({ reviewId }) => briefGet(requireReview(reviewId)),
-    brief_write: async ({ reviewId }) => {
-      const row = requireReview(reviewId);
-      await writeBrief(row);
-      return briefState(row);
+      wantMap(row, true);
+      return mapState(row);
     },
     simple_get: ({ reviewId, refresh }) => {
       const row = requireReview(reviewId);
@@ -3631,8 +3245,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "refresh", summary: "Sync every open PR with GitHub", usage: "bb review-desk refresh [--json]" },
       { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show|ping|resolve> <reviewId> [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
-      { name: "codemap", summary: "Build or print the codemap", usage: "bb review-desk codemap <reviewId> [--json]" },
-      { name: "guide", summary: "Write or print the reading guide over the codemap", usage: "bb review-desk guide <reviewId> [--rewrite] [--json]" },
+      { name: "map", summary: "Write or print the PR's diffmap spec", usage: "bb review-desk map <reviewId> [--rewrite] [--json]" },
       { name: "simple", summary: "Queue Simple English rewrites of all the comments, redo them all, or request one comment by key", usage: "bb review-desk simple <reviewId> [--redo | --key <t:...|c:...|r:...>] [--json]" },
     ],
     async run(argv) {
@@ -3734,50 +3347,16 @@ export default async function plugin(bb: BbPluginApi) {
             const failed = q.simpleRows.all(row.id).filter((r) => r.status === "failed").length;
             return ok(state, `${Object.keys(state.items).length} ready, ${state.pending.length} pending, ${failed} failed (mode ${state.mode})${state.error === null ? "" : `\nlast error: ${state.error}`}`);
           }
-          case "codemap": {
+          case "map": {
             const row = requireReview(rest[0] ?? "");
-            let state = codemapState(row);
-            if (state.status === "missing" || state.status === "failed") startCodemap(row);
-            state = codemapState(row);
-            if (state.status !== "ready" || state.codemap === null) return ok(state, `Codemap ${state.status}${state.error ? `: ${state.error}` : ""}. Run again in a moment.`);
-            const c = state.codemap;
-            const text = [
-              `Codemap (${c.engine}) for ${c.headSha.slice(0, 10)}: ${c.stats.files} files, ${c.stats.symbols} symbols (+${c.stats.added} ~${c.stats.modified} -${c.stats.removed})`,
-              "Module order:",
-              ...c.readingOrder.map((m, i) => `  ${i + 1}. ${m.module}  (${m.paths.length} files) ${m.reason}`),
-              "Hotspots:",
-              ...c.hotspots.slice(0, 10).map((h) => `  ${h.score}  ${h.path}#${h.qualified}  (${h.changedLines} lines, fan-in ${h.fanIn})`),
-            ].join("\n");
-            return ok(c, text);
-          }
-          case "guide": {
-            const row = requireReview(rest[0] ?? "");
-            const before = guideState(row);
-            if (rewrite || before.status === "missing" || before.status === "failed") wantGuide(row, true);
-            else if (before.status === "queued") pumpHelper(row.id);
-            const state = guideState(row);
-            if (state.guide === null) return ok(state, `Guide ${state.status}${state.error ? `: ${state.error}` : ""}. Run again in a moment.`);
-            const g = state.guide as unknown as Guide;
-            const fileOf = new Map(g.files.map((f) => [f.path, f]));
-            const text = [
-              `Guide${state.stale ? ` (written for an older head; now ${state.status})` : state.status === "ready" ? "" : ` (${state.status})`}`,
-              "",
-              g.overview,
-              ...(g.flow.length > 0 ? ["", "How it runs:", ...g.flow.map((h, i) => `  ${i + 1}. ${h.symbol}  ${h.path}${h.line !== null ? `:${h.line}` : ""}\n     ${h.what}`)] : []),
-              "",
-              "Reading order:",
-              ...g.steps.flatMap((s, i) => [
-                `  ${i + 1}. ${s.title}${s.why ? `: ${s.why}` : ""}`,
-                ...s.paths.map((p) => {
-                  const f = fileOf.get(p);
-                  return `       ${(f?.role ?? "").padEnd(9)} ${p}${f?.skim ? "  (skim)" : ""}\n${" ".repeat(17)}${f?.what ?? ""}`;
-                }),
-              ]),
-            ].join("\n");
-            return ok(g, text);
+            if (rewrite) wantMap(row, true);
+            const state = mapGet(row);
+            const { markdown } = state;
+            const status = `Map ${state.status}${state.stale ? ` (on file: ${state.headSha?.slice(0, 10)}, an older head)` : ""}${state.error ? `: ${state.error}` : ""}`;
+            return ok(state, markdown === null ? `${status}. Run again in a moment.` : `${status}\n\n${markdown}`);
           }
           default:
-            return { exitCode: 1, stderr: "usage: bb review-desk open|list|board|move|refresh|factory|ask|codemap|guide|simple" };
+            return { exitCode: 1, stderr: "usage: bb review-desk open|list|board|move|refresh|factory|ask|map|simple" };
         }
       } catch (cause) {
         return { exitCode: 1, stderr: errorMessage(cause) };

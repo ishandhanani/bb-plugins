@@ -82,60 +82,6 @@ export const ghReviewSchema = z.object({
   url: z.string(),
 });
 
-export const codemapSymbolSchema = z.object({
-  kind: z.string(),
-  name: z.string(),
-  qualified: z.string(),
-  status: z.enum(["added", "removed", "modified", "unchanged"]),
-  start: z.number(),
-  end: z.number(),
-  oldStart: z.number().nullable(),
-  oldEnd: z.number().nullable(),
-  changedLines: z.number(),
-  fanIn: z.number(),
-  refs: z.array(z.string()),
-});
-export type CodemapSymbol = z.infer<typeof codemapSymbolSchema>;
-
-export const codemapFileRoleSchema = z.enum(["code", "tests", "docs", "config", "generated"]);
-export type CodemapFileRole = z.infer<typeof codemapFileRoleSchema>;
-
-/** Bumped when the codemap's shape or computation changes; a cached map of an older version is rebuilt. */
-export const CODEMAP_VERSION = 4;
-
-/** What kind of file a path is, from its name alone. Shared by the host (codemap) and the server (guide fallbacks). */
-export function fileRole(filePath: string): CodemapFileRole {
-  const lower = filePath.toLowerCase();
-  const base = lower.slice(lower.lastIndexOf("/") + 1);
-  if (/(^|\/)(generated|__generated__|gen)\//.test(lower) || /\.(pb|pb2)\.[a-z]+$/.test(base) || /_pb2(_grpc)?\.py$/.test(base) || /\.lock$/.test(base) || base === "package-lock.json" || base === "go.sum" || base === "yarn.lock") return "generated";
-  if (/(^|\/)(tests?|__tests__|testing|spec|fixtures)\//.test(lower) || /^test_.*\.py$/.test(base) || /_tests?\.(go|rs|py|ts|js|cc|cpp|cu)$/.test(base) || /\.(test|spec)\.[cm]?[jt]sx?$/.test(base) || base === "tests.rs" || base === "conftest.py") return "tests";
-  if (base.startsWith("requirements")) return "config";
-  if (/(^|\/)docs?\//.test(lower) || /\.(md|mdx|rst|adoc|txt)$/.test(base)) return "docs";
-  if (/(^|\/)\.github\//.test(lower) || /\.(toml|ya?ml|json|ini|cfg|conf|env|properties|tf)$/.test(base) || /^(dockerfile|makefile|justfile|cmakelists\.txt)/.test(base) || base.startsWith(".")) return "config";
-  return "code";
-}
-
-export const codemapSchema = z.object({
-  version: z.number(),
-  headSha: z.string(),
-  engine: z.enum(["tree-sitter", "regex"]),
-  files: z.array(
-    z.object({
-      path: z.string(),
-      lang: z.string().nullable(),
-      module: z.string(),
-      role: codemapFileRoleSchema,
-      changedLines: z.number(),
-      symbols: z.array(codemapSymbolSchema),
-    }),
-  ),
-  edges: z.array(z.object({ from: z.string(), to: z.string() })),
-  readingOrder: z.array(z.object({ module: z.string(), paths: z.array(z.string()), reason: z.string() })),
-  hotspots: z.array(z.object({ path: z.string(), qualified: z.string(), score: z.number(), changedLines: z.number(), fanIn: z.number() })),
-  stats: z.object({ files: z.number(), symbols: z.number(), added: z.number(), removed: z.number(), modified: z.number(), parseFailures: z.number() }),
-});
-export type Codemap = z.infer<typeof codemapSchema>;
-
 export const hostContract = defineRpcContract({
   /** Fetch the PR head and base, and keep a detached worktree at the head. `fetch: false` skips the network and only keeps the worktree in place. */
   repo_prepare: {
@@ -220,16 +166,6 @@ export const hostContract = defineRpcContract({
   gh_resolve: {
     input: z.object({ threadId: z.string(), resolve: z.boolean() }),
     output: z.object({ ok: z.literal(true) }),
-  },
-  codemap: {
-    input: z.object({
-      worktree: z.string(),
-      baseSha: z.string(),
-      headSha: z.string(),
-      files: z.array(changedFileSchema),
-      wasmDir: z.string().nullable(),
-    }),
-    output: codemapSchema,
   },
 });
 export type HostContract = typeof hostContract;
