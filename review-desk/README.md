@@ -4,7 +4,8 @@ Review GitHub pull requests inside bb: a document-style PR page with the diff, t
 
 ## What it does
 
-- **The board** is the landing page: paste a PR link and it becomes a card under **Unreviewed** (nobody has approved), **Changes requested** (a reviewer asked for changes), or **Babysit** (approved by you or others: the decision, or any reviewer's latest review; now you watch CI until it merges). Drag a card to hold it elsewhere until GitHub's state changes, then it follows GitHub again. A card shows the title, `owner/repo #N`, the author, when GitHub last saw activity, and chips for what is in the way: checks passed/total (red when one fails), unresolved threads, approvals, reviewers asking for changes, merge conflicts, and your pending comments. A Babysit card leads with CI: a bar of passed checks, the failing checks by name linking to their runs, one verdict chip (merge conflicts, CI failing, CI running, needs a required review, still a draft, or ready to merge) and when the last commit was pushed. Merged and closed PRs leave the columns and fold into a strip under them until you remove them. Click a card for the PR page below. Open PRs are synced with GitHub when the board opens if they are more than ten minutes stale, on **Refresh**, and in the background on the `boardRefresh` cron; a sync skips the git fetch when the head did not move.
+- **PR factory**: a PR you add goes to **AI review**. A hidden reviewer thread runs round 1 with the code review skills it has, both your own and the repository's (project skills, CLAUDE.md, AGENTS.md), and the server posts the result to GitHub as a COMMENT review headed "Round N AI review": findings above a nit inline on their lines, nits folded into the body. Each push after that, once the head has sat still for `aiReviewSettleMinutes`, runs a targeted round over the new commits that also marks earlier findings fixed, open, or obsolete. After `aiReviewMaxRounds`, or as soon as a round leaves nothing above a nit, the PR moves to **Human review** and the reviewer thread shows up unread in the sidebar. Your own review moves it on: anything but an approval to **Changes requested** (back to Human review when the author pushes), an approval to **Babysit**, where a small model re-runs flaky CI and hands anything that needs a push or a decision back to you (unread thread, chip on the card). It never edits, pushes, merges, or comments. The brain button on a card starts or retries the next round now; dragging a card into a factory column moves it there, and dragging it to Unreviewed takes it out.
+- **The board** is the landing page: paste a PR link and it becomes a card under **Unreviewed** (no review has started), **AI review**, **Human review**, **Changes requested** (a reviewer asked for changes), or **Babysit** (approved by you or others: the decision, or any reviewer's latest review; now you watch CI until it merges). Drag a card to hold it elsewhere until GitHub's state changes, then it follows GitHub again. A card shows the title, `owner/repo #N`, the author, when GitHub last saw activity, and chips for what is in the way: checks passed/total (red when one fails), unresolved threads, approvals, reviewers asking for changes, merge conflicts, and your pending comments. A Babysit card leads with CI: a bar of passed checks, the failing checks by name linking to their runs, one verdict chip (merge conflicts, CI failing, CI running, needs a required review, still a draft, or ready to merge) and when the last commit was pushed. Merged and closed PRs leave the columns and fold into a strip under them until you remove them. Click a card for the PR page below. Open PRs are synced with GitHub when the board opens if they are more than ten minutes stale, on **Refresh**, and in the background on the `boardRefresh` cron; a sync skips the git fetch when the head did not move.
 - **Open a PR** by URL or `owner/repo#123`. The host entry finds the local checkout among your bb projects (or clones it), fetches the PR head, and keeps a detached worktree under `~/.review-desk/worktrees` on that machine (or `worktreesDir`), outside bb's data dir so the chat and helper threads can run in it.
 - **PR page**: state, title, author, base and head branches, then Description, Discussion (reviews, comments, open threads), and Commits tabs, then Changes as file cards. Files load lazily as you scroll; viewed marks and a "lines left" counter track progress.
 - **Diff** per file with Pierre diffs: split by default (unified on request), long lines wrap instead of scrolling sideways, syntax highlighting from bb's code theme, expandable context, line selection. Every file starts collapsed; **Expand all** opens the unviewed ones.
@@ -28,6 +29,7 @@ Review GitHub pull requests inside bb: a document-style PR page with the diff, t
 - `brief-spec.ts` — the brief (summary bullets and areas) the helper thread returns, shared by server and app.
 - `guide-spec.ts` — the guide over the codemap the helper thread returns, shared by server and app.
 - `board-spec.ts` — the board's columns and their labels, shared by server and app.
+- `factory-spec.ts` — the PR factory's prompts, reply parsing, and the GitHub review body, shared by server and app.
 - `board.tsx` — the board page: columns, cards, drag and drop, the merged-or-closed strip.
 - `lib/format.ts` — `timeAgo` and `describeError`, shared by the review page and the board.
 - `mention-ref.ts` — pill identity shared by server and app (what a pill points at, how its id is encoded, its label).
@@ -51,8 +53,9 @@ Requires `gh` authenticated on the machine that holds the repository.
 bb review-desk open <url | owner/repo#N>
 bb review-desk list
 bb review-desk board
-bb review-desk move <reviewId> <unreviewed|changes_requested|babysit|auto>
+bb review-desk move <reviewId> <unreviewed|ai_review|human_review|changes_requested|babysit|auto>
 bb review-desk refresh
+bb review-desk factory <start|stop|show> <reviewId>
 bb review-desk ask <reviewId> <text...> [--provider <id>]
 bb review-desk codemap <reviewId>
 bb review-desk guide <reviewId> [--rewrite]
@@ -70,4 +73,13 @@ bb review-desk guide <reviewId> [--rewrite]
 - `simpleEnglishModel` (default empty): model for the Simple English thread; empty uses `helperModel`, then the project's default. A small, fast model is enough, for example `acp-devin` with `swe-1-7-lightning`.
 - `simpleEnglishSkill` (default empty): optional file appended to the rewrite prompt as vocabulary help, for example a `simple-english` SKILL.md. Empty uses a short built-in word list. A long rule set makes a fast model paraphrase instead of shorten, so the default is the short list.
 - `boardRefresh` (default `*/15 * * * *`): cron (5 fields, server-local time) for syncing the board's open PRs with GitHub in the background; empty turns it off.
+- `autoAiReview` (default true): put a PR in the factory when it is added to the board. Rounds post COMMENT reviews under your `gh` login.
+- `aiReviewProvider` / `aiReviewModel` (default `claude-code` / `claude-opus-5-5`): the AI reviewer.
+- `aiReviewMaxRounds` (default 2): AI rounds before Human review; a round that leaves only nits hands off sooner.
+- `aiReviewConcurrency` (default 2): rounds running at once across the board.
+- `aiReviewSettleMinutes` (default 10): how long a new head must sit unchanged before the next round. Pushes are noticed on the `boardRefresh` cron.
+- `aiReviewSkills` (default empty): skills the reviewer must use on top of the ones it picks; comma separated, `owner/repo=skill` for one repository.
+- `aiReviewEmpirical` (default false): let the reviewer run skills that build, launch servers, or run GPU or load tests. Off, it applies them by reading the code.
+- `babysitProvider` / `babysitModel` (default `claude-code` / `claude-haiku-5-5`): the CI babysitter.
+- `babysitMaxPasses` (default 3): babysit passes per head before CI failures are handed to you.
 - `worktreesDir` (default empty): directory on the repository's machine for the PR worktrees; empty uses `~/.review-desk/worktrees`. Keep it outside bb's data dir, or bb refuses to run the chat and helper threads there. Changing it moves each worktree on its next sync. Removing a PR from the board removes its worktree too, unless it has local changes.
