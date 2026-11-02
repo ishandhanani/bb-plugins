@@ -1,25 +1,38 @@
 // The board over tracked pull requests, shared by server.ts and app.tsx.
 //
-// An open PR sits in the column GitHub's state puts it in (its auto stage)
-// unless you drag it somewhere else; a dragged card holds its column until
-// GitHub's state changes, then follows GitHub again. A merged or closed PR
-// leaves the columns (stage null) and waits in the "merged or closed" strip
-// until you remove it.
-export const BOARD_STAGES = ["unreviewed", "changes_requested", "babysit"] as const;
+// An open PR sits in the column its auto stage says: Babysit once anyone
+// approves it on GitHub, otherwise the PR factory's stage (AI review, Human
+// review, Changes requested), otherwise GitHub's state. You can drag a card
+// somewhere else; a dragged card holds its column until the auto stage
+// changes, then follows it again. A merged or closed PR leaves the columns
+// (stage null) and waits in the "merged or closed" strip until you remove it.
+export const BOARD_STAGES = ["unreviewed", "ai_review", "human_review", "changes_requested", "babysit"] as const;
 export type BoardStage = (typeof BOARD_STAGES)[number];
 
 export const BOARD_STAGE_LABEL: Record<BoardStage, string> = {
   unreviewed: "Unreviewed",
+  ai_review: "AI review",
+  human_review: "Human review",
   changes_requested: "Changes requested",
   babysit: "Babysit",
 };
 
 export const BOARD_STAGE_HINT: Record<BoardStage, string> = {
-  unreviewed: "Open; nobody has approved yet",
-  changes_requested: "A reviewer asked for changes",
+  unreviewed: "Open; no review has started",
+  ai_review: "AI review rounds; the next round runs when new commits land",
+  human_review: "AI review is done; your turn to approve or comment",
+  changes_requested: "A reviewer asked for changes; waiting on the author",
   babysit: "Approved by you or others; watch CI until it merges",
 };
 
 export function isBoardStage(value: unknown): value is BoardStage {
   return typeof value === "string" && (BOARD_STAGES as readonly string[]).includes(value);
+}
+
+/** The stages the PR factory drives; Unreviewed and Babysit come from GitHub. */
+export const PIPELINE_STAGES = ["ai_review", "human_review", "changes_requested"] as const;
+export type PipelineStage = (typeof PIPELINE_STAGES)[number];
+
+export function isPipelineStage(value: unknown): value is PipelineStage {
+  return typeof value === "string" && (PIPELINE_STAGES as readonly string[]).includes(value);
 }

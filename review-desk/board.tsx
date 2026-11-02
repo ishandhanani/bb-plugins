@@ -1,7 +1,7 @@
-// The board: every tracked pull request as a card under Unreviewed, Changes
-// requested, or Babysit, following GitHub's state; drag a card to hold it
-// elsewhere until GitHub's state changes. Merged and closed PRs leave the
-// columns and wait in a strip at the bottom until removed.
+// The board: every tracked pull request as a card under Unreviewed, AI
+// review, Human review, Changes requested, or Babysit, following the PR
+// factory and GitHub's state; drag a card to move it. Merged and closed PRs
+// leave the columns and wait in a strip at the bottom until removed.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { DragEvent, FormEvent, ReactNode } from "react";
 import { toast } from "sonner";
@@ -72,6 +72,25 @@ function babysitVerdict(card: ReviewSummary): { label: string; tone: ChipTone; i
   return { label: "Ready to merge", tone: "ok", icon: "CircleCheck" };
 }
 
+/** Where the PR factory is with this card, in at most three chips. */
+function FactoryChips({ card }: { card: ReviewSummary }) {
+  const f = card.factory;
+  if (f === null) return null;
+  const round = f.round > 0 ? (
+    f.roundStatus === "running" ? <Chip icon="Clock" tone="strong" title="The AI reviewer is working on this round">AI round {f.round} running</Chip>
+    : f.roundStatus === "queued" ? <Chip icon="Clock" title="Waiting for a free AI reviewer">AI round {f.round} queued</Chip>
+    : f.roundStatus === "failed" ? <Chip icon="AlertTriangle" tone="bad" title={f.error ?? "The round failed"}>AI round {f.round} failed</Chip>
+    : <Chip icon="Brain" tone={f.openFindings > 0 ? "strong" : "ok"} title={`${f.roundsPosted} AI round${f.roundsPosted === 1 ? "" : "s"} posted to GitHub; ${f.openFindings} finding${f.openFindings === 1 ? "" : "s"} above a nit open`}>AI {f.roundsPosted}× · {f.openFindings} open</Chip>
+  ) : null;
+  return (
+    <>
+      {round}
+      {f.babysit !== null && f.babysit !== "needs_human" ? <Chip icon="Repeat" title="Last CI babysit pass">babysit: {f.babysit}</Chip> : null}
+      {f.needsYou !== null ? <Chip icon="BellDot" tone="bad" title={f.needsYou}><span className="max-w-[180px] truncate">{f.needsYou}</span></Chip> : null}
+    </>
+  );
+}
+
 /** Checks as a bar, with the failing ones named. */
 function CiBar({ card }: { card: ReviewSummary }) {
   const { checks } = card;
@@ -97,7 +116,7 @@ function CiBar({ card }: { card: ReviewSummary }) {
   );
 }
 
-function PrCard({ card, stage, onOpen, onUnpin, onRemove }: { card: ReviewSummary; stage: BoardStage; onOpen: () => void; onUnpin: () => void; onRemove: () => void }) {
+function PrCard({ card, stage, onOpen, onUnpin, onRemove, onReview }: { card: ReviewSummary; stage: BoardStage; onOpen: () => void; onUnpin: () => void; onRemove: () => void; onReview: () => void }) {
   const [confirm, setConfirm] = useState(false);
   const { checks } = card;
   const babysit = stage === "babysit";
@@ -126,6 +145,17 @@ function PrCard({ card, stage, onOpen, onUnpin, onRemove }: { card: ReviewSummar
       <div className="flex items-start gap-2">
         <Icon name={prIcon} className={cn("mt-0.5 size-4 shrink-0", card.isDraft ? "text-muted-foreground" : "text-primary")} />
         <span className="min-w-0 flex-1 overflow-hidden text-sm font-medium leading-5 [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]">{card.title}</span>
+        {stage !== "babysit" && card.factory?.roundStatus !== "running" && card.factory?.roundStatus !== "queued" ? (
+          <button
+            type="button"
+            aria-label="Run the next AI review round now"
+            title={card.factory === null ? "Start AI review" : "Run the next AI review round now"}
+            onClick={(e) => { e.stopPropagation(); onReview(); }}
+            className="-mt-1.5 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-state-hover hover:text-foreground focus:opacity-100 group-hover:opacity-100"
+          >
+            <Icon name="Brain" className="size-3.5" />
+          </button>
+        ) : null}
         <button
           type="button"
           aria-label="Remove from the board"
@@ -142,6 +172,7 @@ function PrCard({ card, stage, onOpen, onUnpin, onRemove }: { card: ReviewSummar
       {babysit ? <div className="mt-2"><CiBar card={card} /></div> : null}
       <div className="mt-2 flex flex-wrap items-center gap-1">
         {verdict ? <Chip icon={verdict.icon} tone={verdict.tone}>{verdict.label}</Chip> : null}
+        <FactoryChips card={card} />
         {!babysit && card.isDraft ? <Chip>Draft</Chip> : null}
         {!babysit && checks.total > 0 ? <Chip icon={checksIcon} tone={checksTone} title={`Checks: ${checks.passed} passed, ${checks.failed} failing, ${checks.pending} running`}>{checks.passed}/{checks.total}</Chip> : null}
         {card.unresolvedThreads > 0 ? <Chip icon="MessageSquare" tone="strong" title="Unresolved review threads">{card.unresolvedThreads}</Chip> : null}
@@ -156,10 +187,10 @@ function PrCard({ card, stage, onOpen, onUnpin, onRemove }: { card: ReviewSummar
         <button
           type="button"
           onClick={(e) => { e.stopPropagation(); onUnpin(); }}
-          title={`You dragged this card here. GitHub says ${BOARD_STAGE_LABEL[card.autoStage]}; click to follow GitHub again.`}
+          title={`You dragged this card here. It would be in ${BOARD_STAGE_LABEL[card.autoStage]}; click to put it back.`}
           className="mt-2 inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
         >
-          <Icon name="Pin" className="size-3" />Dragged here · GitHub says {BOARD_STAGE_LABEL[card.autoStage]}
+          <Icon name="Pin" className="size-3" />Dragged here · would be in {BOARD_STAGE_LABEL[card.autoStage]}
         </button>
       ) : null}
       {confirm ? (
@@ -313,6 +344,16 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
     }
   };
 
+  const review = async (card: ReviewSummary) => {
+    try {
+      await rpc.call("factory_start", { reviewId: card.id });
+      toast.success(`AI review queued for ${card.owner}/${card.repo}#${card.number}`);
+      refetch();
+    } catch (cause) {
+      toast.error(describeError(cause));
+    }
+  };
+
   const remove = async (card: ReviewSummary, quiet = false) => {
     try {
       await rpc.call("reviews_remove", { reviewId: card.id });
@@ -324,7 +365,7 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
   };
 
   const columns = useMemo(() => {
-    const byStage: Record<BoardStage, ReviewSummary[]> = { unreviewed: [], changes_requested: [], babysit: [] };
+    const byStage = Object.fromEntries(BOARD_STAGES.map((stage) => [stage, [] as ReviewSummary[]])) as Record<BoardStage, ReviewSummary[]>;
     const closed: ReviewSummary[] = [];
     for (const r of reviews ?? []) {
       const stage = moves[r.id] ?? r.stage;
@@ -373,7 +414,7 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
                 }}
               >
                 {columns.byStage[stage].map((card) => (
-                  <PrCard key={card.id} card={card} stage={stage} onOpen={() => onOpen(card.id)} onUnpin={() => void move(card, null)} onRemove={() => void remove(card)} />
+                  <PrCard key={card.id} card={card} stage={stage} onOpen={() => onOpen(card.id)} onUnpin={() => void move(card, null)} onRemove={() => void remove(card)} onReview={() => void review(card)} />
                 ))}
               </BoardColumn>
             ))}

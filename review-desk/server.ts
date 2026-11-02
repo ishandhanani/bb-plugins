@@ -16,7 +16,22 @@ import { z } from "zod";
 import { MENTION_PROVIDER_ID, decodeMentionRef, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
 import { BRIEF_FENCE, type Brief } from "./brief-spec";
 import { GUIDE_FENCE, GUIDE_ROLES, type Guide, type GuideFile, type GuideHop, type GuideRole, type GuideStep } from "./guide-spec";
-import { BOARD_STAGES, BOARD_STAGE_LABEL, isBoardStage, type BoardStage } from "./board-spec";
+import { BOARD_STAGES, BOARD_STAGE_LABEL, isBoardStage, isPipelineStage, type BoardStage, type PipelineStage } from "./board-spec";
+import {
+  AI_ROUND_MARKER,
+  AI_SEVERITIES,
+  babysitIntro,
+  babysitPrompt,
+  findingComment,
+  isHighValue,
+  parseAiReply,
+  parseBabysitReply,
+  reviewBody,
+  reviewerIntro,
+  roundPrompt,
+  type AiSeverity,
+  type PostedFinding,
+} from "./factory-spec";
 import {
   CODEMAP_VERSION,
   changedFileSchema,
@@ -114,6 +129,23 @@ const reviewSummarySchema = z.object({
   autoStage: boardStageSchema.nullable(),
   /** You dragged the card; it holds its column until GitHub's state changes. */
   pinned: z.boolean(),
+  /** The PR factory's view of the card; null when the PR is not in it. */
+  factory: z
+    .object({
+      /** The latest AI round, and how many have been posted. */
+      round: z.number(),
+      roundsPosted: z.number(),
+      roundStatus: z.string().nullable(),
+      /** Findings above a nit still open after the latest round. */
+      openFindings: z.number(),
+      reviewUrl: z.string().nullable(),
+      /** Why you are needed, when you are. */
+      needsYou: z.string().nullable(),
+      /** Outcome of the last CI babysit pass. */
+      babysit: z.string().nullable(),
+      error: z.string().nullable(),
+    })
+    .nullable(),
 });
 export type ReviewSummary = z.infer<typeof reviewSummarySchema>;
 
@@ -264,6 +296,10 @@ export const rpcContract = defineRpcContract({
   reviews_remove: { input: reviewIdSchema, output: okSchema },
   /** Drag a card to a column; null puts it back where GitHub's state says. A dragged card holds its column until that state changes. */
   board_move: { input: z.object({ reviewId: z.string(), stage: boardStageSchema.nullable() }), output: z.object({ review: reviewSummarySchema }) },
+  /** Put a PR in the factory now: start (or retry) the next AI review round at the current head. */
+  factory_start: { input: reviewIdSchema, output: z.object({ review: reviewSummarySchema }) },
+  /** Take a PR out of the factory; the card follows GitHub's state again. */
+  factory_stop: { input: reviewIdSchema, output: z.object({ review: reviewSummarySchema }) },
   /** Sync every PR that is not done with GitHub. A PR whose head moved gets the full sync; the others skip the git fetch. */
   board_refresh: {
     input: z.null(),
@@ -532,6 +568,57 @@ const MIGRATIONS = [
    )`,
   // The board: a card dragged to a column keeps it while GitHub's own state (auto_stage) is unchanged.
   `CREATE TABLE IF NOT EXISTS board_stages (review_id TEXT PRIMARY KEY, stage TEXT NOT NULL, auto_stage TEXT NOT NULL, updated_at INTEGER NOT NULL)`,
+  // The PR factory. pipeline: the stage the factory put the PR in, when the
+  // head last moved, why you are needed, and the CI babysitter's progress at
+  // the current head. ai_rounds: one row per AI review round. ai_findings:
+  // what each round found, and what later rounds decided about it.
+  `CREATE TABLE IF NOT EXISTS pipeline (
+     review_id TEXT PRIMARY KEY,
+     stage TEXT NOT NULL,
+     entered_at INTEGER NOT NULL,
+     head_seen_at INTEGER,
+     needs_you TEXT,
+     babysit_head TEXT,
+     babysit_key TEXT,
+     babysit_passes INTEGER NOT NULL DEFAULT 0,
+     babysit_outcome TEXT,
+     updated_at INTEGER NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS ai_rounds (
+     review_id TEXT NOT NULL,
+     round INTEGER NOT NULL,
+     base_sha TEXT NOT NULL,
+     head_sha TEXT NOT NULL,
+     status TEXT NOT NULL,
+     summary TEXT,
+     high_value INTEGER,
+     review_url TEXT,
+     raw TEXT,
+     error TEXT,
+     started_at INTEGER NOT NULL,
+     finished_at INTEGER,
+     PRIMARY KEY (review_id, round)
+   )`,
+  `CREATE TABLE IF NOT EXISTS ai_findings (
+     id TEXT PRIMARY KEY,
+     review_id TEXT NOT NULL,
+     round INTEGER NOT NULL,
+     path TEXT NOT NULL,
+     line INTEGER NOT NULL,
+     start_line INTEGER,
+     severity TEXT NOT NULL,
+     title TEXT NOT NULL,
+     body TEXT NOT NULL,
+     suggestion TEXT,
+     status TEXT NOT NULL,
+     note TEXT,
+     inline INTEGER NOT NULL DEFAULT 0,
+     updated_at INTEGER NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS ai_findings_review ON ai_findings (review_id)`,
+  // Hidden threads per review for the AI reviewer and the CI babysitter; same shape as helpers.
+  `CREATE TABLE IF NOT EXISTS ai_reviewers (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL, intro_hash TEXT)`,
+  `CREATE TABLE IF NOT EXISTS babysitters (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL, intro_hash TEXT)`,
 ];
 
 interface ReviewRow {
@@ -556,6 +643,18 @@ interface BriefRow {
 }
 interface GuideRow { review_id: string; head_sha: string; status: string; json: string | null; json_head_sha: string | null; raw: string | null; error: string | null; updated_at: number }
 interface BoardStageRow { review_id: string; stage: string; auto_stage: string; updated_at: number }
+interface PipelineRow {
+  review_id: string; stage: string; entered_at: number; head_seen_at: number | null; needs_you: string | null;
+  babysit_head: string | null; babysit_key: string | null; babysit_passes: number; babysit_outcome: string | null; updated_at: number;
+}
+interface RoundRow {
+  review_id: string; round: number; base_sha: string; head_sha: string; status: string; summary: string | null; high_value: number | null;
+  review_url: string | null; raw: string | null; error: string | null; started_at: number; finished_at: number | null;
+}
+interface FindingRow {
+  id: string; review_id: string; round: number; path: string; line: number; start_line: number | null; severity: string; title: string; body: string;
+  suggestion: string | null; status: string; note: string | null; inline: number; updated_at: number;
+}
 
 function newId(): string {
   return randomBytes(6).toString("hex");
@@ -580,6 +679,8 @@ function createStore(db: Database.Database) {
       db.prepare<[string]>(`UPDATE seats SET environment_id = NULL WHERE review_id = ?`),
       db.prepare<[string]>(`UPDATE helpers SET environment_id = NULL WHERE review_id = ?`),
       db.prepare<[string]>(`UPDATE simplifiers SET environment_id = NULL WHERE review_id = ?`),
+      db.prepare<[string]>(`UPDATE ai_reviewers SET environment_id = NULL WHERE review_id = ?`),
+      db.prepare<[string]>(`UPDATE babysitters SET environment_id = NULL WHERE review_id = ?`),
     ],
     touch: db.prepare<[number, string]>(`UPDATE reviews SET updated_at = ? WHERE id = ?`),
     deleteReview: db.prepare<[string]>(`DELETE FROM reviews WHERE id = ?`),
@@ -678,6 +779,51 @@ function createStore(db: Database.Database) {
       `INSERT INTO board_stages (review_id, stage, auto_stage, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET stage = excluded.stage, auto_stage = excluded.auto_stage, updated_at = excluded.updated_at`,
     ),
     deleteBoardStage: db.prepare<[string]>(`DELETE FROM board_stages WHERE review_id = ?`),
+    pipeline: db.prepare<[string], PipelineRow>(`SELECT * FROM pipeline WHERE review_id = ?`),
+    setPipelineStage: db.prepare<[string, string, number, string | null, number]>(
+      `INSERT INTO pipeline (review_id, stage, entered_at, needs_you, updated_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(review_id) DO UPDATE SET stage = excluded.stage, entered_at = excluded.entered_at, needs_you = excluded.needs_you, updated_at = excluded.updated_at`,
+    ),
+    setHeadSeen: db.prepare<[number, string]>(`UPDATE pipeline SET head_seen_at = ? WHERE review_id = ?`),
+    setNeedsYou: db.prepare<[string | null, number, string]>(`UPDATE pipeline SET needs_you = ?, updated_at = ? WHERE review_id = ?`),
+    setBabysit: db.prepare<[string | null, string | null, number, string | null, number, string]>(
+      `UPDATE pipeline SET babysit_head = ?, babysit_key = ?, babysit_passes = ?, babysit_outcome = ?, updated_at = ? WHERE review_id = ?`,
+    ),
+    deletePipeline: db.prepare<[string]>(`DELETE FROM pipeline WHERE review_id = ?`),
+    rounds: db.prepare<[string], RoundRow>(`SELECT * FROM ai_rounds WHERE review_id = ? ORDER BY round ASC`),
+    round: db.prepare<[string, number], RoundRow>(`SELECT * FROM ai_rounds WHERE review_id = ? AND round = ?`),
+    lastRound: db.prepare<[string], RoundRow>(`SELECT * FROM ai_rounds WHERE review_id = ? ORDER BY round DESC LIMIT 1`),
+    roundsByStatus: db.prepare<[string], RoundRow>(`SELECT * FROM ai_rounds WHERE status = ? ORDER BY started_at ASC`),
+    insertRound: db.prepare<[string, number, string, string, number]>(
+      `INSERT OR REPLACE INTO ai_rounds (review_id, round, base_sha, head_sha, status, started_at) VALUES (?, ?, ?, ?, 'queued', ?)`,
+    ),
+    setRoundStatus: db.prepare<[string, string | null, number | null, string, number]>(`UPDATE ai_rounds SET status = ?, error = ?, finished_at = ? WHERE review_id = ? AND round = ?`),
+    setRoundRunning: db.prepare<[number, string, number]>(`UPDATE ai_rounds SET status = 'running', error = NULL, started_at = ? WHERE review_id = ? AND round = ?`),
+    setRoundPosted: db.prepare<[string, number, string | null, string, number, string, number]>(
+      `UPDATE ai_rounds SET status = 'posted', summary = ?, high_value = ?, review_url = ?, raw = ?, error = NULL, finished_at = ? WHERE review_id = ? AND round = ?`,
+    ),
+    deleteRounds: db.prepare<[string]>(`DELETE FROM ai_rounds WHERE review_id = ?`),
+    findings: db.prepare<[string], FindingRow>(`SELECT * FROM ai_findings WHERE review_id = ? ORDER BY round ASC, rowid ASC`),
+    insertFinding: db.prepare<[string, string, number, string, number, number | null, string, string, string, string | null, number, number]>(
+      `INSERT INTO ai_findings (id, review_id, round, path, line, start_line, severity, title, body, suggestion, status, inline, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+    ),
+    setFindingStatus: db.prepare<[string, string, number, string]>(`UPDATE ai_findings SET status = ?, note = ?, updated_at = ? WHERE id = ?`),
+    deleteFindings: db.prepare<[string]>(`DELETE FROM ai_findings WHERE review_id = ?`),
+    aiReviewer: db.prepare<[string], HelperRow>(`SELECT * FROM ai_reviewers WHERE review_id = ?`),
+    aiReviewerByThread: db.prepare<[string], HelperRow>(`SELECT * FROM ai_reviewers WHERE thread_id = ?`),
+    upsertAiReviewer: db.prepare<[string, string, string, string | null, number, string | null]>(
+      `INSERT INTO ai_reviewers (review_id, thread_id, provider_id, environment_id, created_at, intro_hash) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id, intro_hash = excluded.intro_hash`,
+    ),
+    setAiReviewerJob: db.prepare<[string | null, string]>(`UPDATE ai_reviewers SET job = ? WHERE review_id = ?`),
+    deleteAiReviewer: db.prepare<[string]>(`DELETE FROM ai_reviewers WHERE review_id = ?`),
+    babysitter: db.prepare<[string], HelperRow>(`SELECT * FROM babysitters WHERE review_id = ?`),
+    babysitterByThread: db.prepare<[string], HelperRow>(`SELECT * FROM babysitters WHERE thread_id = ?`),
+    upsertBabysitter: db.prepare<[string, string, string, string | null, number, string | null]>(
+      `INSERT INTO babysitters (review_id, thread_id, provider_id, environment_id, created_at, intro_hash) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id, intro_hash = excluded.intro_hash`,
+    ),
+    setBabysitterJob: db.prepare<[string | null, string]>(`UPDATE babysitters SET job = ? WHERE review_id = ?`),
+    deleteBabysitter: db.prepare<[string]>(`DELETE FROM babysitters WHERE review_id = ?`),
+    babysittersWithJob: db.prepare<[], HelperRow>(`SELECT * FROM babysitters WHERE job IS NOT NULL`),
   };
   return { q };
 }
@@ -819,8 +965,22 @@ export default async function plugin(bb: BbPluginApi) {
     simpleEnglishSkill: { type: "string", label: "Optional file appended to the rewrite prompt as vocabulary help (for example a simple-english SKILL.md); empty uses a short built-in word list", default: "" },
     boardRefresh: { type: "string", label: "Cron (5 fields, server-local time) for syncing the board's open PRs with GitHub in the background; empty turns it off", default: "*/15 * * * *" },
     worktreesDir: { type: "string", label: "Directory on the repository's machine for the PR worktrees; empty uses ~/.review-desk/worktrees. Keep it outside bb's data dir, or bb refuses to run the chat and helper threads there", default: "" },
+    autoAiReview: { type: "boolean", label: "PR factory: start AI review rounds when a PR is added to the board (they post COMMENT reviews to GitHub under your gh login)", default: true },
+    aiReviewProvider: { type: "string", label: "PR factory: provider id for the AI reviewer", default: "claude-code" },
+    aiReviewModel: { type: "string", label: "PR factory: model for the AI reviewer; empty uses the project's default", default: "claude-opus-5-5" },
+    aiReviewMaxRounds: { type: "number", label: "PR factory: AI review rounds before the PR moves to Human review (it moves sooner when a round leaves only nits)", default: 2 },
+    aiReviewConcurrency: { type: "number", label: "PR factory: AI review rounds running at once across the board", default: 2 },
+    aiReviewSettleMinutes: { type: "number", label: "PR factory: minutes a new head must sit unchanged before the next AI round starts", default: 10 },
+    aiReviewSkills: { type: "string", label: "PR factory: optional skills the reviewer must use on top of the ones it picks (your own and the repository's); comma separated, owner/repo=skill for one repository", default: "" },
+    aiReviewEmpirical: { type: "boolean", label: "PR factory: let the AI reviewer run empirical review skills (builds, servers, GPU or load tests)", default: false },
+    babysitProvider: { type: "string", label: "PR factory: provider id for the CI babysitter", default: "claude-code" },
+    babysitModel: { type: "string", label: "PR factory: model for the CI babysitter (a small one is enough)", default: "claude-haiku-5-5" },
+    babysitMaxPasses: { type: "number", label: "PR factory: babysit passes per head before CI failures are handed to you", default: 3 },
   });
-  const { defaultProvider, hideSeatThreads, autoBrief, autoGuide, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir } = await settings.get();
+  const {
+    defaultProvider, hideSeatThreads, autoBrief, autoGuide, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir,
+    autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses,
+  } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
 
   const db = bb.storage.database();
@@ -966,6 +1126,7 @@ export default async function plugin(bb: BbPluginApi) {
     await refreshFiles(row);
     void refreshThreads(row).catch((cause: unknown) => bb.log.warn(`threads for ${id}: ${errorMessage(cause)}`));
     publish(id, "opened");
+    if (autoAiReview && row.state === "OPEN") startFactory(row);
     return toReview(row);
   }
 
@@ -984,6 +1145,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (headChanged || cachedFiles(fresh) === null) await refreshFiles(fresh);
     await refreshThreads(fresh).catch((cause: unknown) => bb.log.warn(`threads for ${reviewId}: ${errorMessage(cause)}`));
     if (headChanged) await reanchorNotes(fresh).catch((cause: unknown) => bb.log.warn(`notes for ${reviewId}: ${errorMessage(cause)}`));
+    if (headChanged) q.setHeadSeen.run(Date.now(), reviewId);
     publish(reviewId, "synced");
     return { review: toReview(fresh), headChanged };
   }
@@ -1043,13 +1205,21 @@ export default async function plugin(bb: BbPluginApi) {
    * reports a missing decision as "") puts the PR in Babysit: approved by
    * you or others, now watching CI until it merges.
    */
-  function autoStage(row: ReviewRow): BoardStage | null {
+  function githubStage(row: ReviewRow): BoardStage | null {
     if (row.state !== "OPEN") return null;
     const decision = row.review_decision === "" ? null : row.review_decision;
     const reviewers = parseJson<Review["reviewers"]>(row.reviewers_json, []);
     if (decision === "CHANGES_REQUESTED" || reviewers.some((r) => r.state === "CHANGES_REQUESTED")) return "changes_requested";
     if (decision === "APPROVED" || reviewers.some((r) => r.state === "APPROVED")) return "babysit";
     return "unreviewed";
+  }
+
+  /** An approval wins (Babysit); otherwise the factory's stage, when the PR is in the factory; otherwise GitHub's state. */
+  function autoStage(row: ReviewRow): BoardStage | null {
+    const gh = githubStage(row);
+    if (gh === null || gh === "babysit") return gh;
+    const p = q.pipeline.get(row.id);
+    return p !== undefined && isPipelineStage(p.stage) ? p.stage : gh;
   }
 
   const CHECK_OK = new Set(["success", "skipped", "neutral"]);
@@ -1107,6 +1277,7 @@ export default async function plugin(bb: BbPluginApi) {
       stage: pinnedStage ?? auto,
       autoStage: auto,
       pinned: pinnedStage !== null,
+      factory: factorySummary(row),
     };
   }
 
@@ -1118,6 +1289,15 @@ export default async function plugin(bb: BbPluginApi) {
     const row = requireReview(reviewId);
     const auto = autoStage(row);
     if (auto === null) throw new Error(`${row.owner}/${row.repo}#${row.number} is ${row.state.toLowerCase()}; it is not on the board`);
+    // Below an approval, a drag into a factory column moves the factory, and a drag to Unreviewed takes the PR out of it.
+    if (githubStage(row) !== "babysit" && stage !== null && (isPipelineStage(stage) || (stage === "unreviewed" && q.pipeline.get(reviewId) !== undefined))) {
+      q.deleteBoardStage.run(reviewId);
+      if (stage === "unreviewed") q.deletePipeline.run(reviewId);
+      else setStage(row, stage);
+      if (stage === "ai_review") void advanceFactory(reviewId, true);
+      publish(reviewId, "board");
+      return summarize(requireReview(reviewId));
+    }
     if (stage === null || stage === auto) q.deleteBoardStage.run(reviewId);
     else q.setBoardStage.run(reviewId, stage, auto, Date.now());
     publish(reviewId, "board");
@@ -1175,6 +1355,7 @@ export default async function plugin(bb: BbPluginApi) {
             try {
               await lightSync(row);
               synced++;
+              await advanceFactory(row.id).catch((cause: unknown) => bb.log.warn(`factory ${row.owner}/${row.repo}#${row.number}: ${errorMessage(cause)}`));
             } catch (cause) {
               failed.push({ reviewId: row.id, error: errorMessage(cause) });
               bb.log.warn(`board refresh ${row.owner}/${row.repo}#${row.number}: ${errorMessage(cause)}`);
@@ -2450,6 +2631,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
+    if (factoryThreadDone(thread.id, lastAssistantText, null)) return;
     const helper = q.helperByThread.get(thread.id);
     if (helper !== undefined) {
       q.setHelperJob.run(null, helper.review_id);
@@ -2466,6 +2648,7 @@ export default async function plugin(bb: BbPluginApi) {
     completeSimple(simplifier.review_id, lastAssistantText, null);
   });
   bb.events.on("thread.failed", ({ thread, error }) => {
+    if (factoryThreadDone(thread.id, null, error ?? "the thread failed")) return;
     const helper = q.helperByThread.get(thread.id);
     if (helper !== undefined) {
       q.setHelperJob.run(null, helper.review_id);
@@ -2618,6 +2801,424 @@ export default async function plugin(bb: BbPluginApi) {
     return briefState(row);
   }
 
+  // -- PR factory -------------------------------------------------------------
+  //
+  // A PR added to the board goes to AI review: a hidden reviewer thread runs
+  // round 1 and the server posts its findings to GitHub as a COMMENT review
+  // that says which AI round it is. Each push after that, once the head has
+  // settled, runs a targeted round over the new commits that also decides
+  // what happened to the open findings. After maxRounds, or as soon as a round
+  // leaves nothing above a nit open, the PR moves to Human review and the
+  // reviewer thread surfaces, unread, in the sidebar. Your own review moves it
+  // on: an approval to Babysit (through GitHub's state), anything else to
+  // Changes requested until the author pushes again. In Babysit a small model
+  // re-runs flaky CI; anything that needs a push or a decision comes back to
+  // you, and it never pushes.
+
+  const maxRounds = Math.max(1, Math.round(aiReviewMaxRounds));
+  const roundConcurrency = Math.max(1, Math.round(aiReviewConcurrency));
+  const settleMs = Math.max(0, aiReviewSettleMinutes) * 60_000;
+  const maxPasses = Math.max(1, Math.round(babysitMaxPasses));
+  const extraSkills = aiReviewSkills.split(",").map((entry) => entry.trim()).filter((entry) => entry !== "");
+  /** The extra skills for a repository: the bare ones, and the ones scoped to it. */
+  const skillsFor = (row: ReviewRow) =>
+    extraSkills.flatMap((entry) => {
+      const [scope, skill] = entry.includes("=") ? entry.split("=").map((x) => x.trim()) : [null, entry];
+      return skill && (scope === null || scope.toLowerCase() === `${row.owner}/${row.repo}`.toLowerCase()) ? [skill] : [];
+    });
+
+  const reviewerLane: Lane = {
+    title: "AI review",
+    intro: reviewerIntro,
+    providerId: aiReviewProvider.trim(),
+    model: aiReviewModel,
+    replaceOnIntroChange: false,
+    get: (id) => q.aiReviewer.get(id),
+    upsert: (id, threadId, providerId, environmentId, createdAt, introHash) => { q.upsertAiReviewer.run(id, threadId, providerId, environmentId, createdAt, introHash); },
+    setJob: (job, id) => { q.setAiReviewerJob.run(job, id); },
+    remove: (id) => { q.deleteAiReviewer.run(id); },
+  };
+  const babysitterLane: Lane = {
+    title: "CI babysit",
+    intro: babysitIntro,
+    providerId: babysitProvider.trim(),
+    model: babysitModel,
+    reasoningLevel: "low",
+    replaceOnIntroChange: false,
+    get: (id) => q.babysitter.get(id),
+    upsert: (id, threadId, providerId, environmentId, createdAt, introHash) => { q.upsertBabysitter.run(id, threadId, providerId, environmentId, createdAt, introHash); },
+    setJob: (job, id) => { q.setBabysitterJob.run(job, id); },
+    remove: (id) => { q.deleteBabysitter.run(id); },
+  };
+
+  const prLabel = (row: ReviewRow) => `${row.owner}/${row.repo}#${row.number}`;
+
+  function setStage(row: ReviewRow, stage: PipelineStage, needsYou: string | null = null): void {
+    q.setPipelineStage.run(row.id, stage, Date.now(), needsYou, Date.now());
+    publish(row.id, "board");
+  }
+
+  /** Let you know: the thread shows in the sidebar, unread, under a title that says why. */
+  async function surface(threadId: string | undefined, title: string): Promise<void> {
+    if (threadId === undefined) return;
+    try {
+      await bb.sdk.threads.update({ threadId, visibility: "visible", title: title.slice(0, 200) });
+      await bb.sdk.threads.markUnread({ threadId });
+    } catch (cause) {
+      bb.log.warn(`surface ${threadId}: ${errorMessage(cause)}`);
+    }
+  }
+
+  function factorySummary(row: ReviewRow): ReviewSummary["factory"] {
+    const p = q.pipeline.get(row.id);
+    if (p === undefined) return null;
+    const rounds = q.rounds.all(row.id);
+    const last = rounds.at(-1);
+    return {
+      round: last?.round ?? 0,
+      roundsPosted: rounds.filter((r) => r.status === "posted").length,
+      roundStatus: last?.status ?? null,
+      openFindings: q.findings.all(row.id).filter((f) => f.status === "open" && isHighValue(f.severity)).length,
+      reviewUrl: rounds.filter((r) => r.review_url !== null).at(-1)?.review_url ?? null,
+      needsYou: p.needs_you,
+      babysit: p.babysit_head === row.head_sha ? p.babysit_outcome : null,
+      error: last?.status === "failed" ? last.error : null,
+    };
+  }
+
+  /** Put a PR in the factory: AI review, unless it is already approved. `force` starts the next round now. */
+  function startFactory(row: ReviewRow, force = false): void {
+    const p = q.pipeline.get(row.id);
+    const approved = githubStage(row) === "babysit";
+    if (p === undefined || (force && !approved && p.stage !== "ai_review")) setStage(row, approved ? "human_review" : "ai_review");
+    void advanceFactory(row.id, force).catch((cause: unknown) => bb.log.warn(`factory ${prLabel(row)}: ${errorMessage(cause)}`));
+  }
+
+  const advancing = new Set<string>();
+  /** One step of the factory for a PR; runs after each sync, on open, when a round ends, and when you move the card. */
+  async function advanceFactory(reviewId: string, force = false): Promise<void> {
+    if (advancing.has(reviewId)) return;
+    advancing.add(reviewId);
+    try {
+      const row = q.review.get(reviewId);
+      const p = q.pipeline.get(reviewId);
+      if (row === undefined || p === undefined || row.state !== "OPEN") return;
+      if (githubStage(row) === "babysit") await babysitTick(row, p);
+      else if (p.stage === "ai_review") aiReviewTick(row, p, force);
+      else if (p.stage === "human_review") await humanReviewTick(row, p);
+      else if (p.stage === "changes_requested" && p.head_seen_at !== null && p.head_seen_at > p.entered_at) {
+        setStage(row, "human_review", "New commits since your review");
+        await surface(q.aiReviewer.get(row.id)?.thread_id, `Ready for you again: ${prLabel(row)}`);
+      }
+    } finally {
+      advancing.delete(reviewId);
+    }
+  }
+
+  function aiReviewTick(row: ReviewRow, p: PipelineRow, force: boolean): void {
+    const last = q.lastRound.get(row.id);
+    if (last?.status === "queued" || last?.status === "running") {
+      pumpRounds();
+      return;
+    }
+    if (!force && last !== undefined) {
+      // Reviewed (or failed) at this head: wait for a push. After a push, wait for it to settle.
+      if (last.head_sha === row.head_sha) return;
+      if (Date.now() - (p.head_seen_at ?? 0) < settleMs) return;
+    }
+    const round = q.rounds.all(row.id).filter((r) => r.status === "posted").length + 1;
+    if (!force && round > maxRounds) {
+      setStage(row, "human_review", `${maxRounds} AI rounds done`);
+      return;
+    }
+    // A failed attempt at this round is replaced.
+    q.insertRound.run(row.id, round, row.base_sha, row.head_sha, Date.now());
+    publish(row.id, "board");
+    pumpRounds();
+  }
+
+  /** Start queued rounds while there is room; a reviewer thread takes one round at a time. */
+  function pumpRounds(): void {
+    let running = q.roundsByStatus.all("running").length;
+    for (const r of q.roundsByStatus.all("queued")) {
+      if (running >= roundConcurrency) return;
+      const row = q.review.get(r.review_id);
+      if (row === undefined || (q.aiReviewer.get(r.review_id)?.job ?? null) !== null) continue;
+      q.setRoundRunning.run(Date.now(), r.review_id, r.round);
+      running++;
+      publish(r.review_id, "board");
+      void startRound(row, r);
+    }
+  }
+
+  function threadLine(t: GhThread): string {
+    const first = t.comments[0];
+    const last = t.comments.at(-1);
+    const oneLine = (body: string | undefined, n: number) => (body ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+    const replies = t.comments.length > 1 && last !== undefined ? ` (${t.comments.length - 1} repl${t.comments.length === 2 ? "y" : "ies"}, last by @${last.author}: ${oneLine(last.body, 100)})` : "";
+    return `${t.path}:${t.line ?? t.originalLine ?? "?"} @${first?.author ?? "?"}: ${oneLine(first?.body, 140)}${replies}`;
+  }
+
+  async function startRound(row: ReviewRow, r: RoundRow): Promise<void> {
+    try {
+      const files = await host.call("git_files", { worktree: row.worktree, baseSha: r.base_sha, headSha: r.head_sha }, hostOptions(row));
+      const prev = q.rounds.all(row.id).filter((x) => x.status === "posted" && x.round < r.round).at(-1);
+      const prior = q.findings.all(row.id).filter((f) => f.status === "open" && isHighValue(f.severity));
+      const prompt = roundPrompt({
+        owner: row.owner,
+        repo: row.repo,
+        number: row.number,
+        title: row.title,
+        author: row.author,
+        baseRef: row.base_ref,
+        baseSha: r.base_sha,
+        headSha: r.head_sha,
+        round: r.round,
+        maxRounds,
+        prev: prev === undefined ? null : { baseSha: prev.base_sha, headSha: prev.head_sha },
+        prior: prior.map((f) => ({ id: f.id, round: f.round, severity: f.severity, path: f.path, line: f.line, title: f.title, body: f.body })),
+        threads: cachedThreads(row).filter((t) => !t.isResolved).slice(0, 60).map(threadLine),
+        changedPaths: files.files.map((f) => f.path),
+        extraSkills: skillsFor(row),
+        empirical: aiReviewEmpirical,
+      });
+      await laneSend(reviewerLane, row, `round:${r.round}`, prompt);
+    } catch (cause) {
+      q.setRoundStatus.run("failed", errorMessage(cause), Date.now(), row.id, r.round);
+      publish(row.id, "board");
+      pumpRounds();
+    }
+  }
+
+  /** Head-side line numbers each file's diff shows (added or context): the lines GitHub accepts an inline comment on. */
+  async function rightLines(row: ReviewRow, baseSha: string, headSha: string, files: ChangedFile[]): Promise<Map<string, Set<number>>> {
+    const out = new Map<string, Set<number>>();
+    for (const f of files) {
+      const { patch } = await host.call("git_patch", { worktree: row.worktree, baseSha, headSha, path: f.path, oldPath: f.oldPath }, hostOptions(row));
+      const lines = new Set<number>();
+      let next = 0;
+      for (const l of patch.split("\n")) {
+        const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
+        if (hunk !== null) next = Number(hunk[1]);
+        else if (next > 0 && (l.startsWith("+") || l.startsWith(" "))) lines.add(next++);
+      }
+      out.set(f.path, lines);
+    }
+    return out;
+  }
+
+  async function completeRound(reviewId: string, round: number, text: string | null, error: string | null): Promise<void> {
+    const row = q.review.get(reviewId);
+    const r = q.round.get(reviewId, round);
+    if (row === undefined || r === undefined || r.status !== "running") return;
+    try {
+      if (error !== null || text === null) throw new Error(error ?? "the reviewer returned nothing");
+      const reply = parseAiReply(text);
+      const now = Date.now();
+      // What this round decided about the open findings.
+      const open = new Map(q.findings.all(reviewId).filter((f) => f.status === "open" && isHighValue(f.severity)).map((f) => [f.id, f]));
+      const resolved: { title: string; status: "fixed" | "obsolete"; note: string }[] = [];
+      for (const prev of reply.previous) {
+        const f = open.get(prev.id);
+        if (f === undefined || (prev.status !== "fixed" && prev.status !== "obsolete")) continue;
+        q.setFindingStatus.run(prev.status, prev.note, now, f.id);
+        open.delete(f.id);
+        resolved.push({ title: f.title, status: prev.status, note: prev.note });
+      }
+      const stillOpen = [...open.values()].map((f) => ({ title: f.title, severity: f.severity }));
+      // New findings, anchored to the diff this round reviewed.
+      const files = (await host.call("git_files", { worktree: row.worktree, baseSha: r.base_sha, headSha: r.head_sha }, hostOptions(row))).files;
+      const findings: PostedFinding[] = reply.findings.map((f) => {
+        const clean = f.path.trim().replace(/^\.\//, "");
+        const path = files.find((x) => x.path === clean)?.path ?? files.find((x) => x.path.endsWith(`/${clean}`))?.path ?? clean;
+        const end = typeof f.endLine === "number" && f.endLine > f.line ? Math.round(f.endLine) : null;
+        return {
+          severity: f.severity,
+          path,
+          line: end ?? Math.round(f.line),
+          startLine: end === null ? null : Math.round(f.line),
+          title: f.title.trim().slice(0, 200),
+          body: f.body.trim(),
+          suggestion: f.suggestion ?? null,
+        };
+      });
+      const wanted = new Set(findings.filter((f) => isHighValue(f.severity)).map((f) => f.path));
+      const shown = await rightLines(row, r.base_sha, r.head_sha, files.filter((f) => wanted.has(f.path)));
+      const anchors = (f: PostedFinding) => {
+        const lines = shown.get(f.path);
+        if (lines === undefined) return false;
+        for (let l = f.startLine ?? f.line; l <= f.line; l++) if (!lines.has(l)) return false;
+        return true;
+      };
+      let inline = findings.filter((f) => isHighValue(f.severity) && anchors(f));
+      const nits = findings.filter((f) => !isHighValue(f.severity));
+      const counts = Object.fromEntries(AI_SEVERITIES.map((s) => [s, 0])) as Record<AiSeverity, number>;
+      for (const f of findings) counts[f.severity as AiSeverity]++;
+      const high = findings.filter((f) => isHighValue(f.severity)).length + stillOpen.length;
+      const handoff = round >= maxRounds || high === 0;
+      const submit = (onDiff: PostedFinding[]) =>
+        host.call(
+          "gh_submit_review",
+          {
+            owner: row.owner,
+            repo: row.repo,
+            number: row.number,
+            commitId: r.head_sha,
+            event: "COMMENT",
+            body: reviewBody({ round, maxRounds, summary: reply.summary, counts, resolved, stillOpen, nits, offDiff: findings.filter((f) => isHighValue(f.severity) && !onDiff.includes(f)), handoff }),
+            comments: onDiff.map((f) => ({ path: f.path, line: f.line, side: "RIGHT" as const, startLine: f.startLine, body: findingComment(f, round) })),
+          },
+          hostOptions(row),
+        );
+      let posted: { url: string | null };
+      try {
+        posted = await submit(inline);
+      } catch (cause) {
+        if (inline.length === 0) throw cause;
+        // GitHub refuses the whole review when one comment does not anchor; put them all in the body instead.
+        bb.log.warn(`round ${round} of ${prLabel(row)}: inline comments refused (${errorMessage(cause)}); posting them in the review body`);
+        inline = [];
+        posted = await submit(inline);
+      }
+      for (const f of findings) q.insertFinding.run(newId(), reviewId, round, f.path, f.line, f.startLine, f.severity, f.title, f.body, f.suggestion, inline.includes(f) ? 1 : 0, now);
+      q.setRoundPosted.run(reply.summary, high, posted.url, text.slice(0, 200_000), Date.now(), reviewId, round);
+      await refreshThreads(row).catch(() => undefined);
+      if (handoff) {
+        const why = high === 0 ? `AI round ${round} found nothing above a nit` : `${high} finding${high === 1 ? "" : "s"} above a nit still open after ${round} AI round${round === 1 ? "" : "s"}`;
+        setStage(row, "human_review", why);
+        await surface(q.aiReviewer.get(reviewId)?.thread_id, `Ready for you: ${prLabel(row)} (${why})`);
+      }
+    } catch (cause) {
+      q.setRoundStatus.run("failed", errorMessage(cause), Date.now(), reviewId, round);
+      bb.log.warn(`round ${round} of ${prLabel(row)}: ${errorMessage(cause)}`);
+    }
+    publish(reviewId, "board");
+    pumpRounds();
+  }
+
+  const viewers = new Map<string, string>();
+  async function viewerLogin(row: ReviewRow): Promise<string> {
+    const known = viewers.get(row.host_id);
+    if (known !== undefined) return known;
+    const { login } = await host.call("gh_viewer", {}, hostOptions(row));
+    viewers.set(row.host_id, login);
+    return login;
+  }
+
+  /** Your own review after the hand-off (not one the factory posted under your login): anything but an approval waits on the author. */
+  async function humanReviewTick(row: ReviewRow, p: PipelineRow): Promise<void> {
+    const login = await viewerLogin(row);
+    const conversation = await host.call("gh_conversation", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
+    q.setConversationCache.run(row.id, JSON.stringify(conversation), Date.now());
+    const mine = conversation.reviews.filter((r) => r.author === login && !r.body.includes(AI_ROUND_MARKER) && r.submittedAt !== null && Date.parse(r.submittedAt) > p.entered_at);
+    const latest = mine.at(-1);
+    if (latest === undefined || latest.state === "APPROVED") return;
+    setStage(row, "changes_requested");
+  }
+
+  /** One look at an approved PR's CI. A pass runs only for a failure no earlier pass at this head has seen. */
+  async function babysitTick(row: ReviewRow, p: PipelineRow): Promise<void> {
+    const card = summarize(row);
+    const conflicting = row.mergeable === "CONFLICTING";
+    const fresh = p.babysit_head !== row.head_sha;
+    const passes = fresh ? 0 : p.babysit_passes;
+    const outcome = fresh ? null : p.babysit_outcome;
+    const now = Date.now();
+    if (!conflicting && card.checks.failed === 0) {
+      // Nothing failing: forget the last failure, so the same check failing again after a re-run gets a pass.
+      if (fresh || p.babysit_key !== null) q.setBabysit.run(row.head_sha, null, passes, outcome, now, row.id);
+      if (p.needs_you !== null) q.setNeedsYou.run(null, now, row.id);
+      if (fresh || p.babysit_key !== null || p.needs_you !== null) publish(row.id, "board");
+      return;
+    }
+    if (outcome === "needs_human" || (q.babysitter.get(row.id)?.job ?? null) !== null) return;
+    const key = `${conflicting ? "conflict|" : ""}${card.failingChecks.map((c) => c.name).sort().join("|")}#${card.checks.failed}`;
+    if (!fresh && key === p.babysit_key) return;
+    if (passes >= maxPasses) {
+      const why = `CI still failing after ${passes} babysit passes: ${card.failingChecks.map((c) => c.name).join(", ")}`;
+      q.setBabysit.run(row.head_sha, key, passes, "needs_human", now, row.id);
+      q.setNeedsYou.run(why, now, row.id);
+      publish(row.id, "board");
+      await surface(q.babysitter.get(row.id)?.thread_id, `Needs you: ${prLabel(row)}: ${why}`);
+      return;
+    }
+    q.setBabysit.run(row.head_sha, key, passes + 1, "running", now, row.id);
+    publish(row.id, "board");
+    try {
+      await laneSend(babysitterLane, row, "babysit", babysitPrompt({ owner: row.owner, repo: row.repo, number: row.number, headSha: row.head_sha, pass: passes + 1, maxPasses, failing: card.failingChecks, conflicting }));
+    } catch (cause) {
+      q.setBabysit.run(row.head_sha, key, passes + 1, null, Date.now(), row.id);
+      bb.log.warn(`babysit ${prLabel(row)}: ${errorMessage(cause)}`);
+    }
+  }
+
+  async function completeBabysit(reviewId: string, text: string | null, error: string | null): Promise<void> {
+    const row = q.review.get(reviewId);
+    const p = q.pipeline.get(reviewId);
+    if (row === undefined || p === undefined) return;
+    let outcome: string;
+    let detail: string;
+    try {
+      if (error !== null || text === null) throw new Error(error ?? "no reply");
+      ({ outcome, detail } = parseBabysitReply(text));
+    } catch (cause) {
+      outcome = "needs_human";
+      detail = `the babysitter failed: ${errorMessage(cause)}`;
+    }
+    const now = Date.now();
+    q.setBabysit.run(p.babysit_head, p.babysit_key, p.babysit_passes, outcome, now, reviewId);
+    if (outcome === "needs_human") {
+      q.setNeedsYou.run(detail, now, reviewId);
+      await surface(q.babysitter.get(reviewId)?.thread_id, `Needs you: ${prLabel(row)}: ${detail}`);
+    }
+    publish(reviewId, "board");
+  }
+
+  /** Route a factory thread's reply; false when the thread is not one of ours. */
+  function factoryThreadDone(threadId: string, text: string | null, error: string | null): boolean {
+    const reviewer = q.aiReviewerByThread.get(threadId);
+    if (reviewer !== undefined) {
+      q.setAiReviewerJob.run(null, reviewer.review_id);
+      if (reviewer.job !== null && reviewer.job.startsWith("round:")) void completeRound(reviewer.review_id, Number(reviewer.job.slice("round:".length)), text, error);
+      else pumpRounds();
+      return true;
+    }
+    const sitter = q.babysitterByThread.get(threadId);
+    if (sitter !== undefined) {
+      q.setBabysitterJob.run(null, sitter.review_id);
+      if (sitter.job === "babysit") void completeBabysit(sitter.review_id, text, error);
+      return true;
+    }
+    return false;
+  }
+
+  // Across a plugin reload: a round whose thread is no longer working lost its
+  // reply and goes back on the queue; a babysit pass that lost its reply is
+  // forgotten, so the next sync looks again.
+  void (async () => {
+    const working = async (threadId: string) => {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId });
+        return thread.status !== "idle" && thread.archivedAt === null && thread.deletedAt === null;
+      } catch {
+        return false;
+      }
+    };
+    for (const r of q.roundsByStatus.all("running")) {
+      const reviewer = q.aiReviewer.get(r.review_id);
+      if (reviewer?.job === `round:${r.round}` && (await working(reviewer.thread_id))) continue;
+      q.setAiReviewerJob.run(null, r.review_id);
+      q.insertRound.run(r.review_id, r.round, r.base_sha, r.head_sha, Date.now());
+    }
+    for (const sitter of q.babysittersWithJob.all()) {
+      if (await working(sitter.thread_id)) continue;
+      q.setBabysitterJob.run(null, sitter.review_id);
+      const p = q.pipeline.get(sitter.review_id);
+      if (p !== undefined) q.setBabysit.run(p.babysit_head, null, p.babysit_passes, null, Date.now(), sitter.review_id);
+    }
+    pumpRounds();
+  })();
+
   // -- GitHub write paths ----------------------------------------------------
 
   async function submitReview(reviewId: string, event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES", body: string): Promise<{ url: string | null; posted: number }> {
@@ -2640,6 +3241,8 @@ export default async function plugin(bb: BbPluginApi) {
     q.clearPending.run(row.id);
     await refreshThreads(row).catch(() => undefined);
     publish(row.id, "pending");
+    // Your own review from here: a comment or a change request waits on the author; an approval moves to Babysit through GitHub's state.
+    if (event !== "APPROVE" && q.pipeline.get(row.id)?.stage === "human_review") setStage(row, "changes_requested");
     return { url: result.url, posted: pending.length };
   }
 
@@ -2660,6 +3263,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.rpc.register(rpcContract, {
     reviews_list: () => ({ reviews: boardCards() }),
+    factory_start: async ({ reviewId }) => {
+      const row = requireReview(reviewId);
+      startFactory(row, true);
+      return { review: summarize(requireReview(reviewId)) };
+    },
+    factory_stop: ({ reviewId }) => {
+      requireReview(reviewId);
+      q.deletePipeline.run(reviewId);
+      publish(reviewId, "board");
+      return { review: summarize(requireReview(reviewId)) };
+    },
     board_move: ({ reviewId, stage }) => ({ review: moveCard(reviewId, stage) }),
     board_refresh: async () => {
       const result = await refreshBoard();
@@ -2674,6 +3288,7 @@ export default async function plugin(bb: BbPluginApi) {
       q.deleteSimplifier.run(reviewId);
       q.deleteSimple.run(reviewId);
       q.deleteBoardStage.run(reviewId);
+      for (const stmt of [q.deletePipeline, q.deleteRounds, q.deleteFindings, q.deleteAiReviewer, q.deleteBabysitter]) stmt.run(reviewId);
       q.deleteReview.run(reviewId);
       publish(reviewId, "removed");
       // The worktree goes with the card, unless it has local changes.
@@ -2905,8 +3520,9 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "open", summary: "Open or refresh a PR review", usage: "bb review-desk open <url | owner/repo#N>" },
       { name: "list", summary: "List reviews", usage: "bb review-desk list [--json]" },
       { name: "board", summary: "Print the board: every tracked PR under its column", usage: "bb review-desk board [--json]" },
-      { name: "move", summary: "Drag a card to a column, or back to the column GitHub's state gives it", usage: "bb review-desk move <reviewId> <unreviewed|changes_requested|babysit|auto> [--json]" },
+      { name: "move", summary: "Drag a card to a column, or back to the column GitHub's state gives it", usage: "bb review-desk move <reviewId> <unreviewed|ai_review|human_review|changes_requested|babysit|auto> [--json]" },
       { name: "refresh", summary: "Sync every open PR with GitHub", usage: "bb review-desk refresh [--json]" },
+      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show> <reviewId> [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "codemap", summary: "Build or print the codemap", usage: "bb review-desk codemap <reviewId> [--json]" },
       { name: "guide", summary: "Write or print the reading guide over the codemap", usage: "bb review-desk guide <reviewId> [--rewrite] [--json]" },
@@ -2962,6 +3578,24 @@ export default async function plugin(bb: BbPluginApi) {
             if (!reviewId || !stage || (stage !== "auto" && !isBoardStage(stage))) return { exitCode: 1, stderr: `usage: bb review-desk move <reviewId> <${BOARD_STAGES.join("|")}|auto>` };
             const card = moveCard(reviewId, stage === "auto" ? null : stage);
             return ok(card, `${card.owner}/${card.repo}#${card.number} is in ${card.stage === null ? "merged or closed" : BOARD_STAGE_LABEL[card.stage]}${card.pinned ? " (dragged; follows GitHub again when its state changes)" : " (GitHub's state)"}`);
+          }
+          case "factory": {
+            const [action, reviewId] = rest;
+            const row = requireReview(reviewId ?? "");
+            if (action === "start") startFactory(row, true);
+            else if (action === "stop") {
+              q.deletePipeline.run(row.id);
+              publish(row.id, "board");
+            } else if (action !== "show") return { exitCode: 1, stderr: "usage: bb review-desk factory <start|stop|show> <reviewId>" };
+            const card = summarize(requireReview(row.id));
+            const rounds = q.rounds.all(row.id);
+            const findings = q.findings.all(row.id);
+            const text = [
+              `${card.owner}/${card.repo}#${card.number} is in ${card.stage === null ? "merged or closed" : BOARD_STAGE_LABEL[card.stage]}${card.factory?.needsYou ? `; needs you: ${card.factory.needsYou}` : ""}`,
+              ...rounds.map((r) => `  round ${r.round} ${r.status} at ${r.head_sha.slice(0, 10)}${r.high_value === null ? "" : `, ${r.high_value} above nit`}${r.review_url ? ` ${r.review_url}` : ""}${r.error ? ` (${r.error})` : ""}`),
+              ...findings.map((f) => `    [${f.status}] r${f.round} ${f.severity} ${f.path}:${f.line} ${f.title}`),
+            ].join("\n");
+            return ok({ card, rounds, findings }, text);
           }
           case "refresh": {
             const result = await refreshBoard();
@@ -3027,7 +3661,7 @@ export default async function plugin(bb: BbPluginApi) {
             return ok(g, text);
           }
           default:
-            return { exitCode: 1, stderr: "usage: bb review-desk open|list|board|move|refresh|ask|codemap|guide|simple" };
+            return { exitCode: 1, stderr: "usage: bb review-desk open|list|board|move|refresh|factory|ask|codemap|guide|simple" };
         }
       } catch (cause) {
         return { exitCode: 1, stderr: errorMessage(cause) };

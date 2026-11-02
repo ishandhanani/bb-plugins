@@ -180,6 +180,11 @@ export const hostContract = defineRpcContract({
     input: z.object({ owner: z.string(), repo: z.string(), number: z.number() }),
     output: ghPrSchema,
   },
+  /** The login gh is authenticated as: the account reviews are posted under. */
+  gh_viewer: {
+    input: z.object({}),
+    output: z.object({ login: z.string() }),
+  },
   gh_threads: {
     input: z.object({ owner: z.string(), repo: z.string(), number: z.number() }),
     output: z.object({ threads: z.array(ghThreadSchema) }),
