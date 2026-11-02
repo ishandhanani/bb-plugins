@@ -5,29 +5,38 @@
 // repository through the host entry (git, gh, tree-sitter). Chat with the PR
 // runs on ordinary hidden bb threads (one per provider per review) spawned into
 // the PR worktree; the UI renders them with bb's own ThreadChat.
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi, type PluginMentionItem, type PluginMentionSearchContext } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { MENTION_PROVIDER_ID, decodeMentionRef, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
-import { computeSlop, type SlopReport } from "./slop";
-import { BRIEF_FENCE, type Brief, type BriefEvidence } from "./brief-spec";
-import { GUIDE_FENCE, GUIDE_ROLES, type Guide, type GuideFile, type GuideHop, type GuideRole, type GuideStep } from "./guide-spec";
+import { BOARD_STAGES, BOARD_STAGE_LABEL, isBoardStage, isPipelineStage, type BoardStage, type PipelineStage } from "./board-spec";
 import {
-  CODEMAP_VERSION,
+  AI_ROUND_MARKER,
+  AI_SEVERITIES,
+  babysitIntro,
+  babysitPrompt,
+  findingComment,
+  findingHeader,
+  isHighValue,
+  parseAiReply,
+  parseBabysitReply,
+  reviewBody,
+  reviewerIntro,
+  roundPrompt,
+  type AiSeverity,
+  type PostedFinding,
+} from "./factory-spec";
+import {
   changedFileSchema,
-  codemapSchema,
-  fileRole,
   ghIssueCommentSchema,
   ghReviewSchema,
   ghThreadSchema,
   hostContract,
   type ChangedFile,
-  type Codemap,
   type GhPr,
   type GhThread,
 } from "./host-contract";
@@ -75,6 +84,9 @@ const reviewSchema = z.object({
 });
 export type Review = z.infer<typeof reviewSchema>;
 
+const boardStageSchema = z.enum(BOARD_STAGES);
+
+/** One card on the board: the PR's state plus the few numbers that say what is in its way. */
 const reviewSummarySchema = z.object({
   id: z.string(),
   owner: z.string(),
@@ -85,6 +97,49 @@ const reviewSummarySchema = z.object({
   headSha: z.string(),
   pendingCount: z.number(),
   updatedAt: z.number(),
+  url: z.string(),
+  isDraft: z.boolean(),
+  author: z.string().nullable(),
+  headRefName: z.string(),
+  reviewDecision: z.string().nullable(),
+  mergeable: z.string().nullable(),
+  additions: z.number(),
+  deletions: z.number(),
+  changedFiles: z.number(),
+  checks: z.object({ total: z.number(), passed: z.number(), failed: z.number(), pending: z.number() }),
+  approvals: z.number(),
+  changesRequested: z.number(),
+  unresolvedThreads: z.number(),
+  createdAt: z.string(),
+  ghUpdatedAt: z.string(),
+  syncedAt: z.number(),
+  /** Failing checks by name (at most five), for the babysit card. */
+  failingChecks: z.array(z.object({ name: z.string(), url: z.string().nullable() })),
+  /** Date of the newest commit on the PR. */
+  lastCommitAt: z.string().nullable(),
+  /** The column the card is in; null once the PR is merged or closed. */
+  stage: boardStageSchema.nullable(),
+  /** The column GitHub's state puts it in; null once the PR is merged or closed. */
+  autoStage: boardStageSchema.nullable(),
+  /** You dragged the card; it holds its column until GitHub's state changes. */
+  pinned: z.boolean(),
+  /** The PR factory's view of the card; null when the PR is not in it. */
+  factory: z
+    .object({
+      /** The latest AI round, and how many have been posted. */
+      round: z.number(),
+      roundsPosted: z.number(),
+      roundStatus: z.string().nullable(),
+      /** Findings above a nit still open after the latest round. */
+      openFindings: z.number(),
+      reviewUrl: z.string().nullable(),
+      /** Why you are needed, when you are. */
+      needsYou: z.string().nullable(),
+      /** Outcome of the last CI babysit pass. */
+      babysit: z.string().nullable(),
+      error: z.string().nullable(),
+    })
+    .nullable(),
 });
 export type ReviewSummary = z.infer<typeof reviewSummarySchema>;
 
@@ -124,25 +179,24 @@ const selectionSchema = z.object({
 });
 export type SelectionRef = z.infer<typeof selectionSchema>;
 
-const codemapStateSchema = z.object({
-  status: z.enum(["missing", "building", "ready", "failed"]),
-  codemap: codemapSchema.nullable(),
-  error: z.string().nullable(),
-  updatedAt: z.number().nullable(),
-});
-export type CodemapState = z.infer<typeof codemapStateSchema>;
-
-/** The helper-written guide over the codemap. Payload stays loose on the wire; app.tsx casts to the shared Guide type. */
-const guideStateSchema = z.object({
+/** The Map tab: the helper-written diffmap spec of the PR. */
+const mapStateSchema = z.object({
+  /** About the current head: missing until a map is asked for at it. */
   status: z.enum(["missing", "queued", "writing", "ready", "failed"]),
-  /** The latest guide on file, kept while a newer one is queued or writing. */
-  guide: z.record(z.string(), z.unknown()).nullable(),
-  error: z.string().nullable(),
-  /** The guide on file was written for an older head. */
+  /** The head the map on file was written for; null when there is none. */
+  headSha: z.string().nullable(),
+  /** The map on file was written for an older head. */
   stale: z.boolean(),
+  /** The spec on file, kept while a newer one is queued or writing. */
+  markdown: z.string().nullable(),
+  /** diffmap's viewer for the spec on file; null shows the Markdown. */
+  viewerUrl: z.string().nullable(),
+  /** Why the viewer cannot show it: the viewer is not built, or the spec does not resolve against the worktree. */
+  viewerError: z.string().nullable(),
+  error: z.string().nullable(),
   updatedAt: z.number().nullable(),
 });
-export type GuideState = z.infer<typeof guideStateSchema>;
+export type MapState = z.infer<typeof mapStateSchema>;
 
 const providerOptionSchema = z.object({
   id: z.string(),
@@ -151,21 +205,6 @@ const providerOptionSchema = z.object({
   models: z.array(z.object({ model: z.string(), displayName: z.string(), isDefault: z.boolean() })),
 });
 export type ProviderOption = z.infer<typeof providerOptionSchema>;
-
-/** The Brief tab's state: deterministic slop signals plus the helper-written brief. Payloads stay loose on the wire; app.tsx casts to the shared types. */
-const briefStateSchema = z.object({
-  headSha: z.string(),
-  signalsStatus: z.enum(["missing", "computing", "ready", "failed"]),
-  signals: z.record(z.string(), z.unknown()).nullable(),
-  signalsError: z.string().nullable(),
-  briefStatus: z.enum(["missing", "writing", "ready", "failed"]),
-  brief: z.record(z.string(), z.unknown()).nullable(),
-  briefError: z.string().nullable(),
-  /** The stored brief was written for an older head. */
-  stale: z.boolean(),
-  updatedAt: z.number().nullable(),
-});
-export type BriefState = z.infer<typeof briefStateSchema>;
 
 /**
  * Simple English rewrites of the PR's GitHub comments, keyed per comment:
@@ -236,6 +275,17 @@ export const rpcContract = defineRpcContract({
   },
   reviews_sync: { input: reviewIdSchema, output: z.object({ review: reviewSchema, headChanged: z.boolean() }) },
   reviews_remove: { input: reviewIdSchema, output: okSchema },
+  /** Drag a card to a column; null puts it back where GitHub's state says. A dragged card holds its column until that state changes. */
+  board_move: { input: z.object({ reviewId: z.string(), stage: boardStageSchema.nullable() }), output: z.object({ review: reviewSummarySchema }) },
+  /** Put a PR in the factory now: start (or retry) the next AI review round at the current head. */
+  factory_start: { input: reviewIdSchema, output: z.object({ review: reviewSummarySchema }) },
+  /** Take a PR out of the factory; the card follows GitHub's state again. */
+  factory_stop: { input: reviewIdSchema, output: z.object({ review: reviewSummarySchema }) },
+  /** Sync every PR that is not done with GitHub. A PR whose head moved gets the full sync; the others skip the git fetch. */
+  board_refresh: {
+    input: z.null(),
+    output: z.object({ reviews: z.array(reviewSummarySchema), synced: z.number(), failed: z.array(z.object({ reviewId: z.string(), error: z.string() })) }),
+  },
   review_patch: {
     input: z.object({ reviewId: z.string(), path: z.string() }),
     output: z.object({ patch: z.string(), file: changedFileSchema.nullable() }),
@@ -302,27 +352,20 @@ export const rpcContract = defineRpcContract({
   /** Which review a thread belongs to, if it is one of our analyst seats. */
   seat_lookup: { input: z.object({ threadId: z.string() }), output: z.object({ seat: z.object({ reviewId: z.string(), providerId: z.string() }).nullable() }) },
   chat_reset: { input: z.object({ reviewId: z.string(), providerId: z.string() }), output: okSchema },
-  codemap_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: codemapStateSchema },
-  /** The guide over the codemap; queued for writing on first call at a new head when autoGuide is on. */
-  guide_get: { input: reviewIdSchema, output: guideStateSchema },
-  /** (Re)write the guide at the current head. */
-  guide_write: { input: reviewIdSchema, output: guideStateSchema },
+  /** The diffmap of the PR; queued for writing on first call at a new head when autoMap is on. */
+  map_get: { input: reviewIdSchema, output: mapStateSchema },
+  /** (Re)write the diffmap at the current head. */
+  map_write: { input: reviewIdSchema, output: mapStateSchema },
   rooms_list: { input: z.null(), output: z.object({ rooms: z.array(z.object({ id: z.string(), title: z.string(), handles: z.array(z.string()) })), available: z.boolean() }) },
   send_to_room: {
     input: z.object({ roomId: z.string(), text: z.string().trim().min(1).max(20_000), tags: z.array(z.string()).max(8), turns: z.number().int().min(0).max(40).optional() }),
     output: okSchema,
   },
   context_providers: { input: z.null(), output: z.object({ providers: z.array(providerOptionSchema), defaultProvider: z.string() }) },
-  /** Signals compute on first call for a head; the brief is written on first call too when autoBrief is on. */
-  brief_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: briefStateSchema },
-  /** (Re)write the plain-English brief at the current head. */
-  brief_write: { input: reviewIdSchema, output: briefStateSchema },
   /** Simple English rewrites of the comments. In eager mode missing ones are queued on each call; `refresh` throws the cache away and rewrites everything. */
   simple_get: { input: z.object({ reviewId: z.string(), refresh: z.boolean().optional() }), output: simpleStateSchema },
   /** Rewrite these comments now, ahead of anything else queued; a failed one is tried again. */
   simple_request: { input: z.object({ reviewId: z.string(), keys: z.array(z.string()).min(1).max(200) }), output: simpleStateSchema },
-  /** Put one slop signal's evidence lines into the diff as notes (or take them out again). */
-  notes_from_signal: { input: z.object({ reviewId: z.string(), signalId: z.string(), show: z.boolean() }), output: z.object({ count: z.number() }) },
   /** Ask the helper to find slop and cleanups; notes arrive over realtime. */
   notes_find: { input: reviewIdSchema, output: okSchema },
   note_add: {
@@ -499,6 +542,74 @@ const MIGRATIONS = [
      error TEXT,
      updated_at INTEGER NOT NULL
    )`,
+  // The board: a card dragged to a column keeps it while GitHub's own state (auto_stage) is unchanged.
+  `CREATE TABLE IF NOT EXISTS board_stages (review_id TEXT PRIMARY KEY, stage TEXT NOT NULL, auto_stage TEXT NOT NULL, updated_at INTEGER NOT NULL)`,
+  // The PR factory. pipeline: the stage the factory put the PR in, when the
+  // head last moved, why you are needed, and the CI babysitter's progress at
+  // the current head. ai_rounds: one row per AI review round. ai_findings:
+  // what each round found, and what later rounds decided about it.
+  `CREATE TABLE IF NOT EXISTS pipeline (
+     review_id TEXT PRIMARY KEY,
+     stage TEXT NOT NULL,
+     entered_at INTEGER NOT NULL,
+     head_seen_at INTEGER,
+     needs_you TEXT,
+     babysit_head TEXT,
+     babysit_key TEXT,
+     babysit_passes INTEGER NOT NULL DEFAULT 0,
+     babysit_outcome TEXT,
+     updated_at INTEGER NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS ai_rounds (
+     review_id TEXT NOT NULL,
+     round INTEGER NOT NULL,
+     base_sha TEXT NOT NULL,
+     head_sha TEXT NOT NULL,
+     status TEXT NOT NULL,
+     summary TEXT,
+     high_value INTEGER,
+     review_url TEXT,
+     raw TEXT,
+     error TEXT,
+     started_at INTEGER NOT NULL,
+     finished_at INTEGER,
+     PRIMARY KEY (review_id, round)
+   )`,
+  `CREATE TABLE IF NOT EXISTS ai_findings (
+     id TEXT PRIMARY KEY,
+     review_id TEXT NOT NULL,
+     round INTEGER NOT NULL,
+     path TEXT NOT NULL,
+     line INTEGER NOT NULL,
+     start_line INTEGER,
+     severity TEXT NOT NULL,
+     title TEXT NOT NULL,
+     body TEXT NOT NULL,
+     suggestion TEXT,
+     status TEXT NOT NULL,
+     note TEXT,
+     inline INTEGER NOT NULL DEFAULT 0,
+     updated_at INTEGER NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS ai_findings_review ON ai_findings (review_id)`,
+  // Hidden threads per review for the AI reviewer and the CI babysitter; same shape as helpers.
+  `CREATE TABLE IF NOT EXISTS ai_reviewers (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL, intro_hash TEXT)`,
+  `CREATE TABLE IF NOT EXISTS babysitters (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL, intro_hash TEXT)`,
+  // The diffmap spec of the PR. head_sha is the head the status is about;
+  // markdown_head_sha is the head the stored spec was written for, so an older
+  // map stays on screen while a newer one is queued or writing. The codemaps,
+  // briefs, and guides tables above belong to removed features and stay
+  // declared so existing databases still match.
+  `CREATE TABLE IF NOT EXISTS maps (
+     review_id TEXT PRIMARY KEY,
+     head_sha TEXT NOT NULL,
+     status TEXT NOT NULL,
+     markdown TEXT,
+     markdown_head_sha TEXT,
+     raw TEXT,
+     error TEXT,
+     updated_at INTEGER NOT NULL
+   )`,
 ];
 
 interface ReviewRow {
@@ -509,7 +620,6 @@ interface ReviewRow {
 }
 interface PendingRow { id: string; review_id: string; path: string; line: number; start_line: number | null; side: string; body: string; created_at: number }
 interface SeatRow { review_id: string; provider_id: string; thread_id: string; environment_id: string | null; created_at: number }
-interface CodemapRow { review_id: string; head_sha: string; status: string; json: string | null; error: string | null; updated_at: number }
 interface CacheRow { review_id: string; json: string; fetched_at: number }
 interface HelperRow { review_id: string; thread_id: string; provider_id: string; environment_id: string | null; job: string | null; created_at: number; intro_hash?: string | null }
 interface SimpleRow { review_id: string; comment_key: string; body_hash: string; status: string; text: string | null; error: string | null; updated_at: number; requested_at: number | null }
@@ -517,11 +627,20 @@ interface NoteRow {
   id: string; review_id: string; head_sha: string; path: string; line: number; start_line: number | null; side: string; kind: string; severity: string; title: string; body: string;
   suggestion: string | null; source: string; signal_id: string | null; state: string; anchor_hash: string | null; created_at: number; updated_at: number;
 }
-interface BriefRow {
-  review_id: string; head_sha: string; signals_status: string; signals_json: string | null; signals_error: string | null;
-  brief_status: string; brief_head_sha: string | null; brief_json: string | null; brief_raw: string | null; brief_error: string | null; updated_at: number;
+interface MapRow { review_id: string; head_sha: string; status: string; markdown: string | null; markdown_head_sha: string | null; raw: string | null; error: string | null; updated_at: number }
+interface BoardStageRow { review_id: string; stage: string; auto_stage: string; updated_at: number }
+interface PipelineRow {
+  review_id: string; stage: string; entered_at: number; head_seen_at: number | null; needs_you: string | null;
+  babysit_head: string | null; babysit_key: string | null; babysit_passes: number; babysit_outcome: string | null; updated_at: number;
 }
-interface GuideRow { review_id: string; head_sha: string; status: string; json: string | null; json_head_sha: string | null; raw: string | null; error: string | null; updated_at: number }
+interface RoundRow {
+  review_id: string; round: number; base_sha: string; head_sha: string; status: string; summary: string | null; high_value: number | null;
+  review_url: string | null; raw: string | null; error: string | null; started_at: number; finished_at: number | null;
+}
+interface FindingRow {
+  id: string; review_id: string; round: number; path: string; line: number; start_line: number | null; severity: string; title: string; body: string;
+  suggestion: string | null; status: string; note: string | null; inline: number; updated_at: number;
+}
 
 function newId(): string {
   return randomBytes(6).toString("hex");
@@ -540,8 +659,18 @@ function createStore(db: Database.Database) {
       `UPDATE reviews SET title = ?, body = ?, state = ?, is_draft = ?, author = ?, base_ref = ?, head_ref = ?, head_sha = ?, base_sha = ?, additions = ?, deletions = ?, changed_files = ?, review_decision = ?, mergeable = ?, labels_json = ?, checks_json = ?, reviewers_json = ?, assignees_json = ?, commits_json = ?, gh_created_at = ?, worktree = ?, gh_updated_at = ?, synced_at = ?, updated_at = ? WHERE id = ?`,
     ),
     setEnvironment: db.prepare<[string, string]>(`UPDATE reviews SET environment_id = ? WHERE id = ?`),
+    /** Forget the environments bound to a review's worktree path (the review, its seats, helper, and simplifier). */
+    clearEnvironments: [
+      db.prepare<[string]>(`UPDATE reviews SET environment_id = NULL WHERE id = ?`),
+      db.prepare<[string]>(`UPDATE seats SET environment_id = NULL WHERE review_id = ?`),
+      db.prepare<[string]>(`UPDATE helpers SET environment_id = NULL WHERE review_id = ?`),
+      db.prepare<[string]>(`UPDATE simplifiers SET environment_id = NULL WHERE review_id = ?`),
+      db.prepare<[string]>(`UPDATE ai_reviewers SET environment_id = NULL WHERE review_id = ?`),
+      db.prepare<[string]>(`UPDATE babysitters SET environment_id = NULL WHERE review_id = ?`),
+    ],
     touch: db.prepare<[number, string]>(`UPDATE reviews SET updated_at = ? WHERE id = ?`),
     deleteReview: db.prepare<[string]>(`DELETE FROM reviews WHERE id = ?`),
+    setWorktree: db.prepare<[string, string]>(`UPDATE reviews SET worktree = ? WHERE id = ?`),
     filesCache: db.prepare<[string], { head_sha: string; json: string }>(`SELECT head_sha, json FROM files_cache WHERE review_id = ?`),
     setFilesCache: db.prepare<[string, string, string]>(`INSERT INTO files_cache (review_id, head_sha, json) VALUES (?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, json = excluded.json`),
     viewed: db.prepare<[string], { path: string }>(`SELECT path FROM viewed WHERE review_id = ?`),
@@ -595,17 +724,8 @@ function createStore(db: Database.Database) {
     deleteSimpleRow: db.prepare<[string, string]>(`DELETE FROM simple_comments WHERE review_id = ? AND comment_key = ?`),
     deleteSimple: db.prepare<[string]>(`DELETE FROM simple_comments WHERE review_id = ?`),
     resetSimpleWriting: db.prepare<[]>(`UPDATE simple_comments SET status = 'queued' WHERE status = 'writing'`),
-    brief: db.prepare<[string], BriefRow>(`SELECT * FROM briefs WHERE review_id = ?`),
-    ensureBrief: db.prepare<[string, string, number]>(`INSERT INTO briefs (review_id, head_sha, updated_at) VALUES (?, ?, ?) ON CONFLICT(review_id) DO NOTHING`),
-    setSignals: db.prepare<[string, string, string | null, string | null, number, string]>(
-      `UPDATE briefs SET head_sha = ?, signals_status = ?, signals_json = ?, signals_error = ?, updated_at = ? WHERE review_id = ?`,
-    ),
-    setBrief: db.prepare<[string, string | null, string | null, string | null, string | null, number, string]>(
-      `UPDATE briefs SET brief_status = ?, brief_head_sha = ?, brief_json = ?, brief_raw = ?, brief_error = ?, updated_at = ? WHERE review_id = ?`,
-    ),
     notes: db.prepare<[string], NoteRow>(`SELECT * FROM notes WHERE review_id = ? ORDER BY path ASC, line ASC, created_at ASC`),
     noteById: db.prepare<[string], NoteRow>(`SELECT * FROM notes WHERE id = ?`),
-    notesBySignal: db.prepare<[string, string], NoteRow>(`SELECT * FROM notes WHERE review_id = ? AND signal_id = ?`),
     insertNote: db.prepare<[string, string, string, string, number, number | null, string, string, string, string, string, string | null, string, string | null, string | null, number, number]>(
       `INSERT INTO notes (id, review_id, head_sha, path, line, start_line, side, kind, severity, title, body, suggestion, source, signal_id, anchor_hash, state, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
@@ -614,7 +734,6 @@ function createStore(db: Database.Database) {
     setNoteBody: db.prepare<[string, number, string]>(`UPDATE notes SET body = ?, updated_at = ? WHERE id = ?`),
     setNoteLine: db.prepare<[number, number | null, string, number, string]>(`UPDATE notes SET line = ?, start_line = ?, head_sha = ?, updated_at = ? WHERE id = ?`),
     deleteNote: db.prepare<[string]>(`DELETE FROM notes WHERE id = ?`),
-    deleteSignalNotes: db.prepare<[string, string]>(`DELETE FROM notes WHERE review_id = ? AND signal_id = ? AND state IN ('open', 'stale')`),
     deleteNotesBySource: db.prepare<[string, string]>(`DELETE FROM notes WHERE review_id = ? AND source = ? AND state <> 'promoted'`),
     deleteDismissedNotes: db.prepare<[string]>(`DELETE FROM notes WHERE review_id = ? AND state = 'dismissed'`),
     deleteAllNotes: db.prepare<[string]>(`DELETE FROM notes WHERE review_id = ? AND state <> 'promoted'`),
@@ -622,20 +741,66 @@ function createStore(db: Database.Database) {
     upsertSeen: db.prepare<[string, string, string | null, number]>(
       `INSERT INTO review_seen (review_id, seen_head_sha, prev_head_sha, seen_at) VALUES (?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET seen_head_sha = excluded.seen_head_sha, prev_head_sha = excluded.prev_head_sha, seen_at = excluded.seen_at`,
     ),
-    codemap: db.prepare<[string], CodemapRow>(`SELECT * FROM codemaps WHERE review_id = ?`),
-    setCodemap: db.prepare<[string, string, string, string | null, string | null, number]>(
-      `INSERT INTO codemaps (review_id, head_sha, status, json, error, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, status = excluded.status, json = excluded.json, error = excluded.error, updated_at = excluded.updated_at`,
-    ),
     helpersWithJob: db.prepare<[], HelperRow>(`SELECT * FROM helpers WHERE job IS NOT NULL`),
-    briefsWriting: db.prepare<[], { review_id: string }>(`SELECT review_id FROM briefs WHERE brief_status = 'writing'`),
-    guide: db.prepare<[string], GuideRow>(`SELECT * FROM guides WHERE review_id = ?`),
-    guidesPending: db.prepare<[], { review_id: string; head_sha: string }>(`SELECT review_id, head_sha FROM guides WHERE status IN ('queued', 'writing')`),
-    /** Status for a head; the stored guide (json, json_head_sha, raw) is kept. */
-    setGuideStatus: db.prepare<[string, string, string, string | null, number]>(
-      `INSERT INTO guides (review_id, head_sha, status, error, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, status = excluded.status, error = excluded.error, updated_at = excluded.updated_at`,
+    map: db.prepare<[string], MapRow>(`SELECT * FROM maps WHERE review_id = ?`),
+    mapsPending: db.prepare<[], { review_id: string; head_sha: string }>(`SELECT review_id, head_sha FROM maps WHERE status IN ('queued', 'writing')`),
+    /** Status for a head; the stored spec (markdown, markdown_head_sha, raw) is kept. */
+    setMapStatus: db.prepare<[string, string, string, string | null, number]>(
+      `INSERT INTO maps (review_id, head_sha, status, error, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, status = excluded.status, error = excluded.error, updated_at = excluded.updated_at`,
     ),
-    setGuideReady: db.prepare<[string, string | null, number, string]>(`UPDATE guides SET status = 'ready', json = ?, json_head_sha = head_sha, raw = ?, error = NULL, updated_at = ? WHERE review_id = ?`),
-    setGuideFailed: db.prepare<[string, string | null, number, string]>(`UPDATE guides SET status = 'failed', error = ?, raw = ?, updated_at = ? WHERE review_id = ?`),
+    setMapReady: db.prepare<[string, string, number, string]>(`UPDATE maps SET status = 'ready', markdown = ?, markdown_head_sha = head_sha, raw = ?, error = NULL, updated_at = ? WHERE review_id = ?`),
+    setMapFailed: db.prepare<[string, string | null, number, string]>(`UPDATE maps SET status = 'failed', error = ?, raw = ?, updated_at = ? WHERE review_id = ?`),
+    deleteMap: db.prepare<[string]>(`DELETE FROM maps WHERE review_id = ?`),
+    boardStage: db.prepare<[string], BoardStageRow>(`SELECT * FROM board_stages WHERE review_id = ?`),
+    setBoardStage: db.prepare<[string, string, string, number]>(
+      `INSERT INTO board_stages (review_id, stage, auto_stage, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET stage = excluded.stage, auto_stage = excluded.auto_stage, updated_at = excluded.updated_at`,
+    ),
+    deleteBoardStage: db.prepare<[string]>(`DELETE FROM board_stages WHERE review_id = ?`),
+    pipeline: db.prepare<[string], PipelineRow>(`SELECT * FROM pipeline WHERE review_id = ?`),
+    setPipelineStage: db.prepare<[string, string, number, string | null, number]>(
+      `INSERT INTO pipeline (review_id, stage, entered_at, needs_you, updated_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(review_id) DO UPDATE SET stage = excluded.stage, entered_at = excluded.entered_at, needs_you = excluded.needs_you, updated_at = excluded.updated_at`,
+    ),
+    setHeadSeen: db.prepare<[number, string]>(`UPDATE pipeline SET head_seen_at = ? WHERE review_id = ?`),
+    setNeedsYou: db.prepare<[string | null, number, string]>(`UPDATE pipeline SET needs_you = ?, updated_at = ? WHERE review_id = ?`),
+    setBabysit: db.prepare<[string | null, string | null, number, string | null, number, string]>(
+      `UPDATE pipeline SET babysit_head = ?, babysit_key = ?, babysit_passes = ?, babysit_outcome = ?, updated_at = ? WHERE review_id = ?`,
+    ),
+    deletePipeline: db.prepare<[string]>(`DELETE FROM pipeline WHERE review_id = ?`),
+    rounds: db.prepare<[string], RoundRow>(`SELECT * FROM ai_rounds WHERE review_id = ? ORDER BY round ASC`),
+    round: db.prepare<[string, number], RoundRow>(`SELECT * FROM ai_rounds WHERE review_id = ? AND round = ?`),
+    lastRound: db.prepare<[string], RoundRow>(`SELECT * FROM ai_rounds WHERE review_id = ? ORDER BY round DESC LIMIT 1`),
+    roundsByStatus: db.prepare<[string], RoundRow>(`SELECT * FROM ai_rounds WHERE status = ? ORDER BY started_at ASC`),
+    insertRound: db.prepare<[string, number, string, string, number]>(
+      `INSERT OR REPLACE INTO ai_rounds (review_id, round, base_sha, head_sha, status, started_at) VALUES (?, ?, ?, ?, 'queued', ?)`,
+    ),
+    setRoundStatus: db.prepare<[string, string | null, number | null, string, number]>(`UPDATE ai_rounds SET status = ?, error = ?, finished_at = ? WHERE review_id = ? AND round = ?`),
+    setRoundRunning: db.prepare<[number, string, number]>(`UPDATE ai_rounds SET status = 'running', error = NULL, started_at = ? WHERE review_id = ? AND round = ?`),
+    setRoundPosted: db.prepare<[string, number, string | null, string, number, string, number]>(
+      `UPDATE ai_rounds SET status = 'posted', summary = ?, high_value = ?, review_url = ?, raw = ?, error = NULL, finished_at = ? WHERE review_id = ? AND round = ?`,
+    ),
+    deleteRounds: db.prepare<[string]>(`DELETE FROM ai_rounds WHERE review_id = ?`),
+    findings: db.prepare<[string], FindingRow>(`SELECT * FROM ai_findings WHERE review_id = ? ORDER BY round ASC, rowid ASC`),
+    insertFinding: db.prepare<[string, string, number, string, number, number | null, string, string, string, string | null, number, number]>(
+      `INSERT INTO ai_findings (id, review_id, round, path, line, start_line, severity, title, body, suggestion, status, inline, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+    ),
+    setFindingStatus: db.prepare<[string, string, number, string]>(`UPDATE ai_findings SET status = ?, note = ?, updated_at = ? WHERE id = ?`),
+    deleteFindings: db.prepare<[string]>(`DELETE FROM ai_findings WHERE review_id = ?`),
+    aiReviewer: db.prepare<[string], HelperRow>(`SELECT * FROM ai_reviewers WHERE review_id = ?`),
+    aiReviewerByThread: db.prepare<[string], HelperRow>(`SELECT * FROM ai_reviewers WHERE thread_id = ?`),
+    upsertAiReviewer: db.prepare<[string, string, string, string | null, number, string | null]>(
+      `INSERT INTO ai_reviewers (review_id, thread_id, provider_id, environment_id, created_at, intro_hash) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id, intro_hash = excluded.intro_hash`,
+    ),
+    setAiReviewerJob: db.prepare<[string | null, string]>(`UPDATE ai_reviewers SET job = ? WHERE review_id = ?`),
+    deleteAiReviewer: db.prepare<[string]>(`DELETE FROM ai_reviewers WHERE review_id = ?`),
+    babysitter: db.prepare<[string], HelperRow>(`SELECT * FROM babysitters WHERE review_id = ?`),
+    babysitterByThread: db.prepare<[string], HelperRow>(`SELECT * FROM babysitters WHERE thread_id = ?`),
+    upsertBabysitter: db.prepare<[string, string, string, string | null, number, string | null]>(
+      `INSERT INTO babysitters (review_id, thread_id, provider_id, environment_id, created_at, intro_hash) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id, intro_hash = excluded.intro_hash`,
+    ),
+    setBabysitterJob: db.prepare<[string | null, string]>(`UPDATE babysitters SET job = ? WHERE review_id = ?`),
+    deleteBabysitter: db.prepare<[string]>(`DELETE FROM babysitters WHERE review_id = ?`),
+    babysittersWithJob: db.prepare<[], HelperRow>(`SELECT * FROM babysitters WHERE job IS NOT NULL`),
   };
   return { q };
 }
@@ -755,11 +920,6 @@ function remoteMatches(remote: string | null, owner: string, repo: string): bool
   return normalized.endsWith(`${owner}/${repo}`.toLowerCase());
 }
 
-function wasmDirCandidates(): string[] {
-  const here = fileURLToPath(new URL(".", import.meta.url));
-  return [`${here}node_modules/@vscode/tree-sitter-wasm/wasm`, `${here}../node_modules/@vscode/tree-sitter-wasm/wasm`];
-}
-
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -768,15 +928,35 @@ export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     defaultProvider: { type: "string", label: "Default AI provider id for the PR chat", default: "claude-code" },
     hideSeatThreads: { type: "boolean", label: "Hide analyst threads from the sidebar", default: true },
-    autoBrief: { type: "boolean", label: "Write the plain-English brief when a review is first opened at a new head", default: true },
-    autoGuide: { type: "boolean", label: "Write the codemap guide (overview, flow, reading order, one line per file) when a review is first opened at a new head", default: true },
-    helperModel: { type: "string", label: "Model for the helper thread (brief, guide, notes); empty uses the project's default", default: "" },
+    autoMap: { type: "boolean", label: "Write the PR's diffmap when it is added to the board, and again when it is viewed at a new head", default: true },
+    helperModel: { type: "string", label: "Model for the helper thread (the diffmap, notes); empty uses the project's default", default: "" },
     simpleEnglishMode: { type: "string", label: "Simple English rewrites of GitHub comments: lazy (when you flip a comment), eager (every comment as it loads), or off", default: "lazy" },
     simpleEnglishProvider: { type: "string", label: "Provider id for the Simple English thread; empty uses defaultProvider", default: "" },
     simpleEnglishModel: { type: "string", label: "Model for the Simple English thread; empty uses helperModel, then the project's default", default: "" },
     simpleEnglishSkill: { type: "string", label: "Optional file appended to the rewrite prompt as vocabulary help (for example a simple-english SKILL.md); empty uses a short built-in word list", default: "" },
+    boardRefresh: { type: "string", label: "Cron (5 fields, server-local time) for syncing the board's open PRs with GitHub in the background; empty turns it off", default: "*/15 * * * *" },
+    threadSection: { type: "string", label: "Sidebar section (folder) for the threads Review Desk starts (chat, AI review, babysit); created on first use; empty leaves them unsectioned", default: "Review Desk" },
+    worktreesDir: { type: "string", label: "Directory on the repository's machine for the PR worktrees; empty uses ~/.review-desk/worktrees. Keep it outside bb's data dir, or bb refuses to run the chat and helper threads there", default: "" },
+    autoAiReview: { type: "boolean", label: "PR factory: start AI review rounds when a PR is added to the board (they post COMMENT reviews to GitHub under your gh login)", default: true },
+    aiReviewProvider: { type: "string", label: "PR factory: provider id for the AI reviewer", default: "claude-code" },
+    aiReviewModel: { type: "string", label: "PR factory: model for the AI reviewer; empty uses the project's default", default: "claude-opus-5-5" },
+    aiReviewMaxRounds: { type: "number", label: "PR factory: AI review rounds before the PR moves to Human review (it moves sooner when a round leaves only nits)", default: 2 },
+    aiReviewConcurrency: { type: "number", label: "PR factory: AI review rounds running at once across the board", default: 2 },
+    aiReviewSettleMinutes: { type: "number", label: "PR factory: minutes a new head must sit unchanged before the next AI round starts", default: 10 },
+    aiReviewSkills: { type: "string", label: "PR factory: optional skills the reviewer must use on top of the ones it picks (your own and the repository's); comma separated, owner/repo=skill for one repository", default: "" },
+    aiReviewEmpirical: { type: "boolean", label: "PR factory: let the AI reviewer run empirical review skills (builds, servers, GPU or load tests)", default: false },
+    babysitProvider: { type: "string", label: "PR factory: provider id for the CI babysitter", default: "claude-code" },
+    babysitModel: { type: "string", label: "PR factory: model for the CI babysitter (a small one is enough)", default: "claude-haiku-5-5" },
+    babysitMaxPasses: { type: "number", label: "PR factory: babysit passes per head before CI failures are handed to you", default: 3 },
+    slackWebhookUrl: { type: "string", secret: true, label: "PR factory: Slack incoming webhook URL; when set, you are pinged there whenever a PR needs you", default: "" },
+    slackMention: { type: "string", label: "PR factory: optional mention at the start of each Slack ping, for example <@U0123ABCD>", default: "" },
+    eventWebhookUrl: { type: "string", label: "PR factory: webhook that gets every hand-off to you as JSON (for example a Devin automation's webhook trigger, which can relay it to Slack and answer follow-ups)", default: "" },
+    eventWebhookSecret: { type: "string", secret: true, label: "PR factory: secret sent as X-Webhook-Secret with each event", default: "" },
   });
-  const { defaultProvider, hideSeatThreads, autoBrief, autoGuide, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill } = await settings.get();
+  const {
+    defaultProvider, hideSeatThreads, autoMap, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir, threadSection,
+    autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
+  } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
 
   const db = bb.storage.database();
@@ -786,25 +966,18 @@ export default async function plugin(bb: BbPluginApi) {
   q.resetSimpleWriting.run();
   q.resetSimplifierJobs.run();
   const host = bb.hosts.experimental_client({ contract: hostContract });
-  const codemapBuilds = new Set<string>();
 
-  /** Jobs waiting for the helper: one thread per review, one job at a time. */
-  const helperWanted = new Map<string, Set<"brief" | "guide">>();
-  const want = (reviewId: string, job: "brief" | "guide") => {
-    const set = helperWanted.get(reviewId) ?? new Set<"brief" | "guide">();
-    set.add(job);
-    helperWanted.set(reviewId, set);
-  };
+  /** Reviews whose map waits for the helper: one thread per review, one job at a time. */
+  const mapWanted = new Set<string>();
 
   // The helper across a plugin reload. A thread still working on its job keeps
   // its marker: the idle event arrives later and completes the job as usual. A
   // thread that is idle, gone, or archived lost its reply, so the marker is
-  // cleared and a brief or guide that was writing goes back on the queue, to
-  // be sent on the next look at the review (brief_get, guide_get).
+  // cleared and a map that was queued or writing goes back on the queue, to be
+  // sent on the next look at the review (map_get).
   void (async () => {
     const now = Date.now();
-    const briefs = new Set(q.briefsWriting.all().map((r) => r.review_id));
-    const guides = new Map(q.guidesPending.all().map((r) => [r.review_id, r.head_sha]));
+    const maps = new Map(q.mapsPending.all().map((r) => [r.review_id, r.head_sha]));
     for (const helper of q.helpersWithJob.all()) {
       let running = false;
       try {
@@ -817,13 +990,11 @@ export default async function plugin(bb: BbPluginApi) {
         q.setHelperJob.run(null, helper.review_id);
         continue;
       }
-      if (helper.job === "brief") briefs.delete(helper.review_id);
-      if (helper.job === "guide") guides.delete(helper.review_id);
+      if (helper.job === "map") maps.delete(helper.review_id);
     }
-    for (const reviewId of briefs) want(reviewId, "brief");
-    for (const [reviewId, headSha] of guides) {
-      q.setGuideStatus.run(reviewId, headSha, "queued", null, now);
-      want(reviewId, "guide");
+    for (const [reviewId, headSha] of maps) {
+      q.setMapStatus.run(reviewId, headSha, "queued", null, now);
+      mapWanted.add(reviewId);
     }
   })();
 
@@ -880,12 +1051,22 @@ export default async function plugin(bb: BbPluginApi) {
 
   function applyPr(row: ReviewRow, pr: GhPr, prepared: { worktree: string; headSha: string; baseSha: string }): void {
     const now = Date.now();
+    // A worktree that moved (new worktreesDir, or the move out of bb's data dir)
+    // invalidates the environments bound to the old path; the next spawn makes new ones.
+    if (prepared.worktree !== row.worktree) for (const stmt of q.clearEnvironments) stmt.run(row.id);
     q.updateReviewMeta.run(
       pr.title, pr.body, pr.state, pr.isDraft ? 1 : 0, pr.author?.login ?? null, pr.baseRefName, pr.headRefName, prepared.headSha, prepared.baseSha,
       pr.additions, pr.deletions, pr.changedFiles, pr.reviewDecision, pr.mergeable, JSON.stringify(pr.labels), JSON.stringify(pr.checks),
       JSON.stringify(pr.reviewers), JSON.stringify(pr.assignees), JSON.stringify(pr.commits), pr.createdAt,
       prepared.worktree, pr.updatedAt, now, now, row.id,
     );
+    // A dragged card follows GitHub again once GitHub's state has moved on.
+    const pin = q.boardStage.get(row.id);
+    if (pin !== undefined && pin.auto_stage !== autoStage(requireReview(row.id))) {
+      // (a merged or closed PR has no auto stage, so its pin goes too)
+      q.deleteBoardStage.run(row.id);
+      publish(row.id, "board");
+    }
   }
 
   async function openReview(ref: string): Promise<Review> {
@@ -901,7 +1082,7 @@ export default async function plugin(bb: BbPluginApi) {
     const key = `${parsed.owner}__${parsed.repo}__${parsed.number}`;
     const prepared = await host.call(
       "repo_prepare",
-      { repoPath: located.repoPath, number: parsed.number, headSha: pr.headRefOid, baseRefName: pr.baseRefName, worktreesDir: "", key },
+      { repoPath: located.repoPath, number: parsed.number, headSha: pr.headRefOid, baseRefName: pr.baseRefName, worktreesDir: worktreesDir.trim(), key },
       { hostId: located.hostId },
     );
     const id = newId();
@@ -912,6 +1093,8 @@ export default async function plugin(bb: BbPluginApi) {
     await refreshFiles(row);
     void refreshThreads(row).catch((cause: unknown) => bb.log.warn(`threads for ${id}: ${errorMessage(cause)}`));
     publish(id, "opened");
+    if (autoAiReview && row.state === "OPEN") startFactory(row);
+    if (autoMap) wantMap(row, false);
     return toReview(row);
   }
 
@@ -922,7 +1105,7 @@ export default async function plugin(bb: BbPluginApi) {
     const key = `${row.owner}__${row.repo}__${row.number}`;
     const prepared = await host.call(
       "repo_prepare",
-      { repoPath: row.repo_path, number: row.number, headSha: pr.headRefOid, baseRefName: pr.baseRefName, worktreesDir: "", key },
+      { repoPath: row.repo_path, number: row.number, headSha: pr.headRefOid, baseRefName: pr.baseRefName, worktreesDir: worktreesDir.trim(), key },
       hostOptions(row),
     );
     applyPr(row, pr, prepared);
@@ -930,6 +1113,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (headChanged || cachedFiles(fresh) === null) await refreshFiles(fresh);
     await refreshThreads(fresh).catch((cause: unknown) => bb.log.warn(`threads for ${reviewId}: ${errorMessage(cause)}`));
     if (headChanged) await reanchorNotes(fresh).catch((cause: unknown) => bb.log.warn(`notes for ${reviewId}: ${errorMessage(cause)}`));
+    if (headChanged) q.setHeadSeen.run(Date.now(), reviewId);
+    // A PR someone has a map of gets one at the new head too.
+    if (headChanged && autoMap && q.map.get(reviewId)?.markdown) wantMap(fresh, false);
     publish(reviewId, "synced");
     return { review: toReview(fresh), headChanged };
   }
@@ -979,6 +1165,190 @@ export default async function plugin(bb: BbPluginApi) {
   function cachedThreads(row: ReviewRow): GhThread[] {
     const cache = q.threadsCache.get(row.id);
     return cache === undefined ? [] : parseJson<GhThread[]>(cache.json, []);
+  }
+
+  // -- board -----------------------------------------------------------------
+
+  /**
+   * The column GitHub's state puts a PR in, or null once it is merged or
+   * closed. Any approval (the decision, or a reviewer's latest review; gh
+   * reports a missing decision as "") puts the PR in Babysit: approved by
+   * you or others, now watching CI until it merges.
+   */
+  function githubStage(row: ReviewRow): BoardStage | null {
+    if (row.state !== "OPEN") return null;
+    const decision = row.review_decision === "" ? null : row.review_decision;
+    const reviewers = parseJson<Review["reviewers"]>(row.reviewers_json, []);
+    if (decision === "CHANGES_REQUESTED" || reviewers.some((r) => r.state === "CHANGES_REQUESTED")) return "changes_requested";
+    if (decision === "APPROVED" || reviewers.some((r) => r.state === "APPROVED")) return "babysit";
+    return "unreviewed";
+  }
+
+  /** An approval wins (Babysit); otherwise the factory's stage, when the PR is in the factory; otherwise GitHub's state. */
+  function autoStage(row: ReviewRow): BoardStage | null {
+    const gh = githubStage(row);
+    if (gh === null || gh === "babysit") return gh;
+    const p = q.pipeline.get(row.id);
+    return p !== undefined && isPipelineStage(p.stage) ? p.stage : gh;
+  }
+
+  const CHECK_OK = new Set(["success", "skipped", "neutral"]);
+  const CHECK_FAILED = new Set(["failure", "error", "timed_out", "cancelled", "action_required", "startup_failure"]);
+
+  /** A review as one card on the board. */
+  function summarize(row: ReviewRow): ReviewSummary {
+    const auto = autoStage(row);
+    const pin = q.boardStage.get(row.id);
+    const pinnedStage = auto !== null && pin !== undefined && pin.auto_stage === auto && isBoardStage(pin.stage) ? pin.stage : null;
+    const checks = parseJson<Review["checks"]>(row.checks_json, []);
+    const reviewers = parseJson<Review["reviewers"]>(row.reviewers_json, []);
+    const commits = parseJson<Review["commits"]>(row.commits_json, []);
+    let passed = 0;
+    let failed = 0;
+    const failingChecks: { name: string; url: string | null }[] = [];
+    for (const c of checks) {
+      const verdict = (c.conclusion ?? "").toLowerCase();
+      if (CHECK_OK.has(verdict)) passed++;
+      else if (CHECK_FAILED.has(verdict)) {
+        failed++;
+        if (failingChecks.length < 5) failingChecks.push({ name: c.name, url: c.url });
+      }
+    }
+    let lastCommitAt: string | null = null;
+    for (const c of commits) if (lastCommitAt === null || c.date > lastCommitAt) lastCommitAt = c.date;
+    return {
+      id: row.id,
+      owner: row.owner,
+      repo: row.repo,
+      number: row.number,
+      title: row.title,
+      state: row.state,
+      headSha: row.head_sha,
+      pendingCount: q.pending.all(row.id).length,
+      updatedAt: row.updated_at,
+      url: row.url,
+      isDraft: row.is_draft === 1,
+      author: row.author,
+      headRefName: row.head_ref,
+      reviewDecision: row.review_decision,
+      mergeable: row.mergeable,
+      additions: row.additions,
+      deletions: row.deletions,
+      changedFiles: row.changed_files,
+      checks: { total: checks.length, passed, failed, pending: checks.length - passed - failed },
+      approvals: reviewers.filter((r) => r.state === "APPROVED").length,
+      changesRequested: reviewers.filter((r) => r.state === "CHANGES_REQUESTED").length,
+      unresolvedThreads: cachedThreads(row).filter((t) => !t.isResolved).length,
+      createdAt: row.gh_created_at,
+      ghUpdatedAt: row.gh_updated_at,
+      syncedAt: row.synced_at,
+      failingChecks,
+      lastCommitAt,
+      stage: pinnedStage ?? auto,
+      autoStage: auto,
+      pinned: pinnedStage !== null,
+      factory: factorySummary(row),
+    };
+  }
+
+  function boardCards(): ReviewSummary[] {
+    return q.reviews.all().map(summarize);
+  }
+
+  function moveCard(reviewId: string, stage: BoardStage | null): ReviewSummary {
+    const row = requireReview(reviewId);
+    const auto = autoStage(row);
+    if (auto === null) throw new Error(`${row.owner}/${row.repo}#${row.number} is ${row.state.toLowerCase()}; it is not on the board`);
+    // Below an approval, a drag into a factory column moves the factory, and a drag to Unreviewed takes the PR out of it.
+    if (githubStage(row) !== "babysit" && stage !== null && (isPipelineStage(stage) || (stage === "unreviewed" && q.pipeline.get(reviewId) !== undefined))) {
+      q.deleteBoardStage.run(reviewId);
+      if (stage === "unreviewed") q.deletePipeline.run(reviewId);
+      else setStage(row, stage);
+      if (stage === "ai_review") void advanceFactory(reviewId, true);
+      publish(reviewId, "board");
+      return summarize(requireReview(reviewId));
+    }
+    if (stage === null || stage === auto) q.deleteBoardStage.run(reviewId);
+    else q.setBoardStage.run(reviewId, stage, auto, Date.now());
+    publish(reviewId, "board");
+    return summarize(row);
+  }
+
+  /** Sync one PR with GitHub; the git fetch and file list only run when the head moved. */
+  async function lightSync(row: ReviewRow): Promise<void> {
+    const pr = await host.call("gh_pr", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
+    if (pr.headRefOid !== row.head_sha) {
+      await syncReview(row.id);
+      return;
+    }
+    // The head did not move, so no fetch; this still keeps the worktree where it belongs.
+    const prepared = await host.call(
+      "repo_prepare",
+      { repoPath: row.repo_path, number: row.number, headSha: row.head_sha, baseRefName: pr.baseRefName, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}`, fetch: false },
+      hostOptions(row),
+    );
+    applyPr(row, pr, prepared);
+    await refreshThreads(requireReview(row.id)).catch((cause: unknown) => bb.log.warn(`threads for ${row.id}: ${errorMessage(cause)}`));
+    publish(row.id, "synced");
+  }
+
+  /** Keep a PR's worktree where `worktreesDir` says, without GitHub or the network. */
+  async function ensureWorktree(row: ReviewRow): Promise<void> {
+    const prepared = await host.call(
+      "repo_prepare",
+      { repoPath: row.repo_path, number: row.number, headSha: row.head_sha, baseRefName: row.base_ref, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}`, fetch: false },
+      hostOptions(row),
+    );
+    if (prepared.worktree === row.worktree) return;
+    for (const stmt of q.clearEnvironments) stmt.run(row.id);
+    q.setWorktree.run(prepared.worktree, row.id);
+    publish(row.id, "synced");
+  }
+
+  type BoardRefreshResult = { synced: number; failed: { reviewId: string; error: string }[] };
+  let boardRefreshing: Promise<BoardRefreshResult> | null = null;
+  /** Sync every PR that is not done, four at a time; callers that overlap share one run. */
+  function refreshBoard(): Promise<BoardRefreshResult> {
+    if (boardRefreshing !== null) return boardRefreshing;
+    boardRefreshing = (async () => {
+      const rows = q.reviews.all();
+      const queue = rows.filter((r) => r.state === "OPEN");
+      const failed: BoardRefreshResult["failed"] = [];
+      let synced = 0;
+      // Merged and closed PRs are not synced, but their worktrees still follow the setting.
+      for (const row of rows.filter((r) => r.state !== "OPEN")) {
+        await ensureWorktree(row).catch((cause: unknown) => bb.log.warn(`worktree for ${row.owner}/${row.repo}#${row.number}: ${errorMessage(cause)}`));
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(4, queue.length) }, async () => {
+          for (let row = queue.shift(); row !== undefined; row = queue.shift()) {
+            try {
+              await lightSync(row);
+              synced++;
+              await advanceFactory(row.id).catch((cause: unknown) => bb.log.warn(`factory ${row.owner}/${row.repo}#${row.number}: ${errorMessage(cause)}`));
+            } catch (cause) {
+              failed.push({ reviewId: row.id, error: errorMessage(cause) });
+              bb.log.warn(`board refresh ${row.owner}/${row.repo}#${row.number}: ${errorMessage(cause)}`);
+            }
+          }
+        }),
+      );
+      return { synced, failed };
+    })().finally(() => {
+      boardRefreshing = null;
+    });
+    return boardRefreshing;
+  }
+
+  if (boardRefresh.trim() !== "") {
+    try {
+      bb.background.schedule("board-refresh", boardRefresh.trim(), async () => {
+        const result = await refreshBoard();
+        if (result.failed.length > 0) throw new Error(`${result.failed.length} of ${result.synced + result.failed.length} PRs failed to sync; first: ${result.failed[0].error}`);
+      });
+    } catch (cause) {
+      bb.log.warn(`board refresh schedule "${boardRefresh}" not registered: ${errorMessage(cause)}`);
+    }
   }
 
   // -- read model ------------------------------------------------------------
@@ -1086,7 +1456,7 @@ export default async function plugin(bb: BbPluginApi) {
       `Your working directory is a detached worktree at the PR head ${row.head_sha}. The merge base with ${row.base_ref} is ${row.base_sha}.`,
       `The full diff is: git diff ${row.base_sha} ${row.head_sha}. One file: git diff ${row.base_sha} ${row.head_sha} -- <path>. Base version of a file: git show ${row.base_sha}:<path>.`,
       "You are read-only: never modify files, never commit, never push. Read files and run read-only commands to verify claims before making them.",
-      "The reviewer attaches code as pills: @-mentions of a line range, a changed file, a changed symbol, a GitHub review thread, or the PR description. Each pill's content arrives with the message as a context block titled \"Context for @<pill>\"; in range excerpts, > marks the selected lines. Treat those blocks as the code the reviewer is pointing at.",
+      "The reviewer attaches code as pills: @-mentions of a line range, a changed file, a commit, a GitHub review thread, or the PR description. Each pill's content arrives with the message as a context block titled \"Context for @<pill>\"; in range excerpts, > marks the selected lines. Treat those blocks as the code the reviewer is pointing at.",
       "Answer for the reviewer: specific, concise, citing paths and line numbers. When asked to draft a GitHub comment, write ready-to-post Markdown with no preamble.",
       "",
       "PR description:",
@@ -1182,6 +1552,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...execution,
       ...(permissionMode ? { permissionMode } : {}),
       title: `Review Desk ${row.owner}/${row.repo}#${row.number}: ${provider.displayName}`,
+      sectionId: await sectionId(),
       visibility: hideSeatThreads ? "hidden" : "visible",
       // The intro is agent-only context so the chat transcript starts with the
       // reviewer's own question.
@@ -1218,68 +1589,13 @@ export default async function plugin(bb: BbPluginApi) {
     publish(reviewId, "seats");
   }
 
-  // -- codemap ---------------------------------------------------------------
-
-  function codemapState(row: ReviewRow): CodemapState {
-    const cached = q.codemap.get(row.id);
-    const notBuilt = (): CodemapState => (codemapBuilds.has(row.id) ? { status: "building", codemap: null, error: null, updatedAt: null } : { status: "missing", codemap: null, error: null, updatedAt: null });
-    if (cached === undefined || cached.head_sha !== row.head_sha) return notBuilt();
-    if (cached.status === "ready") {
-      const codemap = parseJson<Codemap | null>(cached.json, null);
-      // A map built by an older version of the builder is rebuilt, not shown.
-      if (codemap === null || codemap.version !== CODEMAP_VERSION) return notBuilt();
-      return { status: "ready", codemap, error: null, updatedAt: cached.updated_at };
-    }
-    if (cached.status === "building") return { status: "building", codemap: null, error: null, updatedAt: cached.updated_at };
-    return { status: "failed", codemap: null, error: cached.error, updatedAt: cached.updated_at };
-  }
-
-  function startCodemap(row: ReviewRow): void {
-    if (codemapBuilds.has(row.id)) return;
-    codemapBuilds.add(row.id);
-    q.setCodemap.run(row.id, row.head_sha, "building", null, null, Date.now());
-    publish(row.id, "codemap");
-    void (async () => {
-      try {
-        const files = await filesFor(row);
-        const wasmDir = wasmDirCandidates().find((dir) => existsSync(`${dir}/tree-sitter.wasm`)) ?? null;
-        const codemap = await host.call("codemap", { worktree: row.worktree, baseSha: row.base_sha, headSha: row.head_sha, files, wasmDir }, hostOptions(row));
-        q.setCodemap.run(row.id, row.head_sha, "ready", JSON.stringify(codemap), null, Date.now());
-      } catch (cause) {
-        q.setCodemap.run(row.id, row.head_sha, "failed", null, errorMessage(cause), Date.now());
-      } finally {
-        codemapBuilds.delete(row.id);
-        publish(row.id, "codemap");
-        // A queued guide waits for the codemap; it can go now.
-        pumpHelper(row.id);
-      }
-    })();
-  }
-
   // -- code pills (mention provider) -----------------------------------------
   //
-  // `@` in a seat's composer searches this PR: changed files, changed symbols
-  // from the codemap, GitHub review threads, the description, and explicit
+  // `@` in a seat's composer searches this PR: changed files, GitHub review
+  // threads, the description, commits, and explicit
   // `path:10-20` ranges. The picked item becomes a pill in the draft; bb calls
   // `resolve` when the message is sent and attaches the text as agent-only
   // context, so the transcript shows the pill and the analyst sees the code.
-
-  interface ChangedSymbol { path: string; qualified: string; kind: string; status: string; start: number; end: number; oldStart: number | null; oldEnd: number | null; changedLines: number; fanIn: number }
-  const symbolCache = new Map<string, { headSha: string; symbols: ChangedSymbol[] }>();
-
-  function changedSymbols(row: ReviewRow): ChangedSymbol[] {
-    const cached = symbolCache.get(row.id);
-    if (cached !== undefined && cached.headSha === row.head_sha) return cached.symbols;
-    const state = codemapState(row);
-    if (state.status !== "ready" || state.codemap === null) return [];
-    const symbols = state.codemap.files.flatMap((f) =>
-      f.symbols
-        .filter((s) => s.status !== "unchanged")
-        .map((s) => ({ path: f.path, qualified: s.qualified.replace(/\s+/g, " "), kind: s.kind, status: s.status, start: s.start, end: s.end, oldStart: s.oldStart, oldEnd: s.oldEnd, changedLines: s.changedLines, fanIn: s.fanIn })),
-    );
-    symbolCache.set(row.id, { headSha: row.head_sha, symbols });
-    return symbols;
-  }
 
   /** The review a composer talks about: the seat's review for a thread composer, else the project's latest review. */
   function reviewForComposer(ctx: PluginMentionSearchContext): ReviewRow | null {
@@ -1343,19 +1659,6 @@ export default async function plugin(bb: BbPluginApi) {
     }
     groups.push(fileItems);
 
-    const symbolItems: ScoredItem[] = [];
-    for (const sym of changedSymbols(row)) {
-      const s = Math.max(matchScore(sym.qualified.split("::").pop() ?? sym.qualified, query, 9), matchScore(sym.qualified, query, 5));
-      if (s === 0) continue;
-      // Removed symbols only exist on the base side.
-      const removed = sym.status === "removed" && sym.oldStart !== null && sym.oldEnd !== null;
-      const ref: MentionRef = removed
-        ? { kind: "symbol", reviewId: row.id, path: sym.path, qualified: sym.qualified, startLine: sym.oldStart ?? 1, endLine: sym.oldEnd ?? 1, side: "old" }
-        : { kind: "symbol", reviewId: row.id, path: sym.path, qualified: sym.qualified, startLine: sym.start, endLine: sym.end, side: "new" };
-      symbolItems.push(scored(ref, sym.qualified, `${sym.kind} ${sym.status} · ${sym.path}:${ref.startLine}-${ref.endLine}${removed ? " (base)" : ""}`, "Workflow", s + Math.min(sym.changedLines, 200) / 100 + Math.min(sym.fanIn, 50) / 50));
-    }
-    groups.push(symbolItems);
-
     const threadItems: ScoredItem[] = [];
     for (const t of cachedThreads(row)) {
       const first = t.comments[0];
@@ -1379,7 +1682,7 @@ export default async function plugin(bb: BbPluginApi) {
     groups.push(commitItems);
 
     // Browsing (empty query) shows a mix; a query ranks everything together.
-    const caps = browsing ? [3, 8, 6, 4, 1, 3] : [5, 40, 40, 40, 1, 10];
+    const caps = browsing ? [3, 8, 4, 1, 3] : [5, 40, 40, 1, 10];
     const items = groups.flatMap((group, i) => group.sort((a, b) => b.score - a.score).slice(0, caps[i]));
     if (!browsing) items.sort((a, b) => b.score - a.score);
     return items.slice(0, 24).map(({ score: _score, ...rest }) => rest);
@@ -1425,9 +1728,8 @@ export default async function plugin(bb: BbPluginApi) {
         const MAX = 250;
         const slice = lines.slice(start - 1, Math.min(end, start - 1 + MAX));
         const width = String(end).length;
-        const sym = changedSymbols(row).find((s) => s.path === ref.path && s.qualified === ref.qualified);
         return [
-          `${prefix} — ${ref.qualified}${sym ? ` (${sym.kind}, ${sym.status}, ${sym.changedLines} changed lines, fan-in ${sym.fanIn})` : ""} in ${ref.path} lines ${start}-${end} at ${ref.side === "old" ? `base ${short(row.base_sha)}` : `head ${short(row.head_sha)}`}:`,
+          `${prefix} — ${ref.qualified} in ${ref.path} lines ${start}-${end} at ${ref.side === "old" ? `base ${short(row.base_sha)}` : `head ${short(row.head_sha)}`}:`,
           "```",
           slice.map((line, i) => `${String(start + i).padStart(width)}| ${line}`).join("\n"),
           ...(end - start + 1 > MAX ? [`... truncated after ${MAX} lines; read the file for the rest`] : []),
@@ -1496,7 +1798,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   function helperIntro(row: ReviewRow): string {
     return [
-      `You are the helper for pull request #${row.number} of ${row.owner}/${row.repo}: "${row.title}". You get one job per message. Each job names the fenced block tag it wants; answer with exactly one fenced block of that tag containing JSON, and nothing else before or after it.`,
+      `You are the helper for pull request #${row.number} of ${row.owner}/${row.repo}: "${row.title}". You get one job per message, and each job says exactly how to answer.`,
       `Your working directory is a detached worktree at the PR head ${row.head_sha}; the merge base with ${row.base_ref} is ${row.base_sha}. Full diff: git diff ${row.base_sha} ${row.head_sha}. One file: git diff ${row.base_sha} ${row.head_sha} -- <path>. Base version: git show ${row.base_sha}:<path>.`,
       "You are read-only: never modify files, never commit, never push. Read the code before writing; every line number you cite must exist in the diff.",
     ].join("\n");
@@ -1547,7 +1849,7 @@ export default async function plugin(bb: BbPluginApi) {
   /** Reviews whose helper job is being prepared: the prompt is building, the job marker is not set yet. */
   const helperSending = new Set<string>();
 
-  /** The helper takes one job at a time; the brief, the guide, and notes all wait for it. */
+  /** The helper takes one job at a time; the map and notes wait for it. */
   function helperBusy(row: ReviewRow): boolean {
     return helperSending.has(row.id) || (q.helper.get(row.id)?.job ?? null) !== null;
   }
@@ -1566,35 +1868,35 @@ export default async function plugin(bb: BbPluginApi) {
     helperSending.delete(row.id);
   }
 
-  /**
-   * Send the next waiting job once the helper is free. The brief goes before
-   * the guide; the guide also waits for the codemap, which it reads for
-   * orientation. Called when a job completes and when a codemap build ends.
-   */
+  /** Send a waiting map once the helper is free. Called when a job completes and when a map is asked for. */
   function pumpHelper(reviewId: string): void {
-    const wanted = helperWanted.get(reviewId);
-    if (wanted === undefined || wanted.size === 0) return;
+    if (!mapWanted.has(reviewId)) return;
     const row = q.review.get(reviewId);
     if (row === undefined) {
-      helperWanted.delete(reviewId);
+      mapWanted.delete(reviewId);
       return;
     }
     if (helperBusy(row)) return;
-    if (wanted.has("brief")) {
-      wanted.delete("brief");
-      void sendBrief(row);
-      return;
-    }
-    if (wanted.has("guide")) {
-      const codemap = codemapState(row);
-      if (codemap.status === "missing") {
-        startCodemap(row);
-        return;
+    mapWanted.delete(reviewId);
+    void sendMap(row);
+  }
+
+  let sectionLookup: Promise<string | null> | null = null;
+  /** The sidebar section Review Desk's threads go in, created on first use; null when the setting is empty or the lookup fails. */
+  function sectionId(): Promise<string | null> {
+    const name = threadSection.trim();
+    if (name === "") return Promise.resolve(null);
+    sectionLookup ??= (async () => {
+      try {
+        const existing = (await bb.sdk.threadSections.list()).find((s) => s.name === name);
+        return existing?.id ?? (await bb.sdk.threadSections.create({ name })).id;
+      } catch (cause) {
+        bb.log.warn(`thread section "${name}": ${errorMessage(cause)}`);
+        sectionLookup = null;
+        return null;
       }
-      if (codemap.status === "building") return;
-      wanted.delete("guide");
-      void sendGuide(row);
-    }
+    })();
+    return sectionLookup;
   }
 
   async function laneSend(lane: Lane, row: ReviewRow, job: string, text: string): Promise<void> {
@@ -1640,6 +1942,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...(lane.model.trim() !== "" ? { model: lane.model.trim() } : {}),
       ...(lane.reasoningLevel === undefined ? {} : { reasoningLevel: lane.reasoningLevel }),
       title: `Review Desk ${row.owner}/${row.repo}#${row.number}: ${lane.title}`,
+      sectionId: await sectionId(),
       visibility: hideSeatThreads ? "hidden" : "visible",
       input: [{ type: "text", text: intro, mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
     });
@@ -1664,419 +1967,259 @@ export default async function plugin(bb: BbPluginApi) {
     return start !== -1 && end > start ? text.slice(start, end + 1) : null;
   }
 
-  // -- brief: slop signals + plain-English summary ---------------------------
-
-  const signalRuns = new Set<string>();
-
-  function briefState(row: ReviewRow): BriefState {
-    const b = q.brief.get(row.id);
-    const signalsCurrent = b !== undefined && b.head_sha === row.head_sha;
-    const signalsStatus = signalRuns.has(row.id) ? "computing" : !signalsCurrent ? "missing" : b.signals_status === "ready" || b.signals_status === "failed" ? b.signals_status : "missing";
-    const briefStatus = b === undefined ? "missing" : b.brief_status === "writing" || b.brief_status === "ready" || b.brief_status === "failed" ? b.brief_status : "missing";
-    return {
-      headSha: row.head_sha,
-      signalsStatus,
-      signals: signalsCurrent && b.signals_status === "ready" ? parseJson<Record<string, unknown> | null>(b.signals_json, null) : null,
-      signalsError: signalsCurrent ? b.signals_error : null,
-      briefStatus,
-      brief: b?.brief_status === "ready" ? parseJson<Record<string, unknown> | null>(b.brief_json, null) : null,
-      briefError: b?.brief_error ?? null,
-      stale: b?.brief_status === "ready" && b.brief_head_sha !== row.head_sha,
-      updatedAt: b?.updated_at ?? null,
-    };
-  }
-
-  async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-    const out: R[] = new Array(items.length);
-    let next = 0;
-    await Promise.all(
-      Array.from({ length: Math.min(limit, items.length) }, async () => {
-        while (next < items.length) {
-          const i = next++;
-          out[i] = await fn(items[i]);
-        }
-      }),
-    );
-    return out;
-  }
-
-  function startSignals(row: ReviewRow): void {
-    if (signalRuns.has(row.id)) return;
-    signalRuns.add(row.id);
-    q.ensureBrief.run(row.id, row.head_sha, Date.now());
-    publish(row.id, "brief");
-    void (async () => {
-      try {
-        const files = (await filesFor(row)).filter((f) => !f.binary && f.additions + f.deletions > 0);
-        const patches = new Map<string, string>();
-        await mapLimit(files, 8, async (f) => {
-          const result = await host.call("git_patch", { worktree: row.worktree, baseSha: row.base_sha, headSha: row.head_sha, path: f.path, oldPath: f.oldPath }, hostOptions(row));
-          patches.set(f.path, result.patch);
-        });
-        const codemap = codemapState(row);
-        const moduleOf = codemap.status === "ready" && codemap.codemap !== null ? new Map(codemap.codemap.files.map((f) => [f.path, f.module])) : null;
-        const report = computeSlop({ files: await filesFor(row), patches, title: row.title, body: row.body, moduleOf });
-        q.setSignals.run(row.head_sha, "ready", JSON.stringify(report), null, Date.now(), row.id);
-      } catch (cause) {
-        q.setSignals.run(row.head_sha, "failed", null, errorMessage(cause), Date.now(), row.id);
-      } finally {
-        signalRuns.delete(row.id);
-        publish(row.id, "brief");
-      }
-    })();
-  }
-
-  function signalsSummary(report: SlopReport | null): string {
-    if (report === null) return "(not computed)";
-    if (report.signals.length === 0) return "none";
-    return report.signals.map((s) => `- ${s.label} (${s.count}): ${s.evidence.slice(0, 3).map((e) => (e.line === null ? e.note : `${e.path}:${e.line} ${e.note}`)).join("; ")}`).join("\n");
-  }
-
-  /**
-   * The codemap as text for a helper prompt. The brief gets the top symbols
-   * overall; the guide (`perFile`) gets every file's changed symbols and the
-   * references between modules, so it can place files and trace the flow.
-   */
-  function codemapDigest(row: ReviewRow, options: { perFile?: number } = {}): string {
-    const state = codemapState(row);
-    if (state.status !== "ready" || state.codemap === null) return "(codemap not built yet)";
-    const c = state.codemap;
-    const lines = [
-      `Codemap (${c.engine}): ${c.stats.files} files, ${c.stats.symbols} symbols (+${c.stats.added} ~${c.stats.modified} -${c.stats.removed}), ${c.edges.length} references between changed symbols.`,
-      "Module order (dependencies first; tests, config, and docs after the code):",
-      ...c.readingOrder.map((m, i) => `  ${i + 1}. ${m.module} (${m.paths.length} files): ${m.reason}`),
-      "Hotspots (changed lines weighted by fan-in from the repository; tests count a quarter):",
-      ...c.hotspots.slice(0, 10).map((h) => `  ${h.path}#${h.qualified} (${h.changedLines} changed lines, fan-in ${h.fanIn})`),
-    ];
-    if (options.perFile === undefined) {
-      lines.push(
-        "Changed symbols (top 60 by changed lines):",
-        ...[...changedSymbols(row)].sort((a, b) => b.changedLines - a.changedLines).slice(0, 60).map((s) => `  ${s.status.padEnd(8)} ${s.kind.padEnd(9)} ${s.qualified}  ${s.path}:${s.status === "removed" ? `${s.oldStart}-${s.oldEnd} (base)` : `${s.start}-${s.end}`}`),
-      );
-      return lines.join("\n");
-    }
-    lines.push("Changed symbols per file (+ added, ~ modified, - removed; head lines, base lines for removed):");
-    for (const f of c.files) {
-      const changed = f.symbols.filter((s) => s.status !== "unchanged").sort((a, b) => b.changedLines - a.changedLines);
-      if (changed.length === 0) {
-        lines.push(`  ${f.path} [${f.role}, ${f.changedLines} lines]: no symbol-level change`);
-        continue;
-      }
-      const shown = changed.slice(0, options.perFile).map((s) => `${s.status === "added" ? "+" : s.status === "removed" ? "-" : "~"}${s.kind} ${s.qualified} ${s.status === "removed" ? `${s.oldStart}-${s.oldEnd}` : `${s.start}-${s.end}`}`);
-      lines.push(`  ${f.path} [${f.role}, ${f.changedLines} lines]: ${shown.join("; ")}${changed.length > shown.length ? `; and ${changed.length - shown.length} more` : ""}`);
-    }
-    const moduleOf = new Map(c.files.map((f) => [f.path, f.module]));
-    const between = new Map<string, number>();
-    for (const e of c.edges) {
-      const from = moduleOf.get(e.from.split("#")[0]);
-      const to = moduleOf.get(e.to.split("#")[0]);
-      if (from === undefined || to === undefined || from === to) continue;
-      const key = `${from} -> ${to}`;
-      between.set(key, (between.get(key) ?? 0) + 1);
-    }
-    if (between.size > 0) {
-      lines.push("References between modules (from -> to: count):");
-      for (const [key, n] of [...between.entries()].sort((a, b) => b[1] - a[1]).slice(0, 40)) lines.push(`  ${key}: ${n}`);
-    }
-    return lines.join("\n");
-  }
-
-  async function briefPrompt(row: ReviewRow): Promise<string> {
-    const files = await filesFor(row);
-    const state = briefState(row);
-    const report = state.signals as unknown as SlopReport | null;
-    return [
-      `Job: write the brief for this PR. Reply with exactly one fenced block tagged ${BRIEF_FENCE} containing this JSON:`,
-      "{",
-      '  "summary": string,',
-      '  "areas": [{ "module": string, "what": string, "path": string }],',
-      '  "claims": [{ "claim": string, "verdict": "matches" | "partly" | "no-evidence" | "contradicted", "evidence": [{ "path": string, "line": number }], "note": string }],',
-      '  "ai": { "score": number, "reasons": [{ "reason": string, "evidence": [{ "path": string, "line": number }] }] }',
-      "}",
-      "",
-      "summary: plain English for a reader who knows this codebase but has not read the diff. Say what the code does now that it did not do before, and what changes for callers or operators. 5 to 10 sentences, each under 20 words, active voice, everyday words. Name code by its identifiers. No marketing words (robust, seamless, comprehensive, leverage, enhance). Describe the diff, not the description.",
-      "areas: one entry per module touched, at most 8, what changed there in one sentence, path = the file that matters most.",
-      "claims: every concrete claim the PR description makes, at most 12. Check each against the diff and the code. verdict: matches, partly, no-evidence (the diff has nothing for it), or contradicted. evidence: head line numbers in changed files. note: one sentence when the verdict is not matches, else empty.",
-      "ai.score: how much this PR reads like unedited AI output, 0 = clearly written and edited by a person, 100 = raw generation. Judge the comments, naming, defensive noise, tests, and description shape from the code itself. Give exactly 3 reasons with evidence lines. The deterministic signals below are for orientation; verify before agreeing with them.",
-      "",
-      `Deterministic signals (score ${report?.score ?? "n/a"}):`,
-      signalsSummary(report),
-      "",
-      `PR title: ${row.title}`,
-      "PR description:",
-      row.body.trim() === "" ? "(none)" : row.body.trim().slice(0, 8000),
-      "",
-      `Changed files (${files.length}):`,
-      ...files.slice(0, 150).map((f) => `  ${f.status.padEnd(8)} ${f.path} (+${f.additions} -${f.deletions})`),
-      ...(files.length > 150 ? [`  ... ${files.length - 150} more`] : []),
-      "",
-      codemapDigest(row),
-    ].join("\n");
-  }
-
-  const rawBriefSchema = z.object({
-    summary: z.string().optional(),
-    areas: z.array(z.object({ module: z.coerce.string(), what: z.string().optional(), path: z.string().nullable().optional() })).optional(),
-    claims: z.array(z.object({ claim: z.string(), verdict: z.string().optional(), evidence: z.array(z.object({ path: z.string(), line: z.coerce.number().nullable().optional() })).optional(), note: z.string().nullable().optional() })).optional(),
-    ai: z.object({ score: z.coerce.number().optional(), reasons: z.array(z.object({ reason: z.string(), evidence: z.array(z.object({ path: z.string(), line: z.coerce.number().nullable().optional() })).optional() })).optional() }).optional(),
-  });
-
-  function normalizeBrief(raw: unknown, files: ChangedFile[]): Brief {
-    const parsed = rawBriefSchema.parse(raw);
-    const paths = new Set(files.map((f) => f.path));
-    const resolvePath = (p: string): string | null => {
-      const clean = p.trim().replace(/^\.\//, "");
-      if (paths.has(clean)) return clean;
-      return files.find((f) => f.path.endsWith(`/${clean}`))?.path ?? null;
-    };
-    const evidence = (list: { path: string; line?: number | null }[] | undefined): BriefEvidence[] =>
-      (list ?? []).slice(0, 6).map((e) => {
-        const resolved = resolvePath(e.path);
-        return { path: resolved ?? e.path, line: typeof e.line === "number" && e.line > 0 ? Math.round(e.line) : null, found: resolved !== null };
-      });
-    const verdicts = new Set(["matches", "partly", "no-evidence", "contradicted"]);
-    return {
-      summary: (parsed.summary ?? "").trim(),
-      areas: (parsed.areas ?? []).slice(0, 8).map((a) => ({ module: a.module, what: (a.what ?? "").trim(), path: a.path ? resolvePath(a.path) : null })),
-      claims: (parsed.claims ?? []).slice(0, 12).map((c) => ({
-        claim: c.claim.trim(),
-        verdict: (verdicts.has((c.verdict ?? "").toLowerCase()) ? (c.verdict ?? "").toLowerCase() : "no-evidence") as Brief["claims"][number]["verdict"],
-        evidence: evidence(c.evidence),
-        note: (c.note ?? "").trim(),
-      })),
-      ai: {
-        score: Math.max(0, Math.min(100, Math.round(parsed.ai?.score ?? 0))),
-        reasons: (parsed.ai?.reasons ?? []).slice(0, 4).map((r) => ({ reason: r.reason.trim(), evidence: evidence(r.evidence) })),
-      },
-    };
-  }
-
-  /** Mark the brief as writing and send it, or queue it when the helper has another job. */
-  async function writeBrief(row: ReviewRow): Promise<void> {
-    q.ensureBrief.run(row.id, row.head_sha, Date.now());
-    const current = q.brief.get(row.id);
-    if (current?.brief_status === "writing") return;
-    const busy = helperBusy(row);
-    q.setBrief.run("writing", row.head_sha, null, null, null, Date.now(), row.id);
-    publish(row.id, "brief");
-    if (busy) {
-      want(row.id, "brief");
-      return;
-    }
-    await sendBrief(row);
-  }
-
-  async function sendBrief(row: ReviewRow): Promise<void> {
-    await runHelperJob(row, "brief", () => briefPrompt(row), (message) => {
-      q.setBrief.run("failed", row.head_sha, null, null, message, Date.now(), row.id);
-      publish(row.id, "brief");
-    });
-  }
-
-  async function completeBrief(reviewId: string, text: string | null, error: string | null): Promise<void> {
-    const row = q.review.get(reviewId);
-    const current = q.brief.get(reviewId);
-    if (row === undefined || current === undefined || current.brief_status !== "writing") return;
-    if (error !== null || text === null) {
-      q.setBrief.run("failed", current.brief_head_sha, null, text, error ?? "the helper returned nothing", Date.now(), reviewId);
-    } else {
-      try {
-        const json = extractFenced(text, BRIEF_FENCE);
-        if (json === null) throw new Error(`no ${BRIEF_FENCE} block in the reply`);
-        const brief = normalizeBrief(JSON.parse(json), await filesFor(row));
-        if (brief.summary === "") throw new Error("the brief has no summary");
-        q.setBrief.run("ready", current.brief_head_sha, JSON.stringify(brief), text, null, Date.now(), reviewId);
-      } catch (cause) {
-        q.setBrief.run("failed", current.brief_head_sha, null, text, `could not read the brief: ${errorMessage(cause)}`, Date.now(), reviewId);
-      }
-    }
-    publish(reviewId, "brief");
-    pumpHelper(reviewId);
-  }
-
-  // -- guide: the helper's map over the codemap -------------------------------
+  // -- map: the helper's diffmap of the PR ------------------------------------
   //
-  // The codemap says which symbols changed where. The guide, written by the
-  // helper from the diff with the codemap as orientation, says what the PR
-  // does, how the changed code runs, in what order to read the files, and what
-  // each file does in this PR. One job on the helper lane, after the brief.
+  // A diffmap spec (github.com/tanishqkancharla/diffmap) of the PR at a head,
+  // written by the helper with diffmap's own generate-diffmap skill (bundled
+  // in skills/) and kept per review. The Map tab renders it with diffmap's
+  // viewer. An older map stays on screen while a newer one is queued or
+  // writing.
 
-  function guideState(row: ReviewRow): GuideState {
-    const g = q.guide.get(row.id);
-    const guide = g?.json ? parseJson<Record<string, unknown> | null>(g.json, null) : null;
-    const stale = guide !== null && g?.json_head_sha !== row.head_sha;
-    if (g === undefined || g.head_sha !== row.head_sha) {
-      // No status for this head yet; an older guide may still be on file.
-      return { status: helperWanted.get(row.id)?.has("guide") ? "queued" : "missing", guide, error: null, stale, updatedAt: g?.updated_at ?? null };
-    }
-    const status = g.status === "queued" || g.status === "writing" || g.status === "ready" || g.status === "failed" ? g.status : "missing";
-    return { status, guide, error: status === "failed" ? g.error : null, stale, updatedAt: g.updated_at };
+  const MAP_OPEN = "<<<DIFFMAP";
+  const MAP_CLOSE = "DIFFMAP>>>";
+
+  function mapState(row: ReviewRow): MapState {
+    const m = q.map.get(row.id);
+    if (m === undefined) return { status: "missing", headSha: null, stale: false, markdown: null, viewerUrl: null, viewerError: null, error: null, updatedAt: null };
+    const known = m.status === "queued" || m.status === "writing" || m.status === "ready" || m.status === "failed" ? m.status : "missing";
+    // A finished status about an older head says nothing about this one.
+    const status = m.head_sha !== row.head_sha && (known === "ready" || known === "failed") ? "missing" : known;
+    return {
+      status,
+      headSha: m.markdown_head_sha,
+      stale: m.markdown !== null && m.markdown_head_sha !== row.head_sha,
+      markdown: m.markdown,
+      viewerUrl: viewerUrl(row),
+      viewerError: m.markdown === null ? null : viewerGistErrors.get(row.id) ?? (viewerReady ? null : viewerError ?? "the map viewer is being built (first time only)"),
+      error: status === "failed" ? m.error : null,
+      updatedAt: m.updated_at,
+    };
   }
 
-  /** Ask for the guide at the current head; `force` rewrites one that is already current. */
-  function wantGuide(row: ReviewRow, force: boolean): void {
-    const state = guideState(row);
-    if (state.status === "writing" || state.status === "queued") return;
-    if (!force && state.status === "ready" && !state.stale) return;
-    want(row.id, "guide");
-    q.setGuideStatus.run(row.id, row.head_sha, "queued", null, Date.now());
-    publish(row.id, "guide");
+  /** Fixes sent for a review's latest map after diffmap rejected it; a fresh map starts over. */
+  const mapFixes = new Map<string, number>();
+  const MAX_MAP_FIXES = 2;
+
+  /** Queue the map at the current head; `force` writes it again even when one is on file. */
+  function wantMap(row: ReviewRow, force: boolean): void {
+    const state = mapState(row);
+    if (!force && (state.status === "queued" || state.status === "writing" || state.status === "ready")) return;
+    if (state.status === "writing") return;
+    q.setMapStatus.run(row.id, row.head_sha, "queued", null, Date.now());
+    mapFixes.delete(row.id);
+    mapWanted.add(row.id);
+    publish(row.id, "map");
     pumpHelper(row.id);
   }
 
-  async function sendGuide(row: ReviewRow): Promise<void> {
-    q.setGuideStatus.run(row.id, row.head_sha, "writing", null, Date.now());
-    publish(row.id, "guide");
-    await runHelperJob(row, "guide", () => guidePrompt(row), (message) => {
-      q.setGuideStatus.run(row.id, row.head_sha, "failed", message, Date.now());
-      publish(row.id, "guide");
-    });
+  /** The map is written on first look at a new head when autoMap is on; rewrites go through map_write. */
+  function mapGet(row: ReviewRow): MapState {
+    ensureViewer();
+    const state = mapState(row);
+    if (autoMap && state.status === "missing") wantMap(row, false);
+    // A map re-queued by a plugin reload goes out on the first look at the review.
+    else if (state.status === "queued") {
+      mapWanted.add(row.id);
+      pumpHelper(row.id);
+    }
+    return mapState(row);
   }
 
-  async function guidePrompt(row: ReviewRow): Promise<string> {
+  async function mapPrompt(row: ReviewRow): Promise<string> {
     const files = await filesFor(row);
-    const codemap = codemapState(row).codemap;
-    const roleOf = new Map((codemap?.files ?? []).map((f) => [f.path, f.role]));
+    const commits = parseJson<Review["commits"]>(row.commits_json, []);
     return [
-      `Job: write the reading guide for this PR. Reply with exactly one fenced block tagged ${GUIDE_FENCE} containing this JSON:`,
-      "{",
-      '  "overview": string,',
-      '  "flow": [{ "path": string, "symbol": string, "what": string }],',
-      '  "steps": [{ "title": string, "why": string, "paths": [string] }],',
-      '  "files": [{ "path": string, "role": "core" | "types" | "wiring" | "tests" | "docs" | "config" | "generated" | "moved", "what": string, "skim": boolean }]',
-      "}",
+      "Job: write a diffmap walkthrough of this pull request for the person reviewing it.",
+      "Use the generate-diffmap skill for the spec's shape, prose, diagrams, call stacks, code fences, and source references. This is a walkthrough of an existing pull request, so:",
+      `- Explain the PR as it stands at head ${row.head_sha}. Start from what changes for the person using it, then work down the layers as far as a reviewer needs.`,
+      "- Write one phase per logical part of the change, in the order a reviewer should read them, each marked ✅ because the code exists. Use the PR's commits as phases only when they are meaningful steps.",
+      `- End each phase with a changes fence whose first line is ${row.base_sha}..${row.head_sha}, followed by that phase's files in reading order.`,
+      `- References: [[path#symbol]] and [[path#L10-L20]] read the file at the head; [[${row.base_sha}..${row.head_sha}:path]] opens that file's diff in this PR. A single sha, [[sha:path]], means the file as changed in that one commit, so use it only for a file that commit touches.`,
+      `- Do not write any file, do not run diffmap serve or share, and do not commit. Reply with the whole spec between a line containing only ${MAP_OPEN} and a line containing only ${MAP_CLOSE}, with nothing before or after.`,
       "",
-      "The reviewer reads the diff with this guide beside it. It answers three questions: what is going on, in what order to read the files, and what each file does in this PR. Write from the diff and the code, not from the description.",
-      "",
-      "overview: 4 to 8 sentences, each under 20 words. First the one-sentence gist. Then the shape of the change: what was added, moved, removed, or rewired, and where the new behavior lives. Then what to hold in mind while reading: an invariant, a changed contract, a hot path. Name code by its identifiers. Everyday words, active voice, no marketing words (robust, seamless, comprehensive, leverage, enhance).",
-      "flow: the runtime path through the changed code, in call order, 3 to 10 hops. Each hop is one changed or newly called symbol: path = the changed file that holds it, symbol = its qualified name as the codemap spells it when possible, what = one sentence on what happens there and what it hands to the next hop. Skip tests, docs, and config. Empty when the PR has no runtime path (docs, config, pure renames).",
-      "steps: the reading order, 3 to 8 steps. Group files so each step is one idea a reader can hold: contracts and types first, then the core logic, then the callers and wiring that adopt it, then tests, then docs and config. title: at most 8 words. why: 1 to 3 sentences on what happens in this group and why it is read at this point. paths: changed files only, in the order to read them inside the step. Every file that is not skim appears in exactly one step; skim files may share one last step.",
-      "files: one entry for every changed file, no exceptions. role: core = the logic that changes behavior; types = structs, traits, interfaces, schemas, protos; wiring = callers, constructors, exports, registrations, CLI or config plumbing that adopts the change; tests; docs; config = build, CI, deployment, lockfiles; generated = machine-written output; moved = a file whose content moved with little change. what: one sentence, under 25 words, on what this file does in this PR: what it now does that it did not before, or what was removed. For a moved file, say where it came from. skim: true when the change is mechanical (rename, import shuffle, lockfile, formatting, moved without edits) and the reviewer can pass it quickly.",
-      "Read the diff before writing: the whole change, then per file where the summary below is not enough. The codemap below is deterministic orientation: which symbols changed where, who references whom, and a dependency order between modules. Trust the code over it.",
-      "",
-      `PR title: ${row.title}`,
-      "PR description (context only; verify against the code):",
-      row.body.trim() === "" ? "(none)" : row.body.trim().slice(0, 6000),
-      "",
-      `Changed files (${files.length}), with the codemap's role guess:`,
-      ...files.slice(0, 300).map((f) => `  ${f.status.padEnd(8)} ${(roleOf.get(f.path) ?? fileRole(f.path)).padEnd(9)} ${f.path}${f.oldPath && f.oldPath !== f.path ? ` (from ${f.oldPath})` : ""} (+${f.additions} -${f.deletions})`),
-      ...(files.length > 300 ? [`  ... ${files.length - 300} more`] : []),
-      "",
-      codemapDigest(row, { perFile: 8 }),
+      `PR: ${row.owner}/${row.repo}#${row.number} "${row.title}"${row.author ? ` by ${row.author}` : ""}. Description and conversation: gh pr view ${row.number} --repo ${row.owner}/${row.repo} --comments`,
+      `Commits (${commits.length}):`,
+      ...commits.slice(-40).map((c) => `  ${c.sha.slice(0, 10)} ${c.title}`),
+      `Changed files (${files.length}):`,
+      ...files.slice(0, 150).map((f) => `  ${f.status.padEnd(8)} ${f.path} (+${f.additions} -${f.deletions})`),
+      ...(files.length > 150 ? [`  ... ${files.length - 150} more`] : []),
     ].join("\n");
   }
 
-  const rawGuideSchema = z.object({
-    overview: z.string().optional(),
-    flow: z.array(z.object({ path: z.string().optional(), symbol: z.string().optional(), what: z.string().optional() })).optional(),
-    steps: z.array(z.object({ title: z.string().optional(), why: z.string().optional(), paths: z.array(z.string()).optional() })).optional(),
-    files: z.array(z.object({ path: z.string(), role: z.string().optional(), what: z.string().optional(), skim: z.boolean().optional() })).optional(),
-  });
-
-  /**
-   * The helper's guide made whole: paths resolved to the diff, every changed
-   * file given a line and a place in a step (the codemap fills gaps), flow hops
-   * anchored to their symbol's head line when the codemap has it.
-   */
-  async function normalizeGuide(row: ReviewRow, raw: unknown): Promise<Guide> {
-    const parsed = rawGuideSchema.parse(raw);
-    const files = await filesFor(row);
-    const paths = new Set(files.map((f) => f.path));
-    const resolvePath = (p: string | undefined): string | null => {
-      if (p === undefined) return null;
-      const clean = p.trim().replace(/^\.\//, "").replace(/:\d+(-\d+)?$/, "");
-      if (paths.has(clean)) return clean;
-      const bySuffix = files.filter((f) => f.path.endsWith(`/${clean}`));
-      return bySuffix.length === 1 ? bySuffix[0].path : null;
-    };
-    const codemap = codemapState(row).codemap;
-    const codemapFile = new Map((codemap?.files ?? []).map((f) => [f.path, f]));
-    const fallbackRole = (path: string): GuideRole => {
-      const role = codemapFile.get(path)?.role ?? fileRole(path);
-      return role === "code" ? "core" : role;
-    };
-    const fallbackWhat = (path: string): string => {
-      const file = files.find((f) => f.path === path);
-      const changed = codemapFile.get(path)?.symbols.filter((s) => s.status !== "unchanged") ?? [];
-      if (file?.status === "deleted") return "Removed.";
-      if (file?.status === "renamed" && changed.length === 0) return `Moved from ${file.oldPath}.`;
-      if (changed.length === 0) return file?.status === "added" ? "New file." : "Edited.";
-      const part = (status: string, verb: string) => {
-        const list = changed.filter((s) => s.status === status);
-        return list.length === 0 ? null : `${verb} ${list.slice(0, 3).map((s) => s.name).join(", ")}${list.length > 3 ? ` and ${list.length - 3} more` : ""}`;
-      };
-      return `${[part("added", "Adds"), part("modified", "changes"), part("removed", "removes")].filter((s) => s !== null).join("; ")}.`;
-    };
-    const byPath = new Map<string, GuideFile>();
-    for (const f of parsed.files ?? []) {
-      const path = resolvePath(f.path);
-      if (path === null || byPath.has(path)) continue;
-      const role = (GUIDE_ROLES as readonly string[]).includes(f.role ?? "") ? (f.role as GuideRole) : fallbackRole(path);
-      byPath.set(path, { path, role, what: (f.what ?? "").trim() || fallbackWhat(path), skim: f.skim === true });
-    }
-    for (const f of files) {
-      if (byPath.has(f.path)) continue;
-      const role = fallbackRole(f.path);
-      byPath.set(f.path, { path: f.path, role, what: fallbackWhat(f.path), skim: role === "docs" || role === "config" || role === "generated" });
-    }
-    const placed = new Set<string>();
-    const steps: GuideStep[] = [];
-    for (const s of (parsed.steps ?? []).slice(0, 12)) {
-      const stepPaths: string[] = [];
-      for (const p of s.paths ?? []) {
-        const path = resolvePath(p);
-        if (path === null || placed.has(path)) continue;
-        placed.add(path);
-        stepPaths.push(path);
-      }
-      if (stepPaths.length === 0) continue;
-      steps.push({ title: (s.title ?? "").trim().slice(0, 80) || `Step ${steps.length + 1}`, why: (s.why ?? "").trim(), paths: stepPaths });
-    }
-    const rest = files.map((f) => f.path).filter((p) => !placed.has(p));
-    const restRead = rest.filter((p) => byPath.get(p)?.skim !== true);
-    const restSkim = rest.filter((p) => byPath.get(p)?.skim === true);
-    if (restRead.length > 0) steps.push({ title: steps.length === 0 ? "Changed files" : "Also changed", why: "Files the guide did not place in a step.", paths: restRead });
-    if (restSkim.length > 0) steps.push({ title: "Skim", why: "Mechanical changes: renames, lockfiles, formatting, generated output.", paths: restSkim });
-    const norm = (s: string) => s.replace(/\s+/g, "").toLowerCase();
-    const flow: GuideHop[] = [];
-    for (const h of (parsed.flow ?? []).slice(0, 12)) {
-      const path = resolvePath(h.path);
-      const symbol = (h.symbol ?? "").trim();
-      if (path === null || symbol === "") continue;
-      const symbols = (codemapFile.get(path)?.symbols ?? []).filter((s) => s.status !== "removed");
-      const wanted = norm(symbol);
-      const last = wanted.split(/::|\./).pop() ?? wanted;
-      const match = symbols.find((s) => norm(s.qualified) === wanted) ?? symbols.find((s) => norm(s.qualified).endsWith(`::${last}`) || norm(s.qualified).endsWith(`.${last}`)) ?? symbols.find((s) => norm(s.name) === last);
-      flow.push({ path, symbol, what: (h.what ?? "").trim(), line: match?.start ?? null });
-    }
-    return { overview: (parsed.overview ?? "").trim(), flow, steps, files: files.map((f) => byPath.get(f.path) as GuideFile) };
+  async function sendMap(row: ReviewRow): Promise<void> {
+    q.setMapStatus.run(row.id, row.head_sha, "writing", null, Date.now());
+    publish(row.id, "map");
+    await runHelperJob(row, "map", () => mapPrompt(row), (message) => {
+      q.setMapStatus.run(row.id, row.head_sha, "failed", message, Date.now());
+      publish(row.id, "map");
+    });
   }
 
-  async function completeGuide(reviewId: string, text: string | null, error: string | null): Promise<void> {
-    const row = q.review.get(reviewId);
-    const g = q.guide.get(reviewId);
-    if (row === undefined || g === undefined || g.status !== "writing") return;
-    try {
-      if (error !== null || text === null) throw new Error(error ?? "the helper returned nothing");
-      const json = extractFenced(text, GUIDE_FENCE);
-      if (json === null) throw new Error(`no ${GUIDE_FENCE} block in the reply`);
-      const guide = await normalizeGuide(row, JSON.parse(json));
-      if (guide.overview === "" && guide.steps.length === 0) throw new Error("the guide has no overview and no steps");
-      q.setGuideReady.run(JSON.stringify(guide), text, Date.now(), reviewId);
-    } catch (cause) {
-      q.setGuideFailed.run(`could not read the guide: ${errorMessage(cause)}`, text, Date.now(), reviewId);
+  /** The spec between the markers; a reply that is only a spec (starts with a heading) is taken whole. */
+  function extractMap(text: string): string | null {
+    const open = text.indexOf(MAP_OPEN);
+    const close = text.lastIndexOf(MAP_CLOSE);
+    if (open !== -1 && close > open) return text.slice(open + MAP_OPEN.length, close).trim();
+    const trimmed = text.trim();
+    return trimmed.startsWith("#") ? trimmed : null;
+  }
+
+  function completeMap(reviewId: string, text: string | null, error: string | null): void {
+    if (q.map.get(reviewId) === undefined) return;
+    const markdown = text === null ? null : extractMap(text);
+    if (error !== null || markdown === null || markdown === "") q.setMapFailed.run(error ?? "the helper returned no spec", text, Date.now(), reviewId);
+    else {
+      q.setMapReady.run(markdown, text ?? "", Date.now(), reviewId);
+      // Build the viewer payload now, so it is ready when the tab opens. diffmap checks
+      // every reference against the repository; a spec it rejects goes back to the helper.
+      if (viewerReady) void viewerGist(reviewId).catch(() => undefined);
     }
-    publish(reviewId, "guide");
+    publish(reviewId, "map");
     pumpHelper(reviewId);
   }
 
-  /** The guide for the UI; queues a write on the first look at a new head when autoGuide is on. */
-  function guideGet(row: ReviewRow): GuideState {
-    const state = guideState(row);
-    if (autoGuide && state.status === "missing") wantGuide(row, false);
-    else if (state.status === "queued") pumpHelper(row.id);
-    return guideState(row);
+  /** Send diffmap's complaint back to the helper that wrote the spec, up to MAX_MAP_FIXES times per map. */
+  function fixMap(reviewId: string, complaint: string): void {
+    const row = q.review.get(reviewId);
+    const fixes = mapFixes.get(reviewId) ?? 0;
+    if (row === undefined || fixes >= MAX_MAP_FIXES || helperBusy(row)) return;
+    mapFixes.set(reviewId, fixes + 1);
+    // The diffmap error names the file and line in diffmap's own source first; the reason is the part after it.
+    const reason = complaint.split("\n").filter((l) => /Error:|\[\[|not |missing|unknown|invalid/i.test(l)).slice(0, 8).join("\n") || complaint.slice(-1500);
+    q.setMapStatus.run(row.id, row.head_sha, "writing", null, Date.now());
+    publish(row.id, "map");
+    void runHelperJob(row, "map", async () => [
+      "Job: diffmap rejected the spec you just wrote when it resolved it against the repository:",
+      "```",
+      reason,
+      "```",
+      "Fix every problem of that kind in the spec (check each reference against the code and the commits it names), then reply with the whole corrected spec between a line containing only <<<DIFFMAP and a line containing only DIFFMAP>>>, with nothing before or after.",
+    ].join("\n"), (message) => {
+      q.setMapStatus.run(row.id, row.head_sha, "failed", message, Date.now());
+      publish(row.id, "map");
+    });
   }
+
+  // -- Map viewer: diffmap's own viewer, served from plugin routes ------------
+  //
+  // The host builds diffmap's static gist app once (diffmap-toolkit.ts); the
+  // server serves its files from exact-match GET routes under /diffmap/ and
+  // answers its one data request, gist.json?review=<id>, with the payload the
+  // host builds from the review's spec and worktree. Same origin as bb, so the
+  // Map tab can frame it.
+
+  const VIEWER_BASE = `/api/v1/plugins/${bb.pluginId}/http/diffmap`;
+  const CONTENT_TYPES: Record<string, string> = {
+    ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+    ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2", ".woff": "font/woff", ".ttf": "font/ttf", ".wasm": "application/wasm",
+  };
+  // Links out of the framed viewer (the PR, GitHub) open in a new tab; github.com refuses to be framed.
+  const VIEWER_LINKS = `<script>document.addEventListener("click",function(e){var a=e.target&&e.target.closest?e.target.closest("a[href]"):null;if(!a)return;var u=new URL(a.href,location.href);if(u.origin!==location.origin){e.preventDefault();window.open(u.href,"_blank","noopener");}},true);</script>`;
+  let viewerReady = false;
+  let viewerError: string | null = null;
+  let viewerHostId: string | null = null;
+  const viewerFiles = new Map<string, Uint8Array<ArrayBuffer>>();
+  /** Built payloads per review, keyed by the map and head they were built from; and the last build error. */
+  const viewerGists = new Map<string, { key: string; json: string }>();
+  const viewerGistErrors = new Map<string, string>();
+
+  async function viewerFile(relative: string): Promise<Uint8Array<ArrayBuffer>> {
+    const cached = viewerFiles.get(relative);
+    if (cached !== undefined) return cached;
+    if (viewerHostId === null) throw new Error("the map viewer is not built yet");
+    const { base64 } = await host.call("diffmap_asset", { path: relative }, { hostId: viewerHostId });
+    const decoded = Buffer.from(base64, "base64");
+    const bytes = new Uint8Array(new ArrayBuffer(decoded.byteLength));
+    bytes.set(decoded);
+    viewerFiles.set(relative, bytes);
+    return bytes;
+  }
+
+  const contentType = (relative: string) => CONTENT_TYPES[relative.slice(relative.lastIndexOf(".")).toLowerCase()] ?? "application/octet-stream";
+
+  let viewerPreparing: Promise<void> | null = null;
+  /** Build the viewer once (or retry after a failure); safe to call from any handler. */
+  function ensureViewer(): void {
+    if (viewerReady || viewerPreparing !== null) return;
+    viewerPreparing = prepareViewer().finally(() => {
+      viewerPreparing = null;
+    });
+  }
+
+  /** Build the viewer on the primary machine and mount its files; the Map tab shows the spec as Markdown until this is done. */
+  async function prepareViewer(attempt = 0): Promise<void> {
+    try {
+      const hostId = await primaryHostId();
+      const { assets } = await host.call("diffmap_prepare", {}, { hostId, timeoutMs: 20 * 60_000 });
+      viewerHostId = hostId;
+      for (const relative of assets) {
+        if (relative === "index.html") continue;
+        bb.http.route("GET", `/diffmap/${relative}`, async () => {
+          const bytes = await viewerFile(relative);
+          return new Response(bytes, { headers: { "content-type": contentType(relative), "cache-control": relative.startsWith("assets/") ? "public, max-age=31536000, immutable" : "no-store" } });
+        });
+      }
+      const index = async () => {
+        const html = new TextDecoder().decode(await viewerFile("index.html")).replace("</head>", `${VIEWER_LINKS}</head>`);
+        return new Response(html, { headers: { "content-type": CONTENT_TYPES[".html"], "cache-control": "no-store" } });
+      };
+      bb.http.route("GET", "/diffmap/", index);
+      bb.http.route("GET", "/diffmap/index.html", index);
+      bb.http.route("GET", "/diffmap/gist.json", async (c) => {
+        const reviewId = new URL(c.req.url).searchParams.get("review") ?? "";
+        try {
+          return new Response(await viewerGist(reviewId), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+        } catch (cause) {
+          return Response.json({ message: errorMessage(cause) }, { status: 500 });
+        }
+      });
+      viewerReady = true;
+      viewerError = null;
+      bb.log.info(`map viewer ready (${assets.length} files)`);
+    } catch (cause) {
+      viewerError = errorMessage(cause);
+      // Host calls are refused until the plugin has finished registering; try again shortly.
+      if (/unavailable during factory registration/.test(viewerError) && attempt < 10) {
+        await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+        return prepareViewer(attempt + 1);
+      }
+      bb.log.warn(`map viewer: ${viewerError}`);
+    }
+    for (const row of q.reviews.all()) publish(row.id, "map");
+  }
+
+  /** The viewer's payload for a review's map, built on the review's machine from its worktree. */
+  async function viewerGist(reviewId: string): Promise<string> {
+    const row = requireReview(reviewId);
+    const m = q.map.get(reviewId);
+    if (m === undefined || m.markdown === null) throw new Error("this PR has no map yet");
+    const key = `${m.updated_at}:${row.head_sha}`;
+    const cached = viewerGists.get(reviewId);
+    if (cached?.key === key) return cached.json;
+    try {
+      const { json } = await host.call("diffmap_gist", { worktree: row.worktree, markdown: m.markdown, label: prLabel(row), htmlUrl: row.url }, { hostId: row.host_id, timeoutMs: 5 * 60_000 });
+      viewerGists.set(reviewId, { key, json });
+      if (viewerGistErrors.delete(reviewId)) publish(reviewId, "map");
+      return json;
+    } catch (cause) {
+      viewerGistErrors.set(reviewId, errorMessage(cause));
+      publish(reviewId, "map");
+      // diffmap checks every reference against the repository; a spec it rejects goes back to the helper.
+      fixMap(reviewId, errorMessage(cause));
+      throw cause;
+    }
+  }
+
+  /** Where the Map tab frames the viewer, or null to show the spec as Markdown. */
+  function viewerUrl(row: ReviewRow): string | null {
+    const m = q.map.get(row.id);
+    if (!viewerReady || m === undefined || m.markdown === null || viewerGistErrors.has(row.id)) return null;
+    const params = new URLSearchParams({ review: row.id, label: prLabel(row), v: String(m.updated_at) });
+    return `${VIEWER_BASE}/index.html?${params.toString()}`;
+  }
+
+  // Host calls are not available while the plugin registers, so the build starts on the next tick.
+  setTimeout(ensureViewer, 0);
 
   // -- Simple English: GitHub comments rewritten by a second hidden thread ----
   //
@@ -2311,12 +2454,12 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
+    if (factoryThreadDone(thread.id, lastAssistantText, null)) return;
     const helper = q.helperByThread.get(thread.id);
     if (helper !== undefined) {
       q.setHelperJob.run(null, helper.review_id);
-      if (helper.job === "brief") void completeBrief(helper.review_id, lastAssistantText, null);
+      if (helper.job === "map") completeMap(helper.review_id, lastAssistantText, null);
       if (helper.job === "notes") void completeNotes(helper.review_id, lastAssistantText, null);
-      if (helper.job === "guide") void completeGuide(helper.review_id, lastAssistantText, null);
       if (helper.job === null) pumpHelper(helper.review_id);
       return;
     }
@@ -2327,12 +2470,12 @@ export default async function plugin(bb: BbPluginApi) {
     completeSimple(simplifier.review_id, lastAssistantText, null);
   });
   bb.events.on("thread.failed", ({ thread, error }) => {
+    if (factoryThreadDone(thread.id, null, error ?? "the thread failed")) return;
     const helper = q.helperByThread.get(thread.id);
     if (helper !== undefined) {
       q.setHelperJob.run(null, helper.review_id);
-      if (helper.job === "brief") void completeBrief(helper.review_id, null, error ?? "the helper thread failed");
+      if (helper.job === "map") completeMap(helper.review_id, null, error ?? "the helper thread failed");
       if (helper.job === "notes") void completeNotes(helper.review_id, null, error ?? "the helper thread failed");
-      if (helper.job === "guide") void completeGuide(helper.review_id, null, error ?? "the helper thread failed");
       if (helper.job === null) pumpHelper(helper.review_id);
       return;
     }
@@ -2345,9 +2488,9 @@ export default async function plugin(bb: BbPluginApi) {
   // -- private notes ----------------------------------------------------------
   //
   // Notes live only in this plugin until promoted to a pending comment. They
-  // come from slop signals (per signal, on request), from the helper's
-  // "find slop and cleanups" job, or from the reviewer marking a comment
-  // private. Each carries a content hash of its line so it follows pushes.
+  // come from the helper's "find slop and cleanups" job or from the reviewer
+  // marking a comment private. Each carries a content hash of its line so it
+  // follows pushes.
 
   const NOTES_FENCE = "review-notes";
 
@@ -2381,42 +2524,8 @@ export default async function plugin(bb: BbPluginApi) {
     return out;
   }
 
-  const SIGNAL_TITLES: Record<string, string> = {
-    "ai-phrasing": "AI phrasing in a comment",
-    "restating-comments": "Comment repeats the code",
-    "defensive-noise": "Defensive noise",
-    "tests-weakened": "Test weakened",
-    stubs: "Stub or deferral",
-    "commented-code": "Commented-out code",
-    duplication: "Duplicated block",
-    scope: "Outside the stated scope",
-    description: "Description shape",
-    "over-commenting": "Over-commented",
-  };
-
-  async function notesFromSignal(row: ReviewRow, signalId: string, show: boolean): Promise<number> {
-    if (!show) {
-      const before = q.notesBySignal.all(row.id, signalId).length;
-      q.deleteSignalNotes.run(row.id, signalId);
-      publish(row.id, "notes");
-      return before;
-    }
-    const report = briefState(row).signals as unknown as SlopReport | null;
-    const signal = report?.signals.find((s) => s.id === signalId);
-    if (signal === undefined) throw new Error("that signal is not in the current report; recompute first");
-    const kind: Note["kind"] = signalId === "tests-weakened" || signalId === "defensive-noise" || signalId === "stubs" ? "risk" : signalId === "scope" ? "question" : "slop";
-    const severity: Note["severity"] = signalId === "tests-weakened" ? "high" : signalId === "stubs" || signalId === "defensive-noise" || signalId === "duplication" ? "medium" : "low";
-    const inputs: NoteInput[] = signal.evidence
-      .filter((e) => e.path !== "" && e.line !== null)
-      .map((e) => ({ path: e.path, line: e.line ?? 1, startLine: null, side: e.side === "old" ? "LEFT" : "RIGHT", kind, severity, title: SIGNAL_TITLES[signalId] ?? signal.label, body: `${e.note}\n\n${signal.description}`, suggestion: null, source: "signal", signalId }));
-    const added = await insertNotes(row, inputs);
-    publish(row.id, "notes");
-    return added.length;
-  }
-
   async function notesPrompt(row: ReviewRow): Promise<string> {
     const files = await filesFor(row);
-    const report = briefState(row).signals as unknown as SlopReport | null;
     return [
       `Job: find AI slop and cleanups in this PR. Reply with exactly one fenced block tagged ${NOTES_FENCE} containing a JSON array:`,
       '[{ "path": string, "line": number, "endLine"?: number, "kind": "slop" | "cleanup" | "risk" | "question", "severity": "low" | "medium" | "high", "title": string, "body": string, "suggestion"?: string }]',
@@ -2425,9 +2534,6 @@ export default async function plugin(bb: BbPluginApi) {
       "kind: slop = generated residue a person would cut (narrating comments, filler docstrings on private helpers, boilerplate, names that read generated); cleanup = dead or duplicated code, leftovers, stubs, inconsistent patterns; risk = weakened or skipped tests, swallowed errors, defensive noise that hides failures, behavior the description does not mention; question = something the reviewer should ask the author.",
       "title: at most 12 words. body: one to three plain-English sentences saying what and why, no filler. suggestion: replacement code for the lines only when a concrete rewrite is obvious; leave it out otherwise.",
       "At most 25 notes, most important first. Skip anything a formatter fixes. Read the diff; do not invent lines. Skip lines that already carry a GitHub review thread if the thread says the same thing.",
-      "",
-      `Deterministic signals for orientation (verify before repeating them):`,
-      signalsSummary(report),
       "",
       `PR title: ${row.title}`,
       `Changed files (${files.length}):`,
@@ -2507,15 +2613,500 @@ export default async function plugin(bb: BbPluginApi) {
     return parts.join("\n\n").trim();
   }
 
-  /** Signals for the head, computing when missing or on refresh; the brief starts once per review when autoBrief is on. Rewrites go through brief_write. */
-  function briefGet(row: ReviewRow, refresh: boolean): BriefState {
-    const state = briefState(row);
-    if (refresh || state.signalsStatus === "missing") startSignals(row);
-    if (autoBrief && state.briefStatus === "missing") void writeBrief(row);
-    // A brief re-queued by a plugin reload goes out on the first look at the review.
-    else if (state.briefStatus === "writing") pumpHelper(row.id);
-    return briefState(row);
+  // -- PR factory -------------------------------------------------------------
+  //
+  // A PR added to the board goes to AI review: a hidden reviewer thread runs
+  // round 1 and the server posts its findings to GitHub as a COMMENT review
+  // that says which AI round it is. Each push after that, once the head has
+  // settled, runs a targeted round over the new commits that also decides
+  // what happened to the open findings. After maxRounds, or as soon as a round
+  // leaves nothing above a nit open, the PR moves to Human review and the
+  // reviewer thread surfaces, unread, in the sidebar. Your own review moves it
+  // on: an approval to Babysit (through GitHub's state), anything else to
+  // Changes requested until the author pushes again. In Babysit a small model
+  // re-runs flaky CI; anything that needs a push or a decision comes back to
+  // you, and it never pushes.
+
+  const maxRounds = Math.max(1, Math.round(aiReviewMaxRounds));
+  const roundConcurrency = Math.max(1, Math.round(aiReviewConcurrency));
+  const settleMs = Math.max(0, aiReviewSettleMinutes) * 60_000;
+  const maxPasses = Math.max(1, Math.round(babysitMaxPasses));
+  const extraSkills = aiReviewSkills.split(",").map((entry) => entry.trim()).filter((entry) => entry !== "");
+  /** The extra skills for a repository: the bare ones, and the ones scoped to it. */
+  const skillsFor = (row: ReviewRow) =>
+    extraSkills.flatMap((entry) => {
+      const [scope, skill] = entry.includes("=") ? entry.split("=").map((x) => x.trim()) : [null, entry];
+      return skill && (scope === null || scope.toLowerCase() === `${row.owner}/${row.repo}`.toLowerCase()) ? [skill] : [];
+    });
+
+  const reviewerLane: Lane = {
+    title: "AI review",
+    intro: reviewerIntro,
+    providerId: aiReviewProvider.trim(),
+    model: aiReviewModel,
+    replaceOnIntroChange: false,
+    get: (id) => q.aiReviewer.get(id),
+    upsert: (id, threadId, providerId, environmentId, createdAt, introHash) => { q.upsertAiReviewer.run(id, threadId, providerId, environmentId, createdAt, introHash); },
+    setJob: (job, id) => { q.setAiReviewerJob.run(job, id); },
+    remove: (id) => { q.deleteAiReviewer.run(id); },
+  };
+  const babysitterLane: Lane = {
+    title: "CI babysit",
+    intro: babysitIntro,
+    providerId: babysitProvider.trim(),
+    model: babysitModel,
+    reasoningLevel: "low",
+    replaceOnIntroChange: false,
+    get: (id) => q.babysitter.get(id),
+    upsert: (id, threadId, providerId, environmentId, createdAt, introHash) => { q.upsertBabysitter.run(id, threadId, providerId, environmentId, createdAt, introHash); },
+    setJob: (job, id) => { q.setBabysitterJob.run(job, id); },
+    remove: (id) => { q.deleteBabysitter.run(id); },
+  };
+
+  const prLabel = (row: ReviewRow) => `${row.owner}/${row.repo}#${row.number}`;
+
+  /** What the factory tells you about; the event webhook gets the id, Slack and the sidebar the headline. */
+  type FactoryEvent = "ready_for_you" | "ready_again" | "needs_you" | "test";
+  const EVENT_HEADLINE: Record<FactoryEvent, string> = { ready_for_you: "Ready for you", ready_again: "Ready for you again", needs_you: "Needs you", test: "Test ping" };
+
+  function setStage(row: ReviewRow, stage: PipelineStage, needsYou: string | null = null): void {
+    q.setPipelineStage.run(row.id, stage, Date.now(), needsYou, Date.now());
+    publish(row.id, "board");
   }
+
+  /** Let you know: the thread shows in the sidebar, unread, under a title that says why, and Slack pings you. */
+  async function letYouKnow(row: ReviewRow, threadId: string | undefined, event: FactoryEvent, why: string): Promise<void> {
+    await ping(row, event, why);
+    if (threadId === undefined) return;
+    try {
+      await bb.sdk.threads.update({ threadId, visibility: "visible", title: `${EVENT_HEADLINE[event]}: ${prLabel(row)}: ${why}`.slice(0, 200), ...((await sectionId()) === null ? {} : { sectionId: await sectionId() }) });
+      await bb.sdk.threads.markUnread({ threadId });
+    } catch (cause) {
+      bb.log.warn(`surface ${threadId}: ${errorMessage(cause)}`);
+    }
+  }
+
+  /** Tell every configured sink: the Slack webhook as a message, the event webhook as JSON. Returns the failures. */
+  async function ping(row: ReviewRow, event: FactoryEvent, why: string): Promise<string[]> {
+    const sends: Promise<string | null>[] = [];
+    const post = async (sink: string, url: string, headers: Record<string, string>, body: unknown) => {
+      try {
+        const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`);
+        return null;
+      } catch (cause) {
+        bb.log.warn(`${sink} ping for ${prLabel(row)}: ${errorMessage(cause)}`);
+        return `${sink}: ${errorMessage(cause)}`;
+      }
+    };
+    if (slackWebhookUrl.trim() !== "") {
+      const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const mention = slackMention.trim();
+      const text = `${mention === "" ? "" : `${mention} `}*${EVENT_HEADLINE[event]}*: <${row.url}|${prLabel(row)}> ${esc(row.title)}\n${esc(why)}`;
+      sends.push(post("slack", slackWebhookUrl.trim(), {}, { text }));
+    }
+    if (eventWebhookUrl.trim() !== "") {
+      const card = summarize(row);
+      sends.push(post("event webhook", eventWebhookUrl.trim(), eventWebhookSecret.trim() === "" ? {} : { "X-Webhook-Secret": eventWebhookSecret.trim() }, {
+        source: "review-desk",
+        event,
+        headline: EVENT_HEADLINE[event],
+        why,
+        pr: { url: row.url, repo: `${row.owner}/${row.repo}`, number: row.number, title: row.title, author: row.author, headSha: row.head_sha, stage: card.stage },
+        factory: card.factory,
+        checks: { ...card.checks, failing: card.failingChecks },
+      }));
+    }
+    if (sends.length === 0) return ["neither slackWebhookUrl nor eventWebhookUrl is set"];
+    return (await Promise.all(sends)).filter((f): f is string => f !== null);
+  }
+
+  function factorySummary(row: ReviewRow): ReviewSummary["factory"] {
+    const p = q.pipeline.get(row.id);
+    if (p === undefined) return null;
+    const rounds = q.rounds.all(row.id);
+    const last = rounds.at(-1);
+    return {
+      round: last?.round ?? 0,
+      roundsPosted: rounds.filter((r) => r.status === "posted").length,
+      roundStatus: last?.status ?? null,
+      openFindings: q.findings.all(row.id).filter((f) => f.status === "open" && isHighValue(f.severity)).length,
+      reviewUrl: rounds.filter((r) => r.review_url !== null).at(-1)?.review_url ?? null,
+      needsYou: p.needs_you,
+      babysit: p.babysit_head === row.head_sha ? p.babysit_outcome : null,
+      error: last?.status === "failed" ? last.error : null,
+    };
+  }
+
+  /** Put a PR in the factory: AI review, unless it is already approved. `force` starts the next round now. */
+  function startFactory(row: ReviewRow, force = false): void {
+    const p = q.pipeline.get(row.id);
+    const approved = githubStage(row) === "babysit";
+    if (p === undefined || (force && !approved && p.stage !== "ai_review")) setStage(row, approved ? "human_review" : "ai_review");
+    void advanceFactory(row.id, force).catch((cause: unknown) => bb.log.warn(`factory ${prLabel(row)}: ${errorMessage(cause)}`));
+  }
+
+  const advancing = new Set<string>();
+  /** One step of the factory for a PR; runs after each sync, on open, when a round ends, and when you move the card. */
+  async function advanceFactory(reviewId: string, force = false): Promise<void> {
+    if (advancing.has(reviewId)) return;
+    advancing.add(reviewId);
+    try {
+      const row = q.review.get(reviewId);
+      const p = q.pipeline.get(reviewId);
+      if (row === undefined || p === undefined || row.state !== "OPEN") return;
+      if (githubStage(row) === "babysit") await babysitTick(row, p);
+      else if (p.stage === "ai_review") aiReviewTick(row, p, force);
+      else if (p.stage === "human_review") await humanReviewTick(row, p);
+      else if (p.stage === "changes_requested" && p.head_seen_at !== null && p.head_seen_at > p.entered_at) {
+        setStage(row, "human_review", "New commits since your review");
+        await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "ready_again", "new commits since your review");
+      }
+    } finally {
+      advancing.delete(reviewId);
+    }
+  }
+
+  function aiReviewTick(row: ReviewRow, p: PipelineRow, force: boolean): void {
+    const last = q.lastRound.get(row.id);
+    if (last?.status === "queued" || last?.status === "running") {
+      pumpRounds();
+      return;
+    }
+    if (!force && last !== undefined) {
+      // Reviewed (or failed) at this head: wait for a push. After a push, wait for it to settle.
+      if (last.head_sha === row.head_sha) return;
+      if (Date.now() - (p.head_seen_at ?? 0) < settleMs) return;
+    }
+    const round = q.rounds.all(row.id).filter((r) => r.status === "posted").length + 1;
+    if (!force && round > maxRounds) {
+      setStage(row, "human_review", `${maxRounds} AI rounds done`);
+      return;
+    }
+    // A failed attempt at this round is replaced.
+    q.insertRound.run(row.id, round, row.base_sha, row.head_sha, Date.now());
+    publish(row.id, "board");
+    pumpRounds();
+  }
+
+  /** Start queued rounds while there is room; a reviewer thread takes one round at a time. */
+  function pumpRounds(): void {
+    let running = q.roundsByStatus.all("running").length;
+    for (const r of q.roundsByStatus.all("queued")) {
+      if (running >= roundConcurrency) return;
+      const row = q.review.get(r.review_id);
+      if (row === undefined || (q.aiReviewer.get(r.review_id)?.job ?? null) !== null) continue;
+      q.setRoundRunning.run(Date.now(), r.review_id, r.round);
+      running++;
+      publish(r.review_id, "board");
+      void startRound(row, r);
+    }
+  }
+
+  function threadLine(t: GhThread): string {
+    const first = t.comments[0];
+    const last = t.comments.at(-1);
+    const oneLine = (body: string | undefined, n: number) => (body ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+    const replies = t.comments.length > 1 && last !== undefined ? ` (${t.comments.length - 1} repl${t.comments.length === 2 ? "y" : "ies"}, last by @${last.author}: ${oneLine(last.body, 100)})` : "";
+    return `${t.path}:${t.line ?? t.originalLine ?? "?"} @${first?.author ?? "?"}: ${oneLine(first?.body, 140)}${replies}`;
+  }
+
+  async function startRound(row: ReviewRow, r: RoundRow): Promise<void> {
+    try {
+      const files = await host.call("git_files", { worktree: row.worktree, baseSha: r.base_sha, headSha: r.head_sha }, hostOptions(row));
+      const prev = q.rounds.all(row.id).filter((x) => x.status === "posted" && x.round < r.round).at(-1);
+      const prior = q.findings.all(row.id).filter((f) => f.status === "open" && isHighValue(f.severity));
+      const prompt = roundPrompt({
+        owner: row.owner,
+        repo: row.repo,
+        number: row.number,
+        title: row.title,
+        author: row.author,
+        baseRef: row.base_ref,
+        baseSha: r.base_sha,
+        headSha: r.head_sha,
+        round: r.round,
+        maxRounds,
+        prev: prev === undefined ? null : { baseSha: prev.base_sha, headSha: prev.head_sha },
+        prior: prior.map((f) => ({ id: f.id, round: f.round, severity: f.severity, path: f.path, line: f.line, title: f.title, body: f.body })),
+        threads: cachedThreads(row).filter((t) => !t.isResolved).slice(0, 60).map(threadLine),
+        changedPaths: files.files.map((f) => f.path),
+        extraSkills: skillsFor(row),
+        empirical: aiReviewEmpirical,
+      });
+      await laneSend(reviewerLane, row, `round:${r.round}`, prompt);
+    } catch (cause) {
+      q.setRoundStatus.run("failed", errorMessage(cause), Date.now(), row.id, r.round);
+      publish(row.id, "board");
+      pumpRounds();
+    }
+  }
+
+  /** Head-side line numbers each file's diff shows (added or context): the lines GitHub accepts an inline comment on. */
+  async function rightLines(row: ReviewRow, baseSha: string, headSha: string, files: ChangedFile[]): Promise<Map<string, Set<number>>> {
+    const out = new Map<string, Set<number>>();
+    for (const f of files) {
+      const { patch } = await host.call("git_patch", { worktree: row.worktree, baseSha, headSha, path: f.path, oldPath: f.oldPath }, hostOptions(row));
+      const lines = new Set<number>();
+      let next = 0;
+      for (const l of patch.split("\n")) {
+        const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
+        if (hunk !== null) next = Number(hunk[1]);
+        else if (next > 0 && (l.startsWith("+") || l.startsWith(" "))) lines.add(next++);
+      }
+      out.set(f.path, lines);
+    }
+    return out;
+  }
+
+  async function completeRound(reviewId: string, round: number, text: string | null, error: string | null): Promise<void> {
+    const row = q.review.get(reviewId);
+    const r = q.round.get(reviewId, round);
+    if (row === undefined || r === undefined || r.status !== "running") return;
+    try {
+      if (error !== null || text === null) throw new Error(error ?? "the reviewer returned nothing");
+      const reply = parseAiReply(text);
+      const now = Date.now();
+      // What this round decided about the open findings.
+      const open = new Map(q.findings.all(reviewId).filter((f) => f.status === "open" && isHighValue(f.severity)).map((f) => [f.id, f]));
+      const resolved: { title: string; status: "fixed" | "obsolete"; note: string }[] = [];
+      for (const prev of reply.previous) {
+        const f = open.get(prev.id);
+        if (f === undefined || (prev.status !== "fixed" && prev.status !== "obsolete")) continue;
+        q.setFindingStatus.run(prev.status, prev.note, now, f.id);
+        open.delete(f.id);
+        resolved.push({ title: f.title, status: prev.status, note: prev.note });
+      }
+      const stillOpen = [...open.values()].map((f) => ({ title: f.title, severity: f.severity }));
+      // New findings, anchored to the diff this round reviewed.
+      const files = (await host.call("git_files", { worktree: row.worktree, baseSha: r.base_sha, headSha: r.head_sha }, hostOptions(row))).files;
+      const findings: PostedFinding[] = reply.findings.map((f) => {
+        const clean = f.path.trim().replace(/^\.\//, "");
+        const path = files.find((x) => x.path === clean)?.path ?? files.find((x) => x.path.endsWith(`/${clean}`))?.path ?? clean;
+        const end = typeof f.endLine === "number" && f.endLine > f.line ? Math.round(f.endLine) : null;
+        return {
+          severity: f.severity,
+          path,
+          line: end ?? Math.round(f.line),
+          startLine: end === null ? null : Math.round(f.line),
+          title: f.title.trim().slice(0, 200),
+          body: f.body.trim(),
+          suggestion: f.suggestion ?? null,
+        };
+      });
+      const wanted = new Set(findings.filter((f) => isHighValue(f.severity)).map((f) => f.path));
+      const shown = await rightLines(row, r.base_sha, r.head_sha, files.filter((f) => wanted.has(f.path)));
+      const anchors = (f: PostedFinding) => {
+        const lines = shown.get(f.path);
+        if (lines === undefined) return false;
+        for (let l = f.startLine ?? f.line; l <= f.line; l++) if (!lines.has(l)) return false;
+        return true;
+      };
+      let inline = findings.filter((f) => isHighValue(f.severity) && anchors(f));
+      const nits = findings.filter((f) => !isHighValue(f.severity));
+      const counts = Object.fromEntries(AI_SEVERITIES.map((s) => [s, 0])) as Record<AiSeverity, number>;
+      for (const f of findings) counts[f.severity as AiSeverity]++;
+      const high = findings.filter((f) => isHighValue(f.severity)).length + stillOpen.length;
+      const handoff = round >= maxRounds || high === 0;
+      const submit = (onDiff: PostedFinding[]) =>
+        host.call(
+          "gh_submit_review",
+          {
+            owner: row.owner,
+            repo: row.repo,
+            number: row.number,
+            commitId: r.head_sha,
+            event: "COMMENT",
+            body: reviewBody({ round, maxRounds, summary: reply.summary, counts, resolved, stillOpen, nits, offDiff: findings.filter((f) => isHighValue(f.severity) && !onDiff.includes(f)), handoff }),
+            comments: onDiff.map((f) => ({ path: f.path, line: f.line, side: "RIGHT" as const, startLine: f.startLine, body: findingComment(f, round) })),
+          },
+          hostOptions(row),
+        );
+      let posted: { url: string | null };
+      try {
+        posted = await submit(inline);
+      } catch (cause) {
+        if (inline.length === 0) throw cause;
+        // GitHub refuses the whole review when one comment does not anchor; put them all in the body instead.
+        bb.log.warn(`round ${round} of ${prLabel(row)}: inline comments refused (${errorMessage(cause)}); posting them in the review body`);
+        inline = [];
+        posted = await submit(inline);
+      }
+      for (const f of findings) q.insertFinding.run(newId(), reviewId, round, f.path, f.line, f.startLine, f.severity, f.title, f.body, f.suggestion, inline.includes(f) ? 1 : 0, now);
+      q.setRoundPosted.run(reply.summary, high, posted.url, text.slice(0, 200_000), Date.now(), reviewId, round);
+      await resolveFindingThreads(row, r.head_sha).catch((cause: unknown) => bb.log.warn(`resolving threads on ${prLabel(row)}: ${errorMessage(cause)}`));
+      if (handoff) {
+        const why = high === 0 ? `AI round ${round} found nothing above a nit` : `${high} finding${high === 1 ? "" : "s"} above a nit still open after ${round} AI round${round === 1 ? "" : "s"}`;
+        setStage(row, "human_review", why);
+        await letYouKnow(row, q.aiReviewer.get(reviewId)?.thread_id, "ready_for_you", why);
+      }
+    } catch (cause) {
+      q.setRoundStatus.run("failed", errorMessage(cause), Date.now(), reviewId, round);
+      bb.log.warn(`round ${round} of ${prLabel(row)}: ${errorMessage(cause)}`);
+    }
+    publish(reviewId, "board");
+    pumpRounds();
+  }
+
+  /**
+   * Close the factory's own inline threads for findings a later round marked
+   * fixed or obsolete: a one-line reply saying so, then resolve. Threads you
+   * already resolved, or that are not the factory's, are left alone.
+   */
+  async function resolveFindingThreads(row: ReviewRow, atSha: string): Promise<number> {
+    const closed = q.findings.all(row.id).filter((f) => f.inline === 1 && (f.status === "fixed" || f.status === "obsolete"));
+    if (closed.length === 0) return 0;
+    const threads = await refreshThreads(row);
+    let resolved = 0;
+    for (const f of closed) {
+      const header = findingHeader(f.severity, f.title, f.round);
+      const thread = threads.find((t) => !t.isResolved && t.path === f.path && (t.comments[0]?.body ?? "").startsWith(header));
+      const first = thread?.comments[0];
+      if (thread === undefined || first === undefined) continue;
+      const note = (f.note ?? "").trim();
+      try {
+        if (first.databaseId !== null) {
+          const body = `${f.status === "fixed" ? "Fixed" : "No longer applies"} as of ${atSha.slice(0, 10)} (AI review)${note === "" ? "." : `: ${note}`}`;
+          await host.call("gh_reply", { owner: row.owner, repo: row.repo, number: row.number, commentId: first.databaseId, body }, hostOptions(row));
+        }
+        await host.call("gh_resolve", { threadId: thread.id, resolve: true }, hostOptions(row));
+        resolved++;
+      } catch (cause) {
+        bb.log.warn(`resolving ${f.path}:${f.line} on ${prLabel(row)}: ${errorMessage(cause)}`);
+      }
+    }
+    if (resolved > 0) await refreshThreads(row).catch(() => undefined);
+    return resolved;
+  }
+
+  const viewers = new Map<string, string>();
+  async function viewerLogin(row: ReviewRow): Promise<string> {
+    const known = viewers.get(row.host_id);
+    if (known !== undefined) return known;
+    const { login } = await host.call("gh_viewer", {}, hostOptions(row));
+    viewers.set(row.host_id, login);
+    return login;
+  }
+
+  /**
+   * Your own review after the hand-off: not one the factory posted under your
+   * login, and not an empty comment-only review (thread replies, including the
+   * factory's own on threads it resolves). An approval wins and moves the PR to
+   * Babysit through GitHub's state; anything else waits on the author.
+   */
+  async function humanReviewTick(row: ReviewRow, p: PipelineRow): Promise<void> {
+    const login = await viewerLogin(row);
+    const conversation = await host.call("gh_conversation", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
+    q.setConversationCache.run(row.id, JSON.stringify(conversation), Date.now());
+    const mine = conversation.reviews.filter(
+      (r) => r.author === login && !r.body.includes(AI_ROUND_MARKER) && (r.state !== "COMMENTED" || r.body.trim() !== "") && r.submittedAt !== null && Date.parse(r.submittedAt) > p.entered_at,
+    );
+    if (mine.length === 0 || mine.some((r) => r.state === "APPROVED")) return;
+    setStage(row, "changes_requested");
+  }
+
+  /** One look at an approved PR's CI. A pass runs only for a failure no earlier pass at this head has seen. */
+  async function babysitTick(row: ReviewRow, p: PipelineRow): Promise<void> {
+    const card = summarize(row);
+    const conflicting = row.mergeable === "CONFLICTING";
+    const fresh = p.babysit_head !== row.head_sha;
+    const passes = fresh ? 0 : p.babysit_passes;
+    const outcome = fresh ? null : p.babysit_outcome;
+    const now = Date.now();
+    if (!conflicting && card.checks.failed === 0) {
+      // Nothing failing: forget the last failure, so the same check failing again after a re-run gets a pass.
+      if (fresh || p.babysit_key !== null) q.setBabysit.run(row.head_sha, null, passes, outcome, now, row.id);
+      if (p.needs_you !== null) q.setNeedsYou.run(null, now, row.id);
+      if (fresh || p.babysit_key !== null || p.needs_you !== null) publish(row.id, "board");
+      return;
+    }
+    if (outcome === "needs_human" || (q.babysitter.get(row.id)?.job ?? null) !== null) return;
+    const key = `${conflicting ? "conflict|" : ""}${card.failingChecks.map((c) => c.name).sort().join("|")}#${card.checks.failed}`;
+    if (!fresh && key === p.babysit_key) return;
+    if (passes >= maxPasses) {
+      const why = `CI still failing after ${passes} babysit passes: ${card.failingChecks.map((c) => c.name).join(", ")}`;
+      q.setBabysit.run(row.head_sha, key, passes, "needs_human", now, row.id);
+      q.setNeedsYou.run(why, now, row.id);
+      publish(row.id, "board");
+      await letYouKnow(row, q.babysitter.get(row.id)?.thread_id, "needs_you", why);
+      return;
+    }
+    q.setBabysit.run(row.head_sha, key, passes + 1, "running", now, row.id);
+    publish(row.id, "board");
+    try {
+      await laneSend(babysitterLane, row, "babysit", babysitPrompt({ owner: row.owner, repo: row.repo, number: row.number, headSha: row.head_sha, pass: passes + 1, maxPasses, failing: card.failingChecks, conflicting }));
+    } catch (cause) {
+      q.setBabysit.run(row.head_sha, key, passes + 1, null, Date.now(), row.id);
+      bb.log.warn(`babysit ${prLabel(row)}: ${errorMessage(cause)}`);
+    }
+  }
+
+  async function completeBabysit(reviewId: string, text: string | null, error: string | null): Promise<void> {
+    const row = q.review.get(reviewId);
+    const p = q.pipeline.get(reviewId);
+    if (row === undefined || p === undefined) return;
+    let outcome: string;
+    let detail: string;
+    try {
+      if (error !== null || text === null) throw new Error(error ?? "no reply");
+      ({ outcome, detail } = parseBabysitReply(text));
+    } catch (cause) {
+      outcome = "needs_human";
+      detail = `the babysitter failed: ${errorMessage(cause)}`;
+    }
+    const now = Date.now();
+    q.setBabysit.run(p.babysit_head, p.babysit_key, p.babysit_passes, outcome, now, reviewId);
+    if (outcome === "needs_human") {
+      q.setNeedsYou.run(detail, now, reviewId);
+      await letYouKnow(row, q.babysitter.get(reviewId)?.thread_id, "needs_you", detail);
+    }
+    publish(reviewId, "board");
+  }
+
+  /** Route a factory thread's reply; false when the thread is not one of ours. */
+  function factoryThreadDone(threadId: string, text: string | null, error: string | null): boolean {
+    const reviewer = q.aiReviewerByThread.get(threadId);
+    if (reviewer !== undefined) {
+      q.setAiReviewerJob.run(null, reviewer.review_id);
+      if (reviewer.job !== null && reviewer.job.startsWith("round:")) void completeRound(reviewer.review_id, Number(reviewer.job.slice("round:".length)), text, error);
+      else pumpRounds();
+      return true;
+    }
+    const sitter = q.babysitterByThread.get(threadId);
+    if (sitter !== undefined) {
+      q.setBabysitterJob.run(null, sitter.review_id);
+      if (sitter.job === "babysit") void completeBabysit(sitter.review_id, text, error);
+      return true;
+    }
+    return false;
+  }
+
+  // Across a plugin reload: a round whose thread is no longer working lost its
+  // reply and goes back on the queue; a babysit pass that lost its reply is
+  // forgotten, so the next sync looks again.
+  void (async () => {
+    const working = async (threadId: string) => {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId });
+        return thread.status !== "idle" && thread.archivedAt === null && thread.deletedAt === null;
+      } catch {
+        return false;
+      }
+    };
+    for (const r of q.roundsByStatus.all("running")) {
+      const reviewer = q.aiReviewer.get(r.review_id);
+      if (reviewer?.job === `round:${r.round}` && (await working(reviewer.thread_id))) continue;
+      q.setAiReviewerJob.run(null, r.review_id);
+      q.insertRound.run(r.review_id, r.round, r.base_sha, r.head_sha, Date.now());
+    }
+    for (const sitter of q.babysittersWithJob.all()) {
+      if (await working(sitter.thread_id)) continue;
+      q.setBabysitterJob.run(null, sitter.review_id);
+      const p = q.pipeline.get(sitter.review_id);
+      if (p !== undefined) q.setBabysit.run(p.babysit_head, null, p.babysit_passes, null, Date.now(), sitter.review_id);
+    }
+    pumpRounds();
+  })();
 
   // -- GitHub write paths ----------------------------------------------------
 
@@ -2539,6 +3130,12 @@ export default async function plugin(bb: BbPluginApi) {
     q.clearPending.run(row.id);
     await refreshThreads(row).catch(() => undefined);
     publish(row.id, "pending");
+    // Your own review from here: a comment or a change request waits on the author; an approval moves to Babysit through GitHub's state.
+    if (event !== "APPROVE" && q.pipeline.get(row.id)?.stage === "human_review") setStage(row, "changes_requested");
+    // Re-read GitHub now so the card moves (an approval to Babysit) without waiting for the next board refresh.
+    void lightSync(requireReview(row.id))
+      .then(() => advanceFactory(row.id))
+      .catch((cause: unknown) => bb.log.warn(`sync after review on ${prLabel(row)}: ${errorMessage(cause)}`));
     return { url: result.url, posted: pending.length };
   }
 
@@ -2558,28 +3155,44 @@ export default async function plugin(bb: BbPluginApi) {
   // -- RPC -------------------------------------------------------------------
 
   bb.rpc.register(rpcContract, {
-    reviews_list: () => ({
-      reviews: q.reviews.all().map((row) => ({
-        id: row.id,
-        owner: row.owner,
-        repo: row.repo,
-        number: row.number,
-        title: row.title,
-        state: row.state,
-        headSha: row.head_sha,
-        pendingCount: q.pending.all(row.id).length,
-        updatedAt: row.updated_at,
-      })),
-    }),
+    reviews_list: () => ({ reviews: boardCards() }),
+    factory_start: async ({ reviewId }) => {
+      const row = requireReview(reviewId);
+      startFactory(row, true);
+      return { review: summarize(requireReview(reviewId)) };
+    },
+    factory_stop: ({ reviewId }) => {
+      requireReview(reviewId);
+      q.deletePipeline.run(reviewId);
+      publish(reviewId, "board");
+      return { review: summarize(requireReview(reviewId)) };
+    },
+    board_move: ({ reviewId, stage }) => ({ review: moveCard(reviewId, stage) }),
+    board_refresh: async () => {
+      const result = await refreshBoard();
+      return { reviews: boardCards(), ...result };
+    },
     reviews_open: async ({ ref }) => ({ review: await openReview(ref) }),
     reviews_get: ({ reviewId }) => reviewDetail(reviewId),
     reviews_sync: ({ reviewId }) => syncReview(reviewId),
     reviews_remove: async ({ reviewId }) => {
+      const row = q.review.get(reviewId);
       for (const seat of q.seats.all(reviewId)) await chatReset(reviewId, seat.provider_id);
       q.deleteSimplifier.run(reviewId);
       q.deleteSimple.run(reviewId);
+      q.deleteBoardStage.run(reviewId);
+      for (const stmt of [q.deletePipeline, q.deleteRounds, q.deleteFindings, q.deleteAiReviewer, q.deleteBabysitter, q.deleteMap]) stmt.run(reviewId);
       q.deleteReview.run(reviewId);
       publish(reviewId, "removed");
+      // The worktree goes with the card, unless it has local changes.
+      if (row !== undefined) {
+        try {
+          const result = await host.call("repo_remove_worktree", { repoPath: row.repo_path, worktree: row.worktree }, hostOptions(row));
+          if (!result.removed) bb.log.info(`kept worktree ${row.worktree}: ${result.reason}`);
+        } catch (cause) {
+          bb.log.warn(`worktree for ${row.owner}/${row.repo}#${row.number}: ${errorMessage(cause)}`);
+        }
+      }
       return { ok: true as const };
     },
     review_patch: async ({ reviewId, path }) => {
@@ -2671,24 +3284,11 @@ export default async function plugin(bb: BbPluginApi) {
       await chatReset(reviewId, providerId);
       return { ok: true as const };
     },
-    codemap_get: ({ reviewId, refresh }) => {
+    map_get: ({ reviewId }) => mapGet(requireReview(reviewId)),
+    map_write: ({ reviewId }) => {
       const row = requireReview(reviewId);
-      const state = codemapState(row);
-      if (refresh || state.status === "missing") startCodemap(row);
-      return codemapState(row);
-    },
-    guide_get: ({ reviewId }) => guideGet(requireReview(reviewId)),
-    guide_write: ({ reviewId }) => {
-      const row = requireReview(reviewId);
-      wantGuide(row, true);
-      return guideState(row);
-    },
-    brief_get: ({ reviewId, refresh }) => briefGet(requireReview(reviewId), refresh === true),
-    brief_write: async ({ reviewId }) => {
-      const row = requireReview(reviewId);
-      if (briefState(row).signalsStatus === "missing") startSignals(row);
-      await writeBrief(row);
-      return briefState(row);
+      wantMap(row, true);
+      return mapState(row);
     },
     simple_get: ({ reviewId, refresh }) => {
       const row = requireReview(reviewId);
@@ -2700,7 +3300,6 @@ export default async function plugin(bb: BbPluginApi) {
       requestSimple(row, keys);
       return simpleState(row);
     },
-    notes_from_signal: async ({ reviewId, signalId, show }) => ({ count: await notesFromSignal(requireReview(reviewId), signalId, show) }),
     notes_find: async ({ reviewId }) => {
       await findNotes(requireReview(reviewId));
       return { ok: true as const };
@@ -2801,9 +3400,12 @@ export default async function plugin(bb: BbPluginApi) {
     commands: [
       { name: "open", summary: "Open or refresh a PR review", usage: "bb review-desk open <url | owner/repo#N>" },
       { name: "list", summary: "List reviews", usage: "bb review-desk list [--json]" },
+      { name: "board", summary: "Print the board: every tracked PR under its column", usage: "bb review-desk board [--json]" },
+      { name: "move", summary: "Drag a card to a column, or back to the column GitHub's state gives it", usage: "bb review-desk move <reviewId> <unreviewed|ai_review|human_review|changes_requested|babysit|auto> [--json]" },
+      { name: "refresh", summary: "Sync every open PR with GitHub", usage: "bb review-desk refresh [--json]" },
+      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show|ping|resolve> <reviewId> [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
-      { name: "codemap", summary: "Build or print the codemap", usage: "bb review-desk codemap <reviewId> [--json]" },
-      { name: "guide", summary: "Write or print the reading guide over the codemap", usage: "bb review-desk guide <reviewId> [--rewrite] [--json]" },
+      { name: "map", summary: "Write or print the PR's diffmap spec", usage: "bb review-desk map <reviewId> [--rewrite] [--json]" },
       { name: "simple", summary: "Queue Simple English rewrites of all the comments, redo them all, or request one comment by key", usage: "bb review-desk simple <reviewId> [--redo | --key <t:...|c:...|r:...>] [--json]" },
     ],
     async run(argv) {
@@ -2828,6 +3430,67 @@ export default async function plugin(bb: BbPluginApi) {
             const rows = q.reviews.all();
             return ok(rows.map(toReview), rows.length === 0 ? "No reviews." : rows.map((r) => `${r.id}  ${r.owner}/${r.repo}#${r.number}  ${r.title}  [${r.state}]`).join("\n"));
           }
+          case "board": {
+            const cards = boardCards();
+            const lines: string[] = [];
+            for (const stage of BOARD_STAGES) {
+              const inStage = cards.filter((c) => c.stage === stage);
+              lines.push(`${BOARD_STAGE_LABEL[stage]} (${inStage.length})`);
+              for (const c of inStage) {
+                const bits = [
+                  c.isDraft ? "draft" : null,
+                  c.checks.total > 0 ? `checks ${c.checks.passed}/${c.checks.total}${c.checks.failed > 0 ? ` (${c.checks.failed} failing)` : ""}` : null,
+                  c.unresolvedThreads > 0 ? `${c.unresolvedThreads} open thread${c.unresolvedThreads === 1 ? "" : "s"}` : null,
+                  c.approvals > 0 ? `${c.approvals} approval${c.approvals === 1 ? "" : "s"}` : null,
+                  c.mergeable === "CONFLICTING" ? "conflicts" : null,
+                  c.pinned ? "dragged here" : null,
+                ].filter((b): b is string => b !== null);
+                lines.push(`  ${c.id}  ${c.owner}/${c.repo}#${c.number}  ${c.title}${bits.length > 0 ? `  [${bits.join(", ")}]` : ""}`);
+              }
+            }
+            const closed = cards.filter((c) => c.stage === null);
+            lines.push(`Merged or closed (${closed.length})`);
+            for (const c of closed) lines.push(`  ${c.id}  ${c.owner}/${c.repo}#${c.number}  ${c.title}  [${c.state.toLowerCase()}]`);
+            return ok(cards, cards.length === 0 ? "No PRs on the board." : lines.join("\n"));
+          }
+          case "move": {
+            const [reviewId, stage] = rest;
+            if (!reviewId || !stage || (stage !== "auto" && !isBoardStage(stage))) return { exitCode: 1, stderr: `usage: bb review-desk move <reviewId> <${BOARD_STAGES.join("|")}|auto>` };
+            const card = moveCard(reviewId, stage === "auto" ? null : stage);
+            return ok(card, `${card.owner}/${card.repo}#${card.number} is in ${card.stage === null ? "merged or closed" : BOARD_STAGE_LABEL[card.stage]}${card.pinned ? " (dragged; follows GitHub again when its state changes)" : " (GitHub's state)"}`);
+          }
+          case "factory": {
+            const [action, reviewId] = rest;
+            const row = requireReview(reviewId ?? "");
+            if (action === "ping") {
+              const failures = await ping(row, "test", "Review Desk can reach you");
+              return failures.length === 0 ? ok({ ok: true }, "Sent a test ping to every configured sink") : { exitCode: 1, stderr: `Ping failed: ${failures.join("; ")}` };
+            }
+            if (action === "resolve") {
+              const last = q.rounds.all(row.id).filter((r) => r.status === "posted").at(-1);
+              const resolved = last === undefined ? 0 : await resolveFindingThreads(row, last.head_sha);
+              return ok({ resolved }, `Resolved ${resolved} thread${resolved === 1 ? "" : "s"} for fixed or obsolete findings`);
+            }
+            if (action === "start") startFactory(row, true);
+            else if (action === "stop") {
+              q.deletePipeline.run(row.id);
+              publish(row.id, "board");
+            } else if (action !== "show") return { exitCode: 1, stderr: "usage: bb review-desk factory <start|stop|show|ping|resolve> <reviewId>" };
+            const card = summarize(requireReview(row.id));
+            const rounds = q.rounds.all(row.id);
+            const findings = q.findings.all(row.id);
+            const text = [
+              `${card.owner}/${card.repo}#${card.number} is in ${card.stage === null ? "merged or closed" : BOARD_STAGE_LABEL[card.stage]}${card.factory?.needsYou ? `; needs you: ${card.factory.needsYou}` : ""}`,
+              ...rounds.map((r) => `  round ${r.round} ${r.status} at ${r.head_sha.slice(0, 10)}${r.high_value === null ? "" : `, ${r.high_value} above nit`}${r.review_url ? ` ${r.review_url}` : ""}${r.error ? ` (${r.error})` : ""}`),
+              ...findings.map((f) => `    [${f.status}] r${f.round} ${f.severity} ${f.path}:${f.line} ${f.title}`),
+            ].join("\n");
+            return ok({ card, rounds, findings }, text);
+          }
+          case "refresh": {
+            const result = await refreshBoard();
+            const failed = result.failed.length === 0 ? "" : `; ${result.failed.length} failed: ${result.failed.map((f) => `${f.reviewId} (${f.error})`).join(", ")}`;
+            return ok(result, `Synced ${result.synced} PR${result.synced === 1 ? "" : "s"}${failed}`);
+          }
           case "ask": {
             const [reviewId, ...words] = rest;
             const text = words.join(" ").trim();
@@ -2844,50 +3507,16 @@ export default async function plugin(bb: BbPluginApi) {
             const failed = q.simpleRows.all(row.id).filter((r) => r.status === "failed").length;
             return ok(state, `${Object.keys(state.items).length} ready, ${state.pending.length} pending, ${failed} failed (mode ${state.mode})${state.error === null ? "" : `\nlast error: ${state.error}`}`);
           }
-          case "codemap": {
+          case "map": {
             const row = requireReview(rest[0] ?? "");
-            let state = codemapState(row);
-            if (state.status === "missing" || state.status === "failed") startCodemap(row);
-            state = codemapState(row);
-            if (state.status !== "ready" || state.codemap === null) return ok(state, `Codemap ${state.status}${state.error ? `: ${state.error}` : ""}. Run again in a moment.`);
-            const c = state.codemap;
-            const text = [
-              `Codemap (${c.engine}) for ${c.headSha.slice(0, 10)}: ${c.stats.files} files, ${c.stats.symbols} symbols (+${c.stats.added} ~${c.stats.modified} -${c.stats.removed})`,
-              "Module order:",
-              ...c.readingOrder.map((m, i) => `  ${i + 1}. ${m.module}  (${m.paths.length} files) ${m.reason}`),
-              "Hotspots:",
-              ...c.hotspots.slice(0, 10).map((h) => `  ${h.score}  ${h.path}#${h.qualified}  (${h.changedLines} lines, fan-in ${h.fanIn})`),
-            ].join("\n");
-            return ok(c, text);
-          }
-          case "guide": {
-            const row = requireReview(rest[0] ?? "");
-            const before = guideState(row);
-            if (rewrite || before.status === "missing" || before.status === "failed") wantGuide(row, true);
-            else if (before.status === "queued") pumpHelper(row.id);
-            const state = guideState(row);
-            if (state.guide === null) return ok(state, `Guide ${state.status}${state.error ? `: ${state.error}` : ""}. Run again in a moment.`);
-            const g = state.guide as unknown as Guide;
-            const fileOf = new Map(g.files.map((f) => [f.path, f]));
-            const text = [
-              `Guide${state.stale ? ` (written for an older head; now ${state.status})` : state.status === "ready" ? "" : ` (${state.status})`}`,
-              "",
-              g.overview,
-              ...(g.flow.length > 0 ? ["", "How it runs:", ...g.flow.map((h, i) => `  ${i + 1}. ${h.symbol}  ${h.path}${h.line !== null ? `:${h.line}` : ""}\n     ${h.what}`)] : []),
-              "",
-              "Reading order:",
-              ...g.steps.flatMap((s, i) => [
-                `  ${i + 1}. ${s.title}${s.why ? `: ${s.why}` : ""}`,
-                ...s.paths.map((p) => {
-                  const f = fileOf.get(p);
-                  return `       ${(f?.role ?? "").padEnd(9)} ${p}${f?.skim ? "  (skim)" : ""}\n${" ".repeat(17)}${f?.what ?? ""}`;
-                }),
-              ]),
-            ].join("\n");
-            return ok(g, text);
+            if (rewrite) wantMap(row, true);
+            const state = mapGet(row);
+            const { markdown } = state;
+            const status = `Map ${state.status}${state.stale ? ` (on file: ${state.headSha?.slice(0, 10)}, an older head)` : ""}${state.error ? `: ${state.error}` : ""}`;
+            return ok(state, markdown === null ? `${status}. Run again in a moment.` : `${status}\n\n${markdown}`);
           }
           default:
-            return { exitCode: 1, stderr: "usage: bb review-desk open|list|ask|codemap|guide|simple" };
+            return { exitCode: 1, stderr: "usage: bb review-desk open|list|board|move|refresh|factory|ask|map|simple" };
         }
       } catch (cause) {
         return { exitCode: 1, stderr: errorMessage(cause) };
