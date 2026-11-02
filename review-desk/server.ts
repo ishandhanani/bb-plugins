@@ -978,10 +978,12 @@ export default async function plugin(bb: BbPluginApi) {
     babysitMaxPasses: { type: "number", label: "PR factory: babysit passes per head before CI failures are handed to you", default: 3 },
     slackWebhookUrl: { type: "string", secret: true, label: "PR factory: Slack incoming webhook URL; when set, you are pinged there whenever a PR needs you", default: "" },
     slackMention: { type: "string", label: "PR factory: optional mention at the start of each Slack ping, for example <@U0123ABCD>", default: "" },
+    eventWebhookUrl: { type: "string", label: "PR factory: webhook that gets every hand-off to you as JSON (for example a Devin automation's webhook trigger, which can relay it to Slack and answer follow-ups)", default: "" },
+    eventWebhookSecret: { type: "string", secret: true, label: "PR factory: secret sent as X-Webhook-Secret with each event", default: "" },
   });
   const {
     defaultProvider, hideSeatThreads, autoBrief, autoGuide, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir,
-    autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, slackWebhookUrl, slackMention,
+    autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
   } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
 
@@ -2855,38 +2857,60 @@ export default async function plugin(bb: BbPluginApi) {
 
   const prLabel = (row: ReviewRow) => `${row.owner}/${row.repo}#${row.number}`;
 
+  /** What the factory tells you about; the event webhook gets the id, Slack and the sidebar the headline. */
+  type FactoryEvent = "ready_for_you" | "ready_again" | "needs_you" | "test";
+  const EVENT_HEADLINE: Record<FactoryEvent, string> = { ready_for_you: "Ready for you", ready_again: "Ready for you again", needs_you: "Needs you", test: "Test ping" };
+
   function setStage(row: ReviewRow, stage: PipelineStage, needsYou: string | null = null): void {
     q.setPipelineStage.run(row.id, stage, Date.now(), needsYou, Date.now());
     publish(row.id, "board");
   }
 
   /** Let you know: the thread shows in the sidebar, unread, under a title that says why, and Slack pings you. */
-  async function letYouKnow(row: ReviewRow, threadId: string | undefined, headline: string, why: string): Promise<void> {
-    await ping(row, headline, why);
+  async function letYouKnow(row: ReviewRow, threadId: string | undefined, event: FactoryEvent, why: string): Promise<void> {
+    await ping(row, event, why);
     if (threadId === undefined) return;
     try {
-      await bb.sdk.threads.update({ threadId, visibility: "visible", title: `${headline}: ${prLabel(row)}: ${why}`.slice(0, 200) });
+      await bb.sdk.threads.update({ threadId, visibility: "visible", title: `${EVENT_HEADLINE[event]}: ${prLabel(row)}: ${why}`.slice(0, 200) });
       await bb.sdk.threads.markUnread({ threadId });
     } catch (cause) {
       bb.log.warn(`surface ${threadId}: ${errorMessage(cause)}`);
     }
   }
 
-  /** Post to the Slack incoming webhook, when one is set. Returns the error, if any. */
-  async function ping(row: ReviewRow, headline: string, why: string): Promise<string | null> {
-    const url = slackWebhookUrl.trim();
-    if (url === "") return "slackWebhookUrl is not set";
-    const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    const mention = slackMention.trim();
-    const text = `${mention === "" ? "" : `${mention} `}*${esc(headline)}*: <${row.url}|${prLabel(row)}> ${esc(row.title)}\n${esc(why)}`;
-    try {
-      const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) });
-      if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`);
-      return null;
-    } catch (cause) {
-      bb.log.warn(`slack ping for ${prLabel(row)}: ${errorMessage(cause)}`);
-      return errorMessage(cause);
+  /** Tell every configured sink: the Slack webhook as a message, the event webhook as JSON. Returns the failures. */
+  async function ping(row: ReviewRow, event: FactoryEvent, why: string): Promise<string[]> {
+    const sends: Promise<string | null>[] = [];
+    const post = async (sink: string, url: string, headers: Record<string, string>, body: unknown) => {
+      try {
+        const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`);
+        return null;
+      } catch (cause) {
+        bb.log.warn(`${sink} ping for ${prLabel(row)}: ${errorMessage(cause)}`);
+        return `${sink}: ${errorMessage(cause)}`;
+      }
+    };
+    if (slackWebhookUrl.trim() !== "") {
+      const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const mention = slackMention.trim();
+      const text = `${mention === "" ? "" : `${mention} `}*${EVENT_HEADLINE[event]}*: <${row.url}|${prLabel(row)}> ${esc(row.title)}\n${esc(why)}`;
+      sends.push(post("slack", slackWebhookUrl.trim(), {}, { text }));
     }
+    if (eventWebhookUrl.trim() !== "") {
+      const card = summarize(row);
+      sends.push(post("event webhook", eventWebhookUrl.trim(), eventWebhookSecret.trim() === "" ? {} : { "X-Webhook-Secret": eventWebhookSecret.trim() }, {
+        source: "review-desk",
+        event,
+        headline: EVENT_HEADLINE[event],
+        why,
+        pr: { url: row.url, repo: `${row.owner}/${row.repo}`, number: row.number, title: row.title, author: row.author, headSha: row.head_sha, stage: card.stage },
+        factory: card.factory,
+        checks: { ...card.checks, failing: card.failingChecks },
+      }));
+    }
+    if (sends.length === 0) return ["neither slackWebhookUrl nor eventWebhookUrl is set"];
+    return (await Promise.all(sends)).filter((f): f is string => f !== null);
   }
 
   function factorySummary(row: ReviewRow): ReviewSummary["factory"] {
@@ -2928,7 +2952,7 @@ export default async function plugin(bb: BbPluginApi) {
       else if (p.stage === "human_review") await humanReviewTick(row, p);
       else if (p.stage === "changes_requested" && p.head_seen_at !== null && p.head_seen_at > p.entered_at) {
         setStage(row, "human_review", "New commits since your review");
-        await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "Ready for you again", "new commits since your review");
+        await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "ready_again", "new commits since your review");
       }
     } finally {
       advancing.delete(reviewId);
@@ -3106,7 +3130,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (handoff) {
         const why = high === 0 ? `AI round ${round} found nothing above a nit` : `${high} finding${high === 1 ? "" : "s"} above a nit still open after ${round} AI round${round === 1 ? "" : "s"}`;
         setStage(row, "human_review", why);
-        await letYouKnow(row, q.aiReviewer.get(reviewId)?.thread_id, "Ready for you", why);
+        await letYouKnow(row, q.aiReviewer.get(reviewId)?.thread_id, "ready_for_you", why);
       }
     } catch (cause) {
       q.setRoundStatus.run("failed", errorMessage(cause), Date.now(), reviewId, round);
@@ -3159,7 +3183,7 @@ export default async function plugin(bb: BbPluginApi) {
       q.setBabysit.run(row.head_sha, key, passes, "needs_human", now, row.id);
       q.setNeedsYou.run(why, now, row.id);
       publish(row.id, "board");
-      await letYouKnow(row, q.babysitter.get(row.id)?.thread_id, "Needs you", why);
+      await letYouKnow(row, q.babysitter.get(row.id)?.thread_id, "needs_you", why);
       return;
     }
     q.setBabysit.run(row.head_sha, key, passes + 1, "running", now, row.id);
@@ -3189,7 +3213,7 @@ export default async function plugin(bb: BbPluginApi) {
     q.setBabysit.run(p.babysit_head, p.babysit_key, p.babysit_passes, outcome, now, reviewId);
     if (outcome === "needs_human") {
       q.setNeedsYou.run(detail, now, reviewId);
-      await letYouKnow(row, q.babysitter.get(reviewId)?.thread_id, "Needs you", detail);
+      await letYouKnow(row, q.babysitter.get(reviewId)?.thread_id, "needs_you", detail);
     }
     publish(reviewId, "board");
   }
@@ -3603,8 +3627,8 @@ export default async function plugin(bb: BbPluginApi) {
             const [action, reviewId] = rest;
             const row = requireReview(reviewId ?? "");
             if (action === "ping") {
-              const failure = await ping(row, "Test ping", "Review Desk can reach you on Slack");
-              return failure === null ? ok({ ok: true }, "Sent a test ping to Slack") : { exitCode: 1, stderr: `Slack ping failed: ${failure}` };
+              const failures = await ping(row, "test", "Review Desk can reach you");
+              return failures.length === 0 ? ok({ ok: true }, "Sent a test ping to every configured sink") : { exitCode: 1, stderr: `Ping failed: ${failures.join("; ")}` };
             }
             if (action === "start") startFactory(row, true);
             else if (action === "stop") {
