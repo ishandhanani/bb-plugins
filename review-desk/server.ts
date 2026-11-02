@@ -965,6 +965,7 @@ export default async function plugin(bb: BbPluginApi) {
     simpleEnglishModel: { type: "string", label: "Model for the Simple English thread; empty uses helperModel, then the project's default", default: "" },
     simpleEnglishSkill: { type: "string", label: "Optional file appended to the rewrite prompt as vocabulary help (for example a simple-english SKILL.md); empty uses a short built-in word list", default: "" },
     boardRefresh: { type: "string", label: "Cron (5 fields, server-local time) for syncing the board's open PRs with GitHub in the background; empty turns it off", default: "*/15 * * * *" },
+    threadSection: { type: "string", label: "Sidebar section (folder) for the threads Review Desk starts (chat, AI review, babysit); created on first use; empty leaves them unsectioned", default: "Review Desk" },
     worktreesDir: { type: "string", label: "Directory on the repository's machine for the PR worktrees; empty uses ~/.review-desk/worktrees. Keep it outside bb's data dir, or bb refuses to run the chat and helper threads there", default: "" },
     autoAiReview: { type: "boolean", label: "PR factory: start AI review rounds when a PR is added to the board (they post COMMENT reviews to GitHub under your gh login)", default: true },
     aiReviewProvider: { type: "string", label: "PR factory: provider id for the AI reviewer", default: "claude-code" },
@@ -983,7 +984,7 @@ export default async function plugin(bb: BbPluginApi) {
     eventWebhookSecret: { type: "string", secret: true, label: "PR factory: secret sent as X-Webhook-Secret with each event", default: "" },
   });
   const {
-    defaultProvider, hideSeatThreads, autoBrief, autoGuide, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir,
+    defaultProvider, hideSeatThreads, autoBrief, autoGuide, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir, threadSection,
     autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
   } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
@@ -1587,6 +1588,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...execution,
       ...(permissionMode ? { permissionMode } : {}),
       title: `Review Desk ${row.owner}/${row.repo}#${row.number}: ${provider.displayName}`,
+      sectionId: await sectionId(),
       visibility: hideSeatThreads ? "hidden" : "visible",
       // The intro is agent-only context so the chat transcript starts with the
       // reviewer's own question.
@@ -2002,6 +2004,24 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  let sectionLookup: Promise<string | null> | null = null;
+  /** The sidebar section Review Desk's threads go in, created on first use; null when the setting is empty or the lookup fails. */
+  function sectionId(): Promise<string | null> {
+    const name = threadSection.trim();
+    if (name === "") return Promise.resolve(null);
+    sectionLookup ??= (async () => {
+      try {
+        const existing = (await bb.sdk.threadSections.list()).find((s) => s.name === name);
+        return existing?.id ?? (await bb.sdk.threadSections.create({ name })).id;
+      } catch (cause) {
+        bb.log.warn(`thread section "${name}": ${errorMessage(cause)}`);
+        sectionLookup = null;
+        return null;
+      }
+    })();
+    return sectionLookup;
+  }
+
   async function laneSend(lane: Lane, row: ReviewRow, job: string, text: string): Promise<void> {
     const existing = lane.get(row.id);
     const wantedProvider = lane.providerId !== "" ? lane.providerId : (existing?.provider_id ?? defaultProvider);
@@ -2045,6 +2065,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...(lane.model.trim() !== "" ? { model: lane.model.trim() } : {}),
       ...(lane.reasoningLevel === undefined ? {} : { reasoningLevel: lane.reasoningLevel }),
       title: `Review Desk ${row.owner}/${row.repo}#${row.number}: ${lane.title}`,
+      sectionId: await sectionId(),
       visibility: hideSeatThreads ? "hidden" : "visible",
       input: [{ type: "text", text: intro, mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
     });
@@ -2872,7 +2893,7 @@ export default async function plugin(bb: BbPluginApi) {
     await ping(row, event, why);
     if (threadId === undefined) return;
     try {
-      await bb.sdk.threads.update({ threadId, visibility: "visible", title: `${EVENT_HEADLINE[event]}: ${prLabel(row)}: ${why}`.slice(0, 200) });
+      await bb.sdk.threads.update({ threadId, visibility: "visible", title: `${EVENT_HEADLINE[event]}: ${prLabel(row)}: ${why}`.slice(0, 200), ...((await sectionId()) === null ? {} : { sectionId: await sectionId() }) });
       await bb.sdk.threads.markUnread({ threadId });
     } catch (cause) {
       bb.log.warn(`surface ${threadId}: ${errorMessage(cause)}`);
