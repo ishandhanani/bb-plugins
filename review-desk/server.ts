@@ -976,10 +976,12 @@ export default async function plugin(bb: BbPluginApi) {
     babysitProvider: { type: "string", label: "PR factory: provider id for the CI babysitter", default: "claude-code" },
     babysitModel: { type: "string", label: "PR factory: model for the CI babysitter (a small one is enough)", default: "claude-haiku-5-5" },
     babysitMaxPasses: { type: "number", label: "PR factory: babysit passes per head before CI failures are handed to you", default: 3 },
+    slackWebhookUrl: { type: "string", secret: true, label: "PR factory: Slack incoming webhook URL; when set, you are pinged there whenever a PR needs you", default: "" },
+    slackMention: { type: "string", label: "PR factory: optional mention at the start of each Slack ping, for example <@U0123ABCD>", default: "" },
   });
   const {
     defaultProvider, hideSeatThreads, autoBrief, autoGuide, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir,
-    autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses,
+    autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, slackWebhookUrl, slackMention,
   } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
 
@@ -2858,14 +2860,32 @@ export default async function plugin(bb: BbPluginApi) {
     publish(row.id, "board");
   }
 
-  /** Let you know: the thread shows in the sidebar, unread, under a title that says why. */
-  async function surface(threadId: string | undefined, title: string): Promise<void> {
+  /** Let you know: the thread shows in the sidebar, unread, under a title that says why, and Slack pings you. */
+  async function letYouKnow(row: ReviewRow, threadId: string | undefined, headline: string, why: string): Promise<void> {
+    await ping(row, headline, why);
     if (threadId === undefined) return;
     try {
-      await bb.sdk.threads.update({ threadId, visibility: "visible", title: title.slice(0, 200) });
+      await bb.sdk.threads.update({ threadId, visibility: "visible", title: `${headline}: ${prLabel(row)}: ${why}`.slice(0, 200) });
       await bb.sdk.threads.markUnread({ threadId });
     } catch (cause) {
       bb.log.warn(`surface ${threadId}: ${errorMessage(cause)}`);
+    }
+  }
+
+  /** Post to the Slack incoming webhook, when one is set. Returns the error, if any. */
+  async function ping(row: ReviewRow, headline: string, why: string): Promise<string | null> {
+    const url = slackWebhookUrl.trim();
+    if (url === "") return "slackWebhookUrl is not set";
+    const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const mention = slackMention.trim();
+    const text = `${mention === "" ? "" : `${mention} `}*${esc(headline)}*: <${row.url}|${prLabel(row)}> ${esc(row.title)}\n${esc(why)}`;
+    try {
+      const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) });
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`);
+      return null;
+    } catch (cause) {
+      bb.log.warn(`slack ping for ${prLabel(row)}: ${errorMessage(cause)}`);
+      return errorMessage(cause);
     }
   }
 
@@ -2908,7 +2928,7 @@ export default async function plugin(bb: BbPluginApi) {
       else if (p.stage === "human_review") await humanReviewTick(row, p);
       else if (p.stage === "changes_requested" && p.head_seen_at !== null && p.head_seen_at > p.entered_at) {
         setStage(row, "human_review", "New commits since your review");
-        await surface(q.aiReviewer.get(row.id)?.thread_id, `Ready for you again: ${prLabel(row)}`);
+        await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "Ready for you again", "new commits since your review");
       }
     } finally {
       advancing.delete(reviewId);
@@ -3086,7 +3106,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (handoff) {
         const why = high === 0 ? `AI round ${round} found nothing above a nit` : `${high} finding${high === 1 ? "" : "s"} above a nit still open after ${round} AI round${round === 1 ? "" : "s"}`;
         setStage(row, "human_review", why);
-        await surface(q.aiReviewer.get(reviewId)?.thread_id, `Ready for you: ${prLabel(row)} (${why})`);
+        await letYouKnow(row, q.aiReviewer.get(reviewId)?.thread_id, "Ready for you", why);
       }
     } catch (cause) {
       q.setRoundStatus.run("failed", errorMessage(cause), Date.now(), reviewId, round);
@@ -3139,7 +3159,7 @@ export default async function plugin(bb: BbPluginApi) {
       q.setBabysit.run(row.head_sha, key, passes, "needs_human", now, row.id);
       q.setNeedsYou.run(why, now, row.id);
       publish(row.id, "board");
-      await surface(q.babysitter.get(row.id)?.thread_id, `Needs you: ${prLabel(row)}: ${why}`);
+      await letYouKnow(row, q.babysitter.get(row.id)?.thread_id, "Needs you", why);
       return;
     }
     q.setBabysit.run(row.head_sha, key, passes + 1, "running", now, row.id);
@@ -3169,7 +3189,7 @@ export default async function plugin(bb: BbPluginApi) {
     q.setBabysit.run(p.babysit_head, p.babysit_key, p.babysit_passes, outcome, now, reviewId);
     if (outcome === "needs_human") {
       q.setNeedsYou.run(detail, now, reviewId);
-      await surface(q.babysitter.get(reviewId)?.thread_id, `Needs you: ${prLabel(row)}: ${detail}`);
+      await letYouKnow(row, q.babysitter.get(reviewId)?.thread_id, "Needs you", detail);
     }
     publish(reviewId, "board");
   }
@@ -3522,7 +3542,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "board", summary: "Print the board: every tracked PR under its column", usage: "bb review-desk board [--json]" },
       { name: "move", summary: "Drag a card to a column, or back to the column GitHub's state gives it", usage: "bb review-desk move <reviewId> <unreviewed|ai_review|human_review|changes_requested|babysit|auto> [--json]" },
       { name: "refresh", summary: "Sync every open PR with GitHub", usage: "bb review-desk refresh [--json]" },
-      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show> <reviewId> [--json]" },
+      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show|ping> <reviewId> [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "codemap", summary: "Build or print the codemap", usage: "bb review-desk codemap <reviewId> [--json]" },
       { name: "guide", summary: "Write or print the reading guide over the codemap", usage: "bb review-desk guide <reviewId> [--rewrite] [--json]" },
@@ -3582,11 +3602,15 @@ export default async function plugin(bb: BbPluginApi) {
           case "factory": {
             const [action, reviewId] = rest;
             const row = requireReview(reviewId ?? "");
+            if (action === "ping") {
+              const failure = await ping(row, "Test ping", "Review Desk can reach you on Slack");
+              return failure === null ? ok({ ok: true }, "Sent a test ping to Slack") : { exitCode: 1, stderr: `Slack ping failed: ${failure}` };
+            }
             if (action === "start") startFactory(row, true);
             else if (action === "stop") {
               q.deletePipeline.run(row.id);
               publish(row.id, "board");
-            } else if (action !== "show") return { exitCode: 1, stderr: "usage: bb review-desk factory <start|stop|show> <reviewId>" };
+            } else if (action !== "show") return { exitCode: 1, stderr: "usage: bb review-desk factory <start|stop|show|ping> <reviewId>" };
             const card = summarize(requireReview(row.id));
             const rounds = q.rounds.all(row.id);
             const findings = q.findings.all(row.id);

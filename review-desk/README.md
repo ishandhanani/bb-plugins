@@ -55,7 +55,7 @@ bb review-desk list
 bb review-desk board
 bb review-desk move <reviewId> <unreviewed|ai_review|human_review|changes_requested|babysit|auto>
 bb review-desk refresh
-bb review-desk factory <start|stop|show> <reviewId>
+bb review-desk factory <start|stop|show|ping> <reviewId>
 bb review-desk ask <reviewId> <text...> [--provider <id>]
 bb review-desk codemap <reviewId>
 bb review-desk guide <reviewId> [--rewrite]
@@ -82,4 +82,6 @@ bb review-desk guide <reviewId> [--rewrite]
 - `aiReviewEmpirical` (default false): let the reviewer run skills that build, launch servers, or run GPU or load tests. Off, it applies them by reading the code.
 - `babysitProvider` / `babysitModel` (default `claude-code` / `claude-haiku-5-5`): the CI babysitter.
 - `babysitMaxPasses` (default 3): babysit passes per head before CI failures are handed to you.
+- `slackWebhookUrl` (secret, default empty): a Slack incoming webhook. When set, every hand-off to you (Ready for you, Ready for you again, Needs you) also pings Slack with the PR link and why. `bb review-desk factory ping <reviewId>` sends a test.
+- `slackMention` (default empty): put at the start of each ping, for example `<@U0123ABCD>`, so a channel webhook notifies you.
 - `worktreesDir` (default empty): directory on the repository's machine for the PR worktrees; empty uses `~/.review-desk/worktrees`. Keep it outside bb's data dir, or bb refuses to run the chat and helper threads there. Changing it moves each worktree on its next sync. Removing a PR from the board removes its worktree too, unless it has local changes.
