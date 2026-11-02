@@ -1,0 +1,23 @@
+{
+  "name": "bb-plugin-short-titles",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "bb": ">=0.46",
+    "bbPluginSdk": ">=0.6.37"
+  },
+  "bb": {
+    "name": "Short Titles",
+    "description": "Gives new threads a 3-4 word title.",
+    "branding": {
+      "icon": "Type"
+    },
+    "server": "./server.ts",
+    "skills": []
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.37",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
