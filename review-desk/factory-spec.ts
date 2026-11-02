@@ -87,10 +87,10 @@ export function roundPrompt(c: RoundContext): string {
   if (c.prev === null) {
     return [...head, ...howToReview(c), ...threads, "", OUTPUT_SHAPE].join("\n");
   }
-  const rewritten = `If ${c.prev.headSha} is not an ancestor of ${c.headSha} the branch was rewritten; compare with git range-diff ${c.prev.baseSha}..${c.prev.headSha} ${c.baseSha}..${c.headSha}.`;
+  const p = c.prev;
   return [
     ...head,
-    `The previous round reviewed head ${c.prev.headSha}. This round is targeted: new commits are git log --oneline ${c.prev.headSha}..${c.headSha} and their diff is git diff ${c.prev.headSha} ${c.headSha}. ${rewritten}`,
+    `The previous round reviewed head ${p.headSha} (merge base ${p.baseSha}). This round is targeted at what the PR itself changed since then. That is the difference between the PR's diff then (git diff ${p.baseSha} ${p.headSha}) and now (git diff ${c.baseSha} ${c.headSha}), not git diff ${p.headSha} ${c.headSha}, which also carries everything merged in from ${c.baseRef}. Compare the two per file, for example diff <(git diff ${p.baseSha} ${p.headSha} -- <path>) <(git diff ${c.baseSha} ${c.headSha} -- <path>). The PR's own new commits, with merges from ${c.baseRef} shown as one line each: git log --first-parent --oneline ${p.headSha}..${c.headSha} (after a rebase, git range-diff ${p.baseSha}..${p.headSha} ${c.baseSha}..${c.headSha}).`,
     "",
     "Open findings from earlier rounds:",
     ...(c.prior.length === 0 ? ["  (none)"] : c.prior.map((f) => `  [${f.id}] round ${f.round}, ${f.severity}, ${f.path}:${f.line}: ${f.title}\n      ${f.body.replace(/\s+/g, " ").slice(0, 400)}`)),
