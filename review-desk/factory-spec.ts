@@ -161,8 +161,13 @@ export function parseAiReply(text: string): AiReply {
 
 export interface PostedFinding { severity: string; path: string; line: number; startLine: number | null; title: string; body: string; suggestion: string | null }
 
+/** The first line of a finding's inline comment; also how the factory finds its own thread later. */
+export function findingHeader(severity: string, title: string, round: number): string {
+  return `**[${severity}] ${title.trim()}** (AI review, round ${round})`;
+}
+
 export function findingComment(f: PostedFinding, round: number): string {
-  const parts = [`**[${f.severity}] ${f.title.trim()}** (AI review, round ${round})`, f.body.trim()];
+  const parts = [findingHeader(f.severity, f.title, round), f.body.trim()];
   if (f.suggestion !== null && f.suggestion.trim() !== "") parts.push("```suggestion\n" + f.suggestion.replace(/^```\w*\n?|```$/g, "").replace(/\n$/, "") + "\n```");
   return parts.filter((p) => p !== "").join("\n\n");
 }

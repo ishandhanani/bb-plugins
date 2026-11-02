@@ -23,6 +23,7 @@ import {
   babysitIntro,
   babysitPrompt,
   findingComment,
+  findingHeader,
   isHighValue,
   parseAiReply,
   parseBabysitReply,
@@ -3126,7 +3127,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       for (const f of findings) q.insertFinding.run(newId(), reviewId, round, f.path, f.line, f.startLine, f.severity, f.title, f.body, f.suggestion, inline.includes(f) ? 1 : 0, now);
       q.setRoundPosted.run(reply.summary, high, posted.url, text.slice(0, 200_000), Date.now(), reviewId, round);
-      await refreshThreads(row).catch(() => undefined);
+      await resolveFindingThreads(row, r.head_sha).catch((cause: unknown) => bb.log.warn(`resolving threads on ${prLabel(row)}: ${errorMessage(cause)}`));
       if (handoff) {
         const why = high === 0 ? `AI round ${round} found nothing above a nit` : `${high} finding${high === 1 ? "" : "s"} above a nit still open after ${round} AI round${round === 1 ? "" : "s"}`;
         setStage(row, "human_review", why);
@@ -3140,6 +3141,37 @@ export default async function plugin(bb: BbPluginApi) {
     pumpRounds();
   }
 
+  /**
+   * Close the factory's own inline threads for findings a later round marked
+   * fixed or obsolete: a one-line reply saying so, then resolve. Threads you
+   * already resolved, or that are not the factory's, are left alone.
+   */
+  async function resolveFindingThreads(row: ReviewRow, atSha: string): Promise<number> {
+    const closed = q.findings.all(row.id).filter((f) => f.inline === 1 && (f.status === "fixed" || f.status === "obsolete"));
+    if (closed.length === 0) return 0;
+    const threads = await refreshThreads(row);
+    let resolved = 0;
+    for (const f of closed) {
+      const header = findingHeader(f.severity, f.title, f.round);
+      const thread = threads.find((t) => !t.isResolved && t.path === f.path && (t.comments[0]?.body ?? "").startsWith(header));
+      const first = thread?.comments[0];
+      if (thread === undefined || first === undefined) continue;
+      const note = (f.note ?? "").trim();
+      try {
+        if (first.databaseId !== null) {
+          const body = `${f.status === "fixed" ? "Fixed" : "No longer applies"} as of ${atSha.slice(0, 10)} (AI review)${note === "" ? "." : `: ${note}`}`;
+          await host.call("gh_reply", { owner: row.owner, repo: row.repo, number: row.number, commentId: first.databaseId, body }, hostOptions(row));
+        }
+        await host.call("gh_resolve", { threadId: thread.id, resolve: true }, hostOptions(row));
+        resolved++;
+      } catch (cause) {
+        bb.log.warn(`resolving ${f.path}:${f.line} on ${prLabel(row)}: ${errorMessage(cause)}`);
+      }
+    }
+    if (resolved > 0) await refreshThreads(row).catch(() => undefined);
+    return resolved;
+  }
+
   const viewers = new Map<string, string>();
   async function viewerLogin(row: ReviewRow): Promise<string> {
     const known = viewers.get(row.host_id);
@@ -3149,14 +3181,20 @@ export default async function plugin(bb: BbPluginApi) {
     return login;
   }
 
-  /** Your own review after the hand-off (not one the factory posted under your login): anything but an approval waits on the author. */
+  /**
+   * Your own review after the hand-off: not one the factory posted under your
+   * login, and not an empty comment-only review (thread replies, including the
+   * factory's own on threads it resolves). An approval wins and moves the PR to
+   * Babysit through GitHub's state; anything else waits on the author.
+   */
   async function humanReviewTick(row: ReviewRow, p: PipelineRow): Promise<void> {
     const login = await viewerLogin(row);
     const conversation = await host.call("gh_conversation", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
     q.setConversationCache.run(row.id, JSON.stringify(conversation), Date.now());
-    const mine = conversation.reviews.filter((r) => r.author === login && !r.body.includes(AI_ROUND_MARKER) && r.submittedAt !== null && Date.parse(r.submittedAt) > p.entered_at);
-    const latest = mine.at(-1);
-    if (latest === undefined || latest.state === "APPROVED") return;
+    const mine = conversation.reviews.filter(
+      (r) => r.author === login && !r.body.includes(AI_ROUND_MARKER) && (r.state !== "COMMENTED" || r.body.trim() !== "") && r.submittedAt !== null && Date.parse(r.submittedAt) > p.entered_at,
+    );
+    if (mine.length === 0 || mine.some((r) => r.state === "APPROVED")) return;
     setStage(row, "changes_requested");
   }
 
@@ -3287,6 +3325,10 @@ export default async function plugin(bb: BbPluginApi) {
     publish(row.id, "pending");
     // Your own review from here: a comment or a change request waits on the author; an approval moves to Babysit through GitHub's state.
     if (event !== "APPROVE" && q.pipeline.get(row.id)?.stage === "human_review") setStage(row, "changes_requested");
+    // Re-read GitHub now so the card moves (an approval to Babysit) without waiting for the next board refresh.
+    void lightSync(requireReview(row.id))
+      .then(() => advanceFactory(row.id))
+      .catch((cause: unknown) => bb.log.warn(`sync after review on ${prLabel(row)}: ${errorMessage(cause)}`));
     return { url: result.url, posted: pending.length };
   }
 
@@ -3566,7 +3608,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "board", summary: "Print the board: every tracked PR under its column", usage: "bb review-desk board [--json]" },
       { name: "move", summary: "Drag a card to a column, or back to the column GitHub's state gives it", usage: "bb review-desk move <reviewId> <unreviewed|ai_review|human_review|changes_requested|babysit|auto> [--json]" },
       { name: "refresh", summary: "Sync every open PR with GitHub", usage: "bb review-desk refresh [--json]" },
-      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show|ping> <reviewId> [--json]" },
+      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show|ping|resolve> <reviewId> [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "codemap", summary: "Build or print the codemap", usage: "bb review-desk codemap <reviewId> [--json]" },
       { name: "guide", summary: "Write or print the reading guide over the codemap", usage: "bb review-desk guide <reviewId> [--rewrite] [--json]" },
@@ -3630,11 +3672,16 @@ export default async function plugin(bb: BbPluginApi) {
               const failures = await ping(row, "test", "Review Desk can reach you");
               return failures.length === 0 ? ok({ ok: true }, "Sent a test ping to every configured sink") : { exitCode: 1, stderr: `Ping failed: ${failures.join("; ")}` };
             }
+            if (action === "resolve") {
+              const last = q.rounds.all(row.id).filter((r) => r.status === "posted").at(-1);
+              const resolved = last === undefined ? 0 : await resolveFindingThreads(row, last.head_sha);
+              return ok({ resolved }, `Resolved ${resolved} thread${resolved === 1 ? "" : "s"} for fixed or obsolete findings`);
+            }
             if (action === "start") startFactory(row, true);
             else if (action === "stop") {
               q.deletePipeline.run(row.id);
               publish(row.id, "board");
-            } else if (action !== "show") return { exitCode: 1, stderr: "usage: bb review-desk factory <start|stop|show|ping> <reviewId>" };
+            } else if (action !== "show") return { exitCode: 1, stderr: "usage: bb review-desk factory <start|stop|show|ping|resolve> <reviewId>" };
             const card = summarize(requireReview(row.id));
             const rounds = q.rounds.all(row.id);
             const findings = q.findings.all(row.id);
