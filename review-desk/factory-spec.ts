@@ -62,10 +62,16 @@ export interface RoundContext {
   empirical: boolean;
 }
 
-export function reviewerIntro(c: { owner: string; repo: string; number: number; title: string }): string {
+/** Where a thread's commands run: it starts in a folder shared by every PR of the repository, so it works in its own worktree. */
+function worktreeLine(worktree: string): string {
+  return `The PR's worktree is ${worktree}. Your shell starts in a folder shared by every PR under review in this repository, so run each command in the worktree: cd ${worktree} && <command>, or git -C ${worktree} <args>.`;
+}
+
+export function reviewerIntro(c: { owner: string; repo: string; number: number; title: string; worktree: string }): string {
   return [
     `You are the AI reviewer for pull request #${c.number} of ${c.owner}/${c.repo}: "${c.title}". Each message is one review round. Answer each round with exactly one fenced block tagged ${AI_REVIEW_FENCE} containing JSON, and nothing after it.`,
-    "Your working directory is a detached worktree of the repository. Read code at the exact shas each round gives you (git show <sha>:<path>, git diff <a> <b>); the checkout may lag the head.",
+    worktreeLine(c.worktree),
+    "Read code at the exact shas each round gives you (git show <sha>:<path>, git diff <a> <b>); the checkout may lag the head.",
     "You are read-only: never modify files, never commit, never push, never post to GitHub or comment on the PR. The server posts your result as a review.",
   ].join("\n");
 }
@@ -238,9 +244,10 @@ export function reviewBody(args: {
 export const BABYSIT_OUTCOMES = ["rerun", "waiting", "needs_human", "ok"] as const;
 export type BabysitOutcome = (typeof BABYSIT_OUTCOMES)[number];
 
-export function babysitIntro(c: { owner: string; repo: string; number: number; title: string }): string {
+export function babysitIntro(c: { owner: string; repo: string; number: number; title: string; worktree: string }): string {
   return [
     `You babysit CI for pull request #${c.number} of ${c.owner}/${c.repo}: "${c.title}" until it merges. Each message is one pass. Answer each pass with exactly one fenced block tagged ${BABYSIT_FENCE} containing JSON, and nothing after it.`,
+    worktreeLine(c.worktree),
     "Hard rules: never edit files, never commit, never push, never merge, never close, never comment on the PR or its threads. The only GitHub write you may make is re-running failed jobs (gh run rerun <run-id> --failed).",
     "Anything that needs a code change, a rebase, a push, or a decision goes back to the human: report needs_human and stop.",
   ].join("\n");

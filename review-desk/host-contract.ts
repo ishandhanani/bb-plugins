@@ -167,6 +167,11 @@ export const hostContract = defineRpcContract({
     input: z.object({ threadId: z.string(), resolve: z.boolean() }),
     output: z.object({ ok: z.literal(true) }),
   },
+  /** A folder per repository that links each PR worktree as pr-<number>: the workspace Review Desk's visible threads share. */
+  review_group_dir: {
+    input: z.object({ worktree: z.string(), group: z.string(), number: z.number() }),
+    output: z.object({ path: z.string() }),
+  },
   /** Build diffmap's viewer once per pinned commit (clone, patch, npm ci, vite build); returns the built files. */
   diffmap_prepare: {
     input: z.object({}),

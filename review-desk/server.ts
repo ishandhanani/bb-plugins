@@ -610,6 +610,8 @@ const MIGRATIONS = [
      error TEXT,
      updated_at INTEGER NOT NULL
    )`,
+  // One environment per project, machine, and repository that Review Desk's visible threads share, so the sidebar folds them into one folder.
+  `CREATE TABLE IF NOT EXISTS shared_envs (key TEXT PRIMARY KEY, environment_id TEXT NOT NULL)`,
 ];
 
 interface ReviewRow {
@@ -751,6 +753,9 @@ function createStore(db: Database.Database) {
     setMapReady: db.prepare<[string, string, number, string]>(`UPDATE maps SET status = 'ready', markdown = ?, markdown_head_sha = head_sha, raw = ?, error = NULL, updated_at = ? WHERE review_id = ?`),
     setMapFailed: db.prepare<[string, string | null, number, string]>(`UPDATE maps SET status = 'failed', error = ?, raw = ?, updated_at = ? WHERE review_id = ?`),
     deleteMap: db.prepare<[string]>(`DELETE FROM maps WHERE review_id = ?`),
+    sharedEnv: db.prepare<[string], { key: string; environment_id: string }>(`SELECT * FROM shared_envs WHERE key = ?`),
+    setSharedEnv: db.prepare<[string, string]>(`INSERT INTO shared_envs (key, environment_id) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET environment_id = excluded.environment_id`),
+    deleteSharedEnv: db.prepare<[string]>(`DELETE FROM shared_envs WHERE key = ?`),
     boardStage: db.prepare<[string], BoardStageRow>(`SELECT * FROM board_stages WHERE review_id = ?`),
     setBoardStage: db.prepare<[string, string, string, number]>(
       `INSERT INTO board_stages (review_id, stage, auto_stage, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET stage = excluded.stage, auto_stage = excluded.auto_stage, updated_at = excluded.updated_at`,
@@ -1815,6 +1820,11 @@ export default async function plugin(bb: BbPluginApi) {
     reasoningLevel?: "none" | "low";
     /** When true, a live thread spawned with a different intro is replaced, so prompt changes take effect. */
     replaceOnIntroChange: boolean;
+    /**
+     * The lane's threads surface in the sidebar, so they run in the repository's
+     * shared environment (one folder per project) instead of the PR worktree's.
+     */
+    shared?: boolean;
     get: (reviewId: string) => HelperRow | undefined;
     upsert: (reviewId: string, threadId: string, providerId: string, environmentId: string | null, createdAt: number, introHash: string) => void;
     setJob: (job: string | null, reviewId: string) => void;
@@ -1899,8 +1909,29 @@ export default async function plugin(bb: BbPluginApi) {
     return sectionLookup;
   }
 
+  /** Environments being created for a shared key: the first spawn creates it, later ones wait for its id. */
+  const sharedCreating = new Map<string, Promise<string | null>>();
+
+  /** The repository's shared environment for visible threads: its id when it exists, and the folder to create it in otherwise. */
+  async function sharedWorkspace(row: ReviewRow, projectId: string): Promise<{ key: string; environmentId: string | null; path: string }> {
+    const key = `${projectId}:${row.host_id}:${row.owner}/${row.repo}`;
+    const { path } = await host.call("review_group_dir", { worktree: row.worktree, group: `${row.owner}__${row.repo}`, number: row.number }, hostOptions(row));
+    let environmentId = q.sharedEnv.get(key)?.environment_id ?? null;
+    if (environmentId !== null) {
+      const alive = await bb.sdk.environments.get({ environmentId }).then((e) => e.lifecycle.phase === "active", () => false);
+      if (!alive) {
+        q.deleteSharedEnv.run(key);
+        environmentId = null;
+      }
+    }
+    if (environmentId === null) environmentId = (await sharedCreating.get(key)) ?? null;
+    return { key, environmentId, path };
+  }
+
   async function laneSend(lane: Lane, row: ReviewRow, job: string, text: string): Promise<void> {
     const existing = lane.get(row.id);
+    const projectId = await chatProjectId(row);
+    const shared = lane.shared ? await sharedWorkspace(row, projectId) : null;
     const wantedProvider = lane.providerId !== "" ? lane.providerId : (existing?.provider_id ?? defaultProvider);
     const intro = lane.intro(row);
     const introHash = simpleHash(intro);
@@ -1908,7 +1939,10 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         const thread = await bb.sdk.threads.get({ threadId: existing.thread_id });
         const sameIntro = !lane.replaceOnIntroChange || existing.intro_hash === introHash;
-        if (thread.archivedAt === null && thread.deletedAt === null && existing.provider_id === wantedProvider && sameIntro) {
+        // A thread from before the shared environment moves there on its next job; a visible one is archived so it does not linger.
+        const sameEnvironment = shared === null || shared.environmentId === null || existing.environment_id === shared.environmentId;
+        if (!sameEnvironment && thread.visibility === "visible" && thread.archivedAt === null) await bb.sdk.threads.archive({ threadId: existing.thread_id }).catch(() => undefined);
+        if (thread.archivedAt === null && thread.deletedAt === null && existing.provider_id === wantedProvider && sameIntro && sameEnvironment) {
           lane.setJob(job, row.id);
           await bb.sdk.threads.send({
             threadId: existing.thread_id,
@@ -1930,18 +1964,18 @@ export default async function plugin(bb: BbPluginApi) {
     if (provider === undefined) throw new Error(`unknown provider ${providerId}`);
     const modes = provider.capabilities.permissionModes;
     const permissionMode = modes.includes("auto") ? "auto" : modes.includes("accept-edits") ? "accept-edits" : undefined;
-    const knownEnvironment = row.environment_id ?? q.seats.all(row.id).find((s) => s.environment_id !== null)?.environment_id ?? null;
+    const knownEnvironment = shared !== null ? shared.environmentId : row.environment_id ?? q.seats.all(row.id).find((s) => s.environment_id !== null)?.environment_id ?? null;
     const now = Date.now();
     const thread = await bb.sdk.threads.spawn({
-      projectId: await chatProjectId(row),
+      projectId,
       environment: knownEnvironment !== null
         ? { type: "reuse", environmentId: knownEnvironment }
-        : { type: "host", hostId: row.host_id, workspace: { type: "unmanaged", path: row.worktree } },
+        : { type: "host", hostId: row.host_id, workspace: { type: "unmanaged", path: shared?.path ?? row.worktree } },
       providerId,
       ...(permissionMode ? { permissionMode } : {}),
       ...(lane.model.trim() !== "" ? { model: lane.model.trim() } : {}),
       ...(lane.reasoningLevel === undefined ? {} : { reasoningLevel: lane.reasoningLevel }),
-      title: `Review Desk ${row.owner}/${row.repo}#${row.number}: ${lane.title}`,
+      title: `#${row.number} ${lane.title}`,
       sectionId: await sectionId(),
       visibility: hideSeatThreads ? "hidden" : "visible",
       input: [{ type: "text", text: intro, mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
@@ -1949,13 +1983,23 @@ export default async function plugin(bb: BbPluginApi) {
     lane.upsert(row.id, thread.id, providerId, knownEnvironment, now, introHash);
     lane.setJob(job, row.id);
     if (knownEnvironment === null) {
-      void (async () => {
+      const settled = (async () => {
         const environmentId = thread.environmentId ?? (await waitForEnvironment(thread.id));
-        if (environmentId !== null) {
+        if (environmentId === null) return null;
+        lane.upsert(row.id, thread.id, providerId, environmentId, now, introHash);
+        if (shared === null) {
           q.setEnvironment.run(environmentId, row.id);
-          lane.upsert(row.id, thread.id, providerId, environmentId, now, introHash);
+          return environmentId;
         }
+        // The shared environment's name is the sidebar folder's name.
+        q.setSharedEnv.run(shared.key, environmentId);
+        await bb.sdk.environments.update({ environmentId, name: threadSection.trim() || "Review Desk" }).catch((cause: unknown) => bb.log.warn(`naming the shared environment: ${errorMessage(cause)}`));
+        return environmentId;
       })();
+      if (shared !== null) {
+        sharedCreating.set(shared.key, settled);
+        void settled.finally(() => sharedCreating.delete(shared.key));
+      }
     }
   }
 
@@ -2642,6 +2686,7 @@ export default async function plugin(bb: BbPluginApi) {
   const reviewerLane: Lane = {
     title: "AI review",
     intro: reviewerIntro,
+    shared: true,
     providerId: aiReviewProvider.trim(),
     model: aiReviewModel,
     replaceOnIntroChange: false,
@@ -2653,6 +2698,7 @@ export default async function plugin(bb: BbPluginApi) {
   const babysitterLane: Lane = {
     title: "CI babysit",
     intro: babysitIntro,
+    shared: true,
     providerId: babysitProvider.trim(),
     model: babysitModel,
     reasoningLevel: "low",
@@ -2679,7 +2725,7 @@ export default async function plugin(bb: BbPluginApi) {
     await ping(row, event, why);
     if (threadId === undefined) return;
     try {
-      await bb.sdk.threads.update({ threadId, visibility: "visible", title: `${EVENT_HEADLINE[event]}: ${prLabel(row)}: ${why}`.slice(0, 200), ...((await sectionId()) === null ? {} : { sectionId: await sectionId() }) });
+      await bb.sdk.threads.update({ threadId, visibility: "visible", title: `#${row.number} · ${EVENT_HEADLINE[event]}`, ...((await sectionId()) === null ? {} : { sectionId: await sectionId() }) });
       await bb.sdk.threads.markUnread({ threadId });
     } catch (cause) {
       bb.log.warn(`surface ${threadId}: ${errorMessage(cause)}`);
