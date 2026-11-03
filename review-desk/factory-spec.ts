@@ -3,8 +3,27 @@
 // parsing, and the GitHub review body live here; the wiring is in server.ts.
 import { z } from "zod";
 
-export const AI_SEVERITIES = ["blocker", "major", "minor", "nit"] as const;
-export type AiSeverity = (typeof AI_SEVERITIES)[number];
+/** What a finding is, in the order a reviewer should read them. Only NIT never holds up a merge. */
+export const AI_LABELS = ["BLOCKER", "BUG", "PERF", "TEST", "DESIGN", "QUESTION", "NIT"] as const;
+export type AiLabel = (typeof AI_LABELS)[number];
+
+export const AI_LABEL_MEANING: Record<AiLabel, string> = {
+  BLOCKER: "must be fixed before merge: wrong results, a crash, data loss, a security hole, or a broken contract on a common path",
+  BUG: "a real bug on a less common path",
+  PERF: "a measurable cost on a hot path: allocations, copies, locking, serialization, or repeated work per request",
+  TEST: "risky logic with no test, or a test that does not check what it claims",
+  DESIGN: "structure, API, or naming that will cause bugs or make the code hard to change",
+  QUESTION: "something only the author can answer; the review cannot tell whether it is right",
+  NIT: "style, naming, comments, small cleanups; never holds up a merge on its own",
+};
+
+/** Findings stored before labels (blocker, major, minor, nit) keep working. */
+const LEGACY_LABELS: Record<string, AiLabel> = { blocker: "BLOCKER", major: "BUG", minor: "DESIGN", nit: "NIT" };
+
+export function normalizeLabel(value: string): AiLabel {
+  const upper = value.trim().toUpperCase();
+  return (AI_LABELS as readonly string[]).includes(upper) ? (upper as AiLabel) : LEGACY_LABELS[value.trim().toLowerCase()] ?? "BUG";
+}
 export const AI_FINDING_STATUSES = ["open", "fixed", "obsolete"] as const;
 export type AiFindingStatus = (typeof AI_FINDING_STATUSES)[number];
 
@@ -13,9 +32,9 @@ export const BABYSIT_FENCE = "babysit";
 /** Marks a review the factory posted, so a human review can be told apart from it under the same login. */
 export const AI_ROUND_MARKER = "<!-- review-desk:ai-round";
 
-/** Anything above a nit keeps a PR in AI review. */
-export function isHighValue(severity: string): boolean {
-  return severity !== "nit";
+/** Anything but a NIT keeps a PR in AI review. */
+export function isHighValue(label: string): boolean {
+  return normalizeLabel(label) !== "NIT";
 }
 
 export interface PriorFinding { id: string; round: number; severity: string; path: string; line: number; title: string; body: string }
@@ -55,10 +74,12 @@ const OUTPUT_SHAPE = [
   `Reply with one fenced block tagged ${AI_REVIEW_FENCE}:`,
   "{",
   '  "summary": string,            // 2-4 sentences for the PR author: what the change does and the overall verdict',
-  '  "findings": [{ "path": string, "line": number, "endLine"?: number, "severity": "blocker"|"major"|"minor"|"nit", "title": string, "body": string, "suggestion"?: string }],',
+  `  "findings": [{ "path": string, "line": number, "endLine"?: number, "label": ${AI_LABELS.map((l) => `"${l}"`).join("|")}, "title": string, "body": string, "suggestion"?: string }],`,
   '  "previous": [{ "id": string, "status": "fixed"|"open"|"obsolete", "note": string }]   // one entry per earlier finding listed in this round; empty in round 1',
   "}",
-  "severity: map whatever scale your skills use onto these four. nit means it would not hold up a merge on its own; a round that leaves only nits hands the PR to a human.",
+  "label: the one bucket that fits best. Map whatever scale your skills use onto these:",
+  ...AI_LABELS.map((l) => `  ${l}: ${AI_LABEL_MEANING[l]}`),
+  "A round that leaves only NITs hands the PR to a human.",
   "path and line: a changed file and a line number at the head sha, on a line the diff adds or shows as context. endLine for a range.",
   "title: at most 12 words. body: GitHub Markdown written to the PR author: what is wrong, when it triggers, what it costs, and the fix. suggestion: replacement code for exactly those lines, only when the fix is obvious.",
 ].join("\n");
@@ -114,7 +135,8 @@ const aiReplySchema = z.object({
         path: z.string(),
         line: z.coerce.number(),
         endLine: z.coerce.number().nullable().optional(),
-        severity: z.string(),
+        label: z.string().optional(),
+        severity: z.string().optional(),
         title: z.string(),
         body: z.string().default(""),
         suggestion: z.string().nullable().optional(),
@@ -149,13 +171,17 @@ function replyJson(text: string, fence: string): unknown {
   throw new Error(`no readable ${fence} block in the reply`);
 }
 
-export function parseAiReply(text: string): AiReply {
+/** A reply with every finding's label normalized into `severity` (the stored field) and sorted BLOCKER first. */
+export type ParsedAiReply = Omit<AiReply, "findings"> & { findings: (AiReply["findings"][number] & { severity: string })[] };
+
+export function parseAiReply(text: string): ParsedAiReply {
   const reply = aiReplySchema.parse(replyJson(text, AI_REVIEW_FENCE));
   return {
     ...reply,
     findings: reply.findings
       .filter((f) => f.line > 0 && f.title.trim() !== "")
-      .map((f) => ({ ...f, severity: (AI_SEVERITIES as readonly string[]).includes(f.severity) ? f.severity : "minor" })),
+      .map((f) => ({ ...f, severity: normalizeLabel(f.label ?? f.severity ?? "") as string }))
+      .sort((a, b) => AI_LABELS.indexOf(a.severity as AiLabel) - AI_LABELS.indexOf(b.severity as AiLabel)),
   };
 }
 
@@ -177,7 +203,7 @@ export function reviewBody(args: {
   round: number;
   maxRounds: number;
   summary: string;
-  counts: Record<AiSeverity, number>;
+  counts: Record<AiLabel, number>;
   resolved: { title: string; status: AiFindingStatus; note: string }[];
   stillOpen: { title: string; severity: string }[];
   nits: PostedFinding[];
@@ -190,18 +216,18 @@ export function reviewBody(args: {
     "",
   ];
   if (args.summary.trim() !== "") lines.push(args.summary.trim(), "");
-  const tally = AI_SEVERITIES.filter((s) => args.counts[s] > 0).map((s) => `${args.counts[s]} ${s}`);
+  const tally = AI_LABELS.filter((l) => args.counts[l] > 0).map((l) => `${args.counts[l]} ${l}`);
   lines.push(`**New findings:** ${tally.length === 0 ? "none" : tally.join(", ")}`);
   if (args.resolved.length > 0 || args.stillOpen.length > 0) {
     const fixed = args.resolved.filter((r) => r.status === "fixed").length;
     const obsolete = args.resolved.filter((r) => r.status === "obsolete").length;
     lines.push(`**Earlier findings:** ${fixed} fixed, ${obsolete} no longer apply, ${args.stillOpen.length} still open`);
-    for (const r of args.stillOpen) lines.push(`- still open (${r.severity}): ${r.title}`);
+    for (const r of args.stillOpen) lines.push(`- still open **[${normalizeLabel(r.severity)}]** ${r.title}`);
     for (const r of args.resolved.filter((x) => x.status === "obsolete" && x.note.trim() !== "")) lines.push(`- no longer applies: ${r.title} (${r.note.trim()})`);
   }
   const listed = (items: PostedFinding[]) => items.map((f) => `- \`${f.path}:${f.line}\` **[${f.severity}] ${f.title.trim()}**: ${f.body.trim().replace(/\n+/g, " ")}`);
   if (args.offDiff.length > 0) lines.push("", "**Findings outside the diff:**", ...listed(args.offDiff));
-  if (args.nits.length > 0) lines.push("", `<details><summary>Nits (${args.nits.length})</summary>`, "", ...listed(args.nits), "", "</details>");
+  if (args.nits.length > 0) lines.push("", `<details><summary>NITs (${args.nits.length})</summary>`, "", ...listed(args.nits), "", "</details>");
   lines.push("", args.handoff ? "_AI review is done; a human reviewer takes it from here._" : "_The next AI round runs after new commits are pushed._");
   lines.push(`${AI_ROUND_MARKER} ${args.round} -->`);
   return lines.join("\n");

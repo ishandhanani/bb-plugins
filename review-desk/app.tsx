@@ -536,10 +536,21 @@ const SEVERITIES: { test: RegExp; label: string; className: string }[] = [
   { test: /\b(minor|p2|medium|suggestion)\b/i, label: "minor", className: "border-sky-500/50 bg-sky-500/10 text-sky-700 dark:text-sky-300" },
   { test: /\b(nit|nitpick|p3|low|trivial|style)\b/i, label: "nit", className: "border-border bg-muted text-muted-foreground" },
 ];
-/** Severity and finding id from the first line of a comment, e.g. "**R1-19 · Major — …**". */
+/** The AI review's own labels, as written at the start of its comments: "**[BUG] …**". */
+const AI_LABEL_CLASS: Record<string, string> = {
+  BLOCKER: "border-destructive/50 bg-destructive/10 text-destructive",
+  BUG: "border-destructive/50 bg-destructive/10 text-destructive",
+  PERF: "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  TEST: "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  DESIGN: "border-sky-500/50 bg-sky-500/10 text-sky-700 dark:text-sky-300",
+  QUESTION: "border-sky-500/50 bg-sky-500/10 text-sky-700 dark:text-sky-300",
+  NIT: "border-border bg-muted text-muted-foreground",
+};
+/** Severity and finding id from the first line of a comment, e.g. "**R1-19 · Major — …**" or "**[BUG] …**". */
 function commentTags(body: string): { severity: { label: string; className: string } | null; id: string | null } {
   const head = body.split("\n")[0].slice(0, 160);
-  const severity = SEVERITIES.find((s) => s.test.test(head)) ?? null;
+  const aiLabel = /^\*\*\[([A-Z]+)\]/.exec(head)?.[1];
+  const severity = aiLabel !== undefined && AI_LABEL_CLASS[aiLabel] !== undefined ? { label: aiLabel, className: AI_LABEL_CLASS[aiLabel] } : SEVERITIES.find((s) => s.test.test(head)) ?? null;
   const id = /\b([A-Z]{1,3}\d*-\d{1,3})\b/.exec(head)?.[1] ?? null;
   return { severity: severity ? { label: severity.label, className: severity.className } : null, id };
 }

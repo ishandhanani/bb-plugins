@@ -16,7 +16,7 @@ import { MENTION_PROVIDER_ID, decodeMentionRef, encodeMentionRef, mentionLabel, 
 import { BOARD_STAGES, BOARD_STAGE_LABEL, isBoardStage, isPipelineStage, type BoardStage, type PipelineStage } from "./board-spec";
 import {
   AI_ROUND_MARKER,
-  AI_SEVERITIES,
+  AI_LABELS,
   babysitIntro,
   babysitPrompt,
   findingComment,
@@ -27,7 +27,7 @@ import {
   reviewBody,
   reviewerIntro,
   roundPrompt,
-  type AiSeverity,
+  type AiLabel,
   type PostedFinding,
 } from "./factory-spec";
 import {
@@ -2904,8 +2904,8 @@ export default async function plugin(bb: BbPluginApi) {
       };
       let inline = findings.filter((f) => isHighValue(f.severity) && anchors(f));
       const nits = findings.filter((f) => !isHighValue(f.severity));
-      const counts = Object.fromEntries(AI_SEVERITIES.map((s) => [s, 0])) as Record<AiSeverity, number>;
-      for (const f of findings) counts[f.severity as AiSeverity]++;
+      const counts = Object.fromEntries(AI_LABELS.map((l) => [l, 0])) as Record<AiLabel, number>;
+      for (const f of findings) counts[f.severity as AiLabel]++;
       const high = findings.filter((f) => isHighValue(f.severity)).length + stillOpen.length;
       const handoff = round >= maxRounds || high === 0;
       const submit = (onDiff: PostedFinding[]) =>
