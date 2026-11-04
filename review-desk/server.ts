@@ -19,6 +19,10 @@ import {
   AI_LABELS,
   babysitIntro,
   babysitPrompt,
+  deslopPrompt,
+  fixPrompt,
+  fixerIntro,
+  parseFixReply,
   findingComment,
   findingHeader,
   isHighValue,
@@ -123,6 +127,8 @@ const reviewSummarySchema = z.object({
   autoStage: boardStageSchema.nullable(),
   /** You dragged the card; it holds its column until GitHub's state changes. */
   pinned: z.boolean(),
+  /** You wrote this PR, so it runs the author's pipeline. */
+  mine: z.boolean(),
   /** The PR factory's view of the card; null when the PR is not in it. */
   factory: z
     .object({
@@ -137,6 +143,8 @@ const reviewSummarySchema = z.object({
       needsYou: z.string().nullable(),
       /** Outcome of the last CI babysit pass. */
       babysit: z.string().nullable(),
+      /** The author's agent's latest run on your own PR: fix or deslop, its state, and its verdicts. */
+      fix: z.object({ run: z.number(), kind: z.string(), status: z.string(), fix: z.number(), skip: z.number(), ask: z.number() }).nullable(),
       error: z.string().nullable(),
     })
     .nullable(),
@@ -252,6 +260,22 @@ export type NoteKind = z.infer<typeof noteKindSchema>;
 const okSchema = z.object({ ok: z.literal(true) });
 const reviewIdSchema = z.object({ reviewId: z.string() });
 
+const fixRunSchema = z.object({
+  run: z.number(),
+  kind: z.string(),
+  trigger: z.string(),
+  status: z.string(),
+  summary: z.string().nullable(),
+  items: z.array(z.object({ url: z.string(), author: z.string(), verdict: z.string(), reason: z.string(), commit: z.string().nullable().optional() })),
+  error: z.string().nullable(),
+  headBefore: z.string(),
+  headAfter: z.string().nullable(),
+  threadId: z.string().nullable(),
+  startedAt: z.number(),
+  finishedAt: z.number().nullable(),
+});
+export type FixRun = z.infer<typeof fixRunSchema>;
+
 export const rpcContract = defineRpcContract({
   reviews_list: { input: z.null(), output: z.object({ reviews: z.array(reviewSummarySchema) }) },
   reviews_open: { input: z.object({ ref: z.string().trim().min(1) }), output: z.object({ review: reviewSchema }) },
@@ -271,6 +295,8 @@ export const rpcContract = defineRpcContract({
       seen: z.object({ prevHead: z.string().nullable(), seenHead: z.string().nullable() }),
       /** Project the analyst threads are created in (the composer needs one). */
       chatProjectId: z.string(),
+      /** You wrote this PR, so it runs the author's pipeline. */
+      mine: z.boolean(),
     }),
   },
   reviews_sync: { input: reviewIdSchema, output: z.object({ review: reviewSchema, headChanged: z.boolean() }) },
@@ -279,6 +305,10 @@ export const rpcContract = defineRpcContract({
   board_move: { input: z.object({ reviewId: z.string(), stage: boardStageSchema.nullable() }), output: z.object({ review: reviewSummarySchema }) },
   /** Put a PR in the factory now: start (or retry) the next AI review round at the current head. */
   factory_start: { input: reviewIdSchema, output: z.object({ review: reviewSummarySchema }) },
+  /** Your own PR: the author's agent's runs, newest last. */
+  fix_runs: { input: reviewIdSchema, output: z.object({ runs: z.array(fixRunSchema) }) },
+  /** Your own PR: run the author's agent now, to fix the feedback or to deslop. */
+  fix_start: { input: z.object({ reviewId: z.string(), kind: z.enum(["fix", "deslop"]) }), output: z.object({ review: reviewSummarySchema }) },
   /** Take a PR out of the factory; the card follows GitHub's state again. */
   factory_stop: { input: reviewIdSchema, output: z.object({ review: reviewSummarySchema }) },
   /** Sync every PR that is not done with GitHub. A PR whose head moved gets the full sync; the others skip the git fetch. */
@@ -612,6 +642,23 @@ const MIGRATIONS = [
    )`,
   // One environment per project, machine, and repository that Review Desk's visible threads share, so the sidebar folds them into one folder.
   `CREATE TABLE IF NOT EXISTS shared_envs (key TEXT PRIMARY KEY, environment_id TEXT NOT NULL)`,
+  // Your own PRs: the author's agent (a lane like the reviewer's) and its runs.
+  `CREATE TABLE IF NOT EXISTS fixers (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL, intro_hash TEXT)`,
+  `CREATE TABLE IF NOT EXISTS fix_runs (
+     review_id TEXT NOT NULL,
+     run INTEGER NOT NULL,
+     kind TEXT NOT NULL,
+     trigger TEXT NOT NULL,
+     head_before TEXT NOT NULL,
+     head_after TEXT,
+     status TEXT NOT NULL,
+     summary TEXT,
+     items_json TEXT,
+     error TEXT,
+     started_at INTEGER NOT NULL,
+     finished_at INTEGER,
+     PRIMARY KEY (review_id, run)
+   )`,
 ];
 
 interface ReviewRow {
@@ -631,6 +678,10 @@ interface NoteRow {
 }
 interface MapRow { review_id: string; head_sha: string; status: string; markdown: string | null; markdown_head_sha: string | null; raw: string | null; error: string | null; updated_at: number }
 interface BoardStageRow { review_id: string; stage: string; auto_stage: string; updated_at: number }
+interface FixRunRow {
+  review_id: string; run: number; kind: string; trigger: string; head_before: string; head_after: string | null; status: string; summary: string | null;
+  items_json: string | null; error: string | null; started_at: number; finished_at: number | null;
+}
 interface PipelineRow {
   review_id: string; stage: string; entered_at: number; head_seen_at: number | null; needs_you: string | null;
   babysit_head: string | null; babysit_key: string | null; babysit_passes: number; babysit_outcome: string | null; updated_at: number;
@@ -753,6 +804,24 @@ function createStore(db: Database.Database) {
     setMapReady: db.prepare<[string, string, number, string]>(`UPDATE maps SET status = 'ready', markdown = ?, markdown_head_sha = head_sha, raw = ?, error = NULL, updated_at = ? WHERE review_id = ?`),
     setMapFailed: db.prepare<[string, string | null, number, string]>(`UPDATE maps SET status = 'failed', error = ?, raw = ?, updated_at = ? WHERE review_id = ?`),
     deleteMap: db.prepare<[string]>(`DELETE FROM maps WHERE review_id = ?`),
+    fixer: db.prepare<[string], HelperRow>(`SELECT * FROM fixers WHERE review_id = ?`),
+    fixerByThread: db.prepare<[string], HelperRow>(`SELECT * FROM fixers WHERE thread_id = ?`),
+    upsertFixer: db.prepare<[string, string, string, string | null, number, string | null]>(
+      `INSERT INTO fixers (review_id, thread_id, provider_id, environment_id, created_at, intro_hash) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id, intro_hash = excluded.intro_hash`,
+    ),
+    setFixerJob: db.prepare<[string | null, string]>(`UPDATE fixers SET job = ? WHERE review_id = ?`),
+    deleteFixer: db.prepare<[string]>(`DELETE FROM fixers WHERE review_id = ?`),
+    fixRuns: db.prepare<[string], FixRunRow>(`SELECT * FROM fix_runs WHERE review_id = ? ORDER BY run ASC`),
+    fixRun: db.prepare<[string, number], FixRunRow>(`SELECT * FROM fix_runs WHERE review_id = ? AND run = ?`),
+    runningFixRuns: db.prepare<[], FixRunRow>(`SELECT * FROM fix_runs WHERE status = 'running'`),
+    insertFixRun: db.prepare<[string, number, string, string, string, number]>(
+      `INSERT INTO fix_runs (review_id, run, kind, trigger, head_before, status, started_at) VALUES (?, ?, ?, ?, ?, 'running', ?)`,
+    ),
+    setFixRunDone: db.prepare<[string | null, string, string, number, string, number]>(
+      `UPDATE fix_runs SET status = 'done', head_after = ?, summary = ?, items_json = ?, finished_at = ? WHERE review_id = ? AND run = ?`,
+    ),
+    setFixRunFailed: db.prepare<[string, number, string, number]>(`UPDATE fix_runs SET status = 'failed', error = ?, finished_at = ? WHERE review_id = ? AND run = ?`),
+    deleteFixRuns: db.prepare<[string]>(`DELETE FROM fix_runs WHERE review_id = ?`),
     sharedEnv: db.prepare<[string], { key: string; environment_id: string }>(`SELECT * FROM shared_envs WHERE key = ?`),
     setSharedEnv: db.prepare<[string, string]>(`INSERT INTO shared_envs (key, environment_id) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET environment_id = excluded.environment_id`),
     deleteSharedEnv: db.prepare<[string]>(`DELETE FROM shared_envs WHERE key = ?`),
@@ -953,6 +1022,10 @@ export default async function plugin(bb: BbPluginApi) {
     babysitProvider: { type: "string", label: "PR factory: provider id for the CI babysitter", default: "claude-code" },
     babysitModel: { type: "string", label: "PR factory: model for the CI babysitter (a small one is enough)", default: "claude-haiku-5-5" },
     babysitMaxPasses: { type: "number", label: "PR factory: babysit passes per head before CI failures are handed to you", default: 3 },
+    authorPipeline: { type: "boolean", label: "PR factory: on your own PRs, an agent triages and fixes the feedback after each AI round, pushes, and deslops the diff before your review", default: true },
+    fixerProvider: { type: "string", label: "PR factory: provider id for the author's agent on your own PRs", default: "claude-code" },
+    fixerModel: { type: "string", label: "PR factory: model for the author's agent on your own PRs", default: "claude-opus-5-5" },
+    deslopStage: { type: "boolean", label: "PR factory: on your own PRs, deslop the diff (the bundled deslop skill) after the AI rounds and before your review", default: true },
     slackWebhookUrl: { type: "string", secret: true, label: "PR factory: Slack incoming webhook URL; when set, you are pinged there whenever a PR needs you", default: "" },
     slackMention: { type: "string", label: "PR factory: optional mention at the start of each Slack ping, for example <@U0123ABCD>", default: "" },
     eventWebhookUrl: { type: "string", label: "PR factory: webhook that gets every hand-off to you as JSON (for example a Devin automation's webhook trigger, which can relay it to Slack and answer follow-ups)", default: "" },
@@ -960,7 +1033,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   const {
     defaultProvider, hideSeatThreads, autoMap, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir, threadSection,
-    autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
+    autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, authorPipeline, fixerProvider, fixerModel, deslopStage, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
   } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
 
@@ -1252,6 +1325,7 @@ export default async function plugin(bb: BbPluginApi) {
       stage: pinnedStage ?? auto,
       autoStage: auto,
       pinned: pinnedStage !== null,
+      mine: isMine(row),
       factory: factorySummary(row),
     };
   }
@@ -1389,6 +1463,7 @@ export default async function plugin(bb: BbPluginApi) {
       notesError: notesErrors.get(row.id) ?? null,
       seen: seenState(row),
       chatProjectId: await chatProjectId(row),
+      mine: isMine(row),
     };
   }
   const notesErrors = new Map<string, string>();
@@ -1825,6 +1900,10 @@ export default async function plugin(bb: BbPluginApi) {
      * shared environment (one folder per project) instead of the PR worktree's.
      */
     shared?: boolean;
+    /** Visible from the start (it does work you may want to watch), regardless of hideSeatThreads. */
+    visible?: boolean;
+    /** A workspace of its own (the author's agent works in the PR branch's worktree); null falls back to the PR worktree. */
+    workspace?: (row: ReviewRow) => string | null;
     get: (reviewId: string) => HelperRow | undefined;
     upsert: (reviewId: string, threadId: string, providerId: string, environmentId: string | null, createdAt: number, introHash: string) => void;
     setJob: (job: string | null, reviewId: string) => void;
@@ -1964,20 +2043,21 @@ export default async function plugin(bb: BbPluginApi) {
     if (provider === undefined) throw new Error(`unknown provider ${providerId}`);
     const modes = provider.capabilities.permissionModes;
     const permissionMode = modes.includes("auto") ? "auto" : modes.includes("accept-edits") ? "accept-edits" : undefined;
-    const knownEnvironment = shared !== null ? shared.environmentId : row.environment_id ?? q.seats.all(row.id).find((s) => s.environment_id !== null)?.environment_id ?? null;
+    const ownWorkspace = lane.workspace?.(row) ?? null;
+    const knownEnvironment = ownWorkspace !== null ? null : shared !== null ? shared.environmentId : row.environment_id ?? q.seats.all(row.id).find((s) => s.environment_id !== null)?.environment_id ?? null;
     const now = Date.now();
     const thread = await bb.sdk.threads.spawn({
       projectId,
       environment: knownEnvironment !== null
         ? { type: "reuse", environmentId: knownEnvironment }
-        : { type: "host", hostId: row.host_id, workspace: { type: "unmanaged", path: shared?.path ?? row.worktree } },
+        : { type: "host", hostId: row.host_id, workspace: { type: "unmanaged", path: ownWorkspace ?? shared?.path ?? row.worktree } },
       providerId,
       ...(permissionMode ? { permissionMode } : {}),
       ...(lane.model.trim() !== "" ? { model: lane.model.trim() } : {}),
       ...(lane.reasoningLevel === undefined ? {} : { reasoningLevel: lane.reasoningLevel }),
       title: `#${row.number} ${lane.title}`,
       sectionId: await sectionId(),
-      visibility: hideSeatThreads ? "hidden" : "visible",
+      visibility: lane.visible || !hideSeatThreads ? "visible" : "hidden",
       input: [{ type: "text", text: intro, mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
     });
     lane.upsert(row.id, thread.id, providerId, knownEnvironment, now, introHash);
@@ -1987,6 +2067,7 @@ export default async function plugin(bb: BbPluginApi) {
         const environmentId = thread.environmentId ?? (await waitForEnvironment(thread.id));
         if (environmentId === null) return null;
         lane.upsert(row.id, thread.id, providerId, environmentId, now, introHash);
+        if (ownWorkspace !== null) return environmentId;
         if (shared === null) {
           q.setEnvironment.run(environmentId, row.id);
           return environmentId;
@@ -2780,6 +2861,7 @@ export default async function plugin(bb: BbPluginApi) {
       reviewUrl: rounds.filter((r) => r.review_url !== null).at(-1)?.review_url ?? null,
       needsYou: p.needs_you,
       babysit: p.babysit_head === row.head_sha ? p.babysit_outcome : null,
+      fix: fixSummary(row),
       error: last?.status === "failed" ? last.error : null,
     };
   }
@@ -2801,7 +2883,9 @@ export default async function plugin(bb: BbPluginApi) {
       const row = q.review.get(reviewId);
       const p = q.pipeline.get(reviewId);
       if (row === undefined || p === undefined || row.state !== "OPEN") return;
-      if (githubStage(row) === "babysit") await babysitTick(row, p);
+      // You cannot approve your own PR, so on yours a drag to Babysit starts it.
+      if (githubStage(row) === "babysit" || (isMine(row) && q.boardStage.get(row.id)?.stage === "babysit")) await babysitTick(row, p);
+      else if (p.stage === "ai_review" && isMine(row) && !force && (await myRoundCatchUp(row))) return;
       else if (p.stage === "ai_review") aiReviewTick(row, p, force);
       else if (p.stage === "human_review") await humanReviewTick(row, p);
       else if (p.stage === "changes_requested" && p.head_seen_at !== null && p.head_seen_at > p.entered_at) {
@@ -2953,7 +3037,8 @@ export default async function plugin(bb: BbPluginApi) {
       const counts = Object.fromEntries(AI_LABELS.map((l) => [l, 0])) as Record<AiLabel, number>;
       for (const f of findings) counts[f.severity as AiLabel]++;
       const high = findings.filter((f) => isHighValue(f.severity)).length + stillOpen.length;
-      const handoff = round >= maxRounds || high === 0;
+      const mine = isMine(row);
+      const handoff = !mine && (round >= maxRounds || high === 0);
       const submit = (onDiff: PostedFinding[]) =>
         host.call(
           "gh_submit_review",
@@ -2963,7 +3048,7 @@ export default async function plugin(bb: BbPluginApi) {
             number: row.number,
             commitId: r.head_sha,
             event: "COMMENT",
-            body: reviewBody({ round, maxRounds, summary: reply.summary, counts, resolved, stillOpen, nits, offDiff: findings.filter((f) => isHighValue(f.severity) && !onDiff.includes(f)), handoff }),
+            body: reviewBody({ round, maxRounds, summary: reply.summary, counts, resolved, stillOpen, nits, offDiff: findings.filter((f) => isHighValue(f.severity) && !onDiff.includes(f)), handoff, ...(mine ? { next: "The author's agent picks up this feedback next." } : {}) }),
             comments: onDiff.map((f) => ({ path: f.path, line: f.line, side: "RIGHT" as const, startLine: f.startLine, body: findingComment(f, round) })),
           },
           hostOptions(row),
@@ -2981,7 +3066,8 @@ export default async function plugin(bb: BbPluginApi) {
       for (const f of findings) q.insertFinding.run(newId(), reviewId, round, f.path, f.line, f.startLine, f.severity, f.title, f.body, f.suggestion, inline.includes(f) ? 1 : 0, now);
       q.setRoundPosted.run(reply.summary, high, posted.url, text.slice(0, 200_000), Date.now(), reviewId, round);
       await resolveFindingThreads(row, r.head_sha).catch((cause: unknown) => bb.log.warn(`resolving threads on ${prLabel(row)}: ${errorMessage(cause)}`));
-      if (handoff) {
+      if (mine) await afterMyRound(row, round, high);
+      else if (handoff) {
         const why = high === 0 ? `AI round ${round} found nothing above a nit` : `${high} finding${high === 1 ? "" : "s"} above a nit still open after ${round} AI round${round === 1 ? "" : "s"}`;
         setStage(row, "human_review", why);
         await letYouKnow(row, q.aiReviewer.get(reviewId)?.thread_id, "ready_for_you", why);
@@ -3047,8 +3133,25 @@ export default async function plugin(bb: BbPluginApi) {
     const mine = conversation.reviews.filter(
       (r) => r.author === login && !r.body.includes(AI_ROUND_MARKER) && (r.state !== "COMMENTED" || r.body.trim() !== "") && r.submittedAt !== null && Date.parse(r.submittedAt) > p.entered_at,
     );
+    if (isMine(row)) return myReviewTick(row, p, login, conversation.reviews);
     if (mine.length === 0 || mine.some((r) => r.state === "APPROVED")) return;
     setStage(row, "changes_requested");
+  }
+
+  /**
+   * Your review of your own PR. GitHub will not let you approve it, so it moves
+   * on when you drag it to Babysit; until then, anything you write on it (inline
+   * comments included) goes to the author's agent. Reviews posted while that
+   * agent was working are its own replies, under your login, and are skipped.
+   */
+  async function myReviewTick(row: ReviewRow, p: PipelineRow, login: string, reviews: { author: string; body: string; submittedAt: string | null }[]): Promise<void> {
+    const windows = q.fixRuns.all(row.id).map((r) => [r.started_at, (r.finished_at ?? Date.now()) + 2 * 60_000] as const);
+    const yours = reviews.filter((r) => {
+      if (r.author !== login || r.body.includes(AI_ROUND_MARKER) || r.submittedAt === null) return false;
+      const at = Date.parse(r.submittedAt);
+      return at > p.entered_at && !windows.some(([from, to]) => at >= from && at <= to);
+    });
+    if (yours.length > 0) await startFixRun(row, "fix", "human");
   }
 
   /** One look at an approved PR's CI. A pass runs only for a failure no earlier pass at this head has seen. */
@@ -3118,6 +3221,12 @@ export default async function plugin(bb: BbPluginApi) {
       else pumpRounds();
       return true;
     }
+    const fixer = q.fixerByThread.get(threadId);
+    if (fixer !== undefined) {
+      q.setFixerJob.run(null, fixer.review_id);
+      if (fixer.job !== null && fixer.job.startsWith("fix:")) void completeFixRun(fixer.review_id, Number(fixer.job.slice("fix:".length)), text, error);
+      return true;
+    }
     const sitter = q.babysitterByThread.get(threadId);
     if (sitter !== undefined) {
       q.setBabysitterJob.run(null, sitter.review_id);
@@ -3145,6 +3254,14 @@ export default async function plugin(bb: BbPluginApi) {
       q.setAiReviewerJob.run(null, r.review_id);
       q.insertRound.run(r.review_id, r.round, r.base_sha, r.head_sha, Date.now());
     }
+    // A run of the author's agent whose thread stopped without a reply goes back to you.
+    for (const r of q.runningFixRuns.all()) {
+      const fixer = q.fixer.get(r.review_id);
+      if (fixer?.job === `fix:${r.run}` && (await working(fixer.thread_id))) continue;
+      q.setFixerJob.run(null, r.review_id);
+      const row = q.review.get(r.review_id);
+      if (row !== undefined) await failFixRun(row, r.run, "its thread stopped before it replied (plugin reload?)");
+    }
     for (const sitter of q.babysittersWithJob.all()) {
       if (await working(sitter.thread_id)) continue;
       q.setBabysitterJob.run(null, sitter.review_id);
@@ -3153,6 +3270,168 @@ export default async function plugin(bb: BbPluginApi) {
     }
     pumpRounds();
   })();
+
+  // -- the author's agent: your own PRs ----------------------------------------
+  //
+  // On a PR you wrote, each AI round is followed by the author's agent: it
+  // pulls the feedback fresh, judges it (FIX, SKIP, ASK), fixes what is worth
+  // fixing, pushes, and replies on the threads; its push starts the next round.
+  // After the last round it deslops the diff, then the PR is yours to review.
+  // Your own comments in that review go back to it, and it returns the PR to
+  // you. It is one visible thread per PR, working in the worktree that has the
+  // PR's branch checked out.
+
+  /** Where the author's agent works for each PR: the branch's worktree and the remote it pushes to. */
+  const fixerTargets = new Map<string, { worktree: string; remote: string }>();
+  const fixerLane: Lane = {
+    title: "author's agent",
+    intro: (row) => {
+      const target = fixerTargets.get(row.id);
+      return fixerIntro({ owner: row.owner, repo: row.repo, number: row.number, title: row.title, headRef: row.head_ref, worktree: target?.worktree ?? row.worktree, remote: target?.remote ?? "origin" });
+    },
+    providerId: fixerProvider.trim(),
+    model: fixerModel,
+    replaceOnIntroChange: false,
+    visible: true,
+    workspace: (row) => fixerTargets.get(row.id)?.worktree ?? null,
+    get: (id) => q.fixer.get(id),
+    upsert: (id, threadId, providerId, environmentId, createdAt, introHash) => { q.upsertFixer.run(id, threadId, providerId, environmentId, createdAt, introHash); },
+    setJob: (job, id) => { q.setFixerJob.run(job, id); },
+    remove: (id) => { q.deleteFixer.run(id); },
+  };
+
+  /** Your gh login, learned once from the primary machine; a PR it authored runs the author's pipeline. */
+  let myLogin: string | null = null;
+  async function learnMyLogin(attempt = 0): Promise<void> {
+    try {
+      const hostId = await primaryHostId();
+      const { login } = await host.call("gh_viewer", {}, { hostId });
+      viewers.set(hostId, login);
+      myLogin = login;
+      for (const row of q.reviews.all()) publish(row.id, "board");
+    } catch (cause) {
+      if (attempt < 10) setTimeout(() => void learnMyLogin(attempt + 1), 1000 * (attempt + 1));
+      else bb.log.warn(`could not learn your gh login: ${errorMessage(cause)}`);
+    }
+  }
+  setTimeout(() => void learnMyLogin(), 0);
+
+  function isMine(row: ReviewRow): boolean {
+    return authorPipeline && myLogin !== null && row.author === myLogin;
+  }
+
+  function toFixRun(r: FixRunRow): FixRun {
+    return {
+      run: r.run,
+      kind: r.kind,
+      trigger: r.trigger,
+      status: r.status,
+      summary: r.summary,
+      items: parseJson<FixRun["items"]>(r.items_json, []),
+      error: r.error,
+      headBefore: r.head_before,
+      headAfter: r.head_after,
+      threadId: q.fixer.get(r.review_id)?.thread_id ?? null,
+      startedAt: r.started_at,
+      finishedAt: r.finished_at,
+    };
+  }
+
+  function fixSummary(row: ReviewRow): NonNullable<ReviewSummary["factory"]>["fix"] {
+    const last = q.fixRuns.all(row.id).at(-1);
+    if (last === undefined) return null;
+    const items = parseJson<FixRun["items"]>(last.items_json, []);
+    const count = (v: string) => items.filter((i) => i.verdict === v).length;
+    return { run: last.run, kind: last.kind, status: last.status, fix: count("FIX"), skip: count("SKIP"), ask: count("ASK") };
+  }
+
+  /** Start the author's agent on a fix (after a round, or after your comments) or on the deslop pass. */
+  async function startFixRun(row: ReviewRow, kind: "fix" | "deslop", trigger: string): Promise<void> {
+    if (q.fixRuns.all(row.id).at(-1)?.status === "running") return;
+    const run = (q.fixRuns.all(row.id).at(-1)?.run ?? 0) + 1;
+    q.insertFixRun.run(row.id, run, kind, trigger, row.head_sha, Date.now());
+    setStage(row, kind === "deslop" ? "deslop" : "fixing");
+    try {
+      const pr = await host.call("gh_pr", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
+      if (pr.headOwner === null || pr.headRepo === null) throw new Error("GitHub did not say which repository the PR's branch lives in");
+      const target = await host.call(
+        "branch_worktree",
+        { repoPath: row.repo_path, branch: row.head_ref, headOwner: pr.headOwner, headRepo: pr.headRepo, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}` },
+        { ...hostOptions(row), timeoutMs: 5 * 60_000 },
+      );
+      fixerTargets.set(row.id, { worktree: target.worktree, remote: target.remote });
+      const last = q.rounds.all(row.id).filter((r) => r.status === "posted").at(-1);
+      const prompt = kind === "deslop"
+        ? deslopPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha })
+        : fixPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha, round: last?.round ?? 0, reviewUrl: trigger === "human" ? null : last?.review_url ?? null });
+      await laneSend(fixerLane, row, `fix:${run}`, prompt);
+      // The thread is visible: title it by PR and job so it reads in the sidebar.
+      const threadId = q.fixer.get(row.id)?.thread_id;
+      if (threadId !== undefined) await bb.sdk.threads.update({ threadId, title: `#${row.number} · ${kind === "deslop" ? "Deslop" : "Fixing"}` }).catch(() => undefined);
+      publish(row.id, "board");
+    } catch (cause) {
+      await failFixRun(row, run, errorMessage(cause));
+    }
+  }
+
+  async function failFixRun(row: ReviewRow, run: number, message: string): Promise<void> {
+    q.setFixRunFailed.run(message, Date.now(), row.id, run);
+    const why = `the author's agent stopped: ${message.slice(0, 300)}`;
+    setStage(row, "human_review", why);
+    await letYouKnow(row, q.fixer.get(row.id)?.thread_id, "needs_you", why);
+  }
+
+  async function completeFixRun(reviewId: string, run: number, text: string | null, error: string | null): Promise<void> {
+    const row = q.review.get(reviewId);
+    const r = q.fixRun.get(reviewId, run);
+    if (row === undefined || r === undefined || r.status !== "running") return;
+    let reply: ReturnType<typeof parseFixReply>;
+    try {
+      if (error !== null || text === null) throw new Error(error ?? "the author's agent returned nothing");
+      reply = parseFixReply(text);
+    } catch (cause) {
+      await failFixRun(row, run, errorMessage(cause));
+      return;
+    }
+    q.setFixRunDone.run(reply.head || null, reply.summary, JSON.stringify(reply.items), Date.now(), reviewId, run);
+    // Its push moved the head: read it before deciding what runs next.
+    await syncReview(reviewId).catch((cause: unknown) => bb.log.warn(`sync after the author's agent on ${prLabel(row)}: ${errorMessage(cause)}`));
+    const fresh = requireReview(reviewId);
+    const asks = reply.items.filter((i) => i.verdict === "ASK").length;
+    const toYou = async (why: string) => {
+      setStage(fresh, "human_review", asks > 0 ? `${why}; ${asks} question${asks === 1 ? "" : "s"} for you` : why);
+      await letYouKnow(fresh, q.fixer.get(reviewId)?.thread_id, "ready_for_you", asks > 0 ? `${why}; ${asks} question${asks === 1 ? "" : "s"} for you` : why);
+    };
+    if (r.kind === "deslop") return toYou("AI review, fixes, and deslop are done");
+    if (r.trigger === "human") return toYou("the author's agent worked through your comments");
+    const posted = q.rounds.all(reviewId).filter((x) => x.status === "posted").length;
+    if (reply.pushed && fresh.head_sha !== r.head_before && posted < maxRounds) {
+      // Its own push, so no settling: the next round reviews the fixes now.
+      setStage(fresh, "ai_review");
+      void advanceFactory(reviewId, true).catch(() => undefined);
+      return;
+    }
+    if (deslopStage) return startFixRun(fresh, "deslop", `after-fix:${run}`);
+    return toYou("AI review and fixes are done");
+  }
+
+  /** A round on your own PR at this head that the author's agent never picked up (posted before it existed, or lost to a reload) is handed over now. */
+  async function myRoundCatchUp(row: ReviewRow): Promise<boolean> {
+    const last = q.lastRound.get(row.id);
+    if (last === undefined || last.status !== "posted" || last.head_sha !== row.head_sha) return false;
+    if (q.fixRuns.all(row.id).some((r) => r.trigger === `round:${last.round}`)) return false;
+    await afterMyRound(row, last.round, last.high_value ?? 0);
+    return true;
+  }
+
+  /** After a round on your own PR: the author's agent takes the feedback, or, with nothing to fix, deslops. */
+  async function afterMyRound(row: ReviewRow, round: number, high: number): Promise<void> {
+    const openThreads = cachedThreads(row).filter((t) => !t.isResolved).length;
+    if (high > 0 || openThreads > 0) return startFixRun(row, "fix", `round:${round}`);
+    if (deslopStage) return startFixRun(row, "deslop", `round:${round}`);
+    setStage(row, "human_review", `AI round ${round} found nothing above a nit`);
+    await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "ready_for_you", `AI round ${round} found nothing above a nit`);
+  }
 
   // -- GitHub write paths ----------------------------------------------------
 
@@ -3177,7 +3456,10 @@ export default async function plugin(bb: BbPluginApi) {
     await refreshThreads(row).catch(() => undefined);
     publish(row.id, "pending");
     // Your own review from here: a comment or a change request waits on the author; an approval moves to Babysit through GitHub's state.
-    if (event !== "APPROVE" && q.pipeline.get(row.id)?.stage === "human_review") setStage(row, "changes_requested");
+    if (event !== "APPROVE" && q.pipeline.get(row.id)?.stage === "human_review") {
+      if (isMine(row)) void startFixRun(row, "fix", "human");
+      else setStage(row, "changes_requested");
+    }
     // Re-read GitHub now so the card moves (an approval to Babysit) without waiting for the next board refresh.
     void lightSync(requireReview(row.id))
       .then(() => advanceFactory(row.id))
@@ -3207,6 +3489,13 @@ export default async function plugin(bb: BbPluginApi) {
       startFactory(row, true);
       return { review: summarize(requireReview(reviewId)) };
     },
+    fix_runs: ({ reviewId }) => ({ runs: q.fixRuns.all(requireReview(reviewId).id).map(toFixRun) }),
+    fix_start: async ({ reviewId, kind }) => {
+      const row = requireReview(reviewId);
+      if (q.pipeline.get(row.id) === undefined) setStage(row, kind === "deslop" ? "deslop" : "fixing");
+      await startFixRun(row, kind, "manual");
+      return { review: summarize(requireReview(reviewId)) };
+    },
     factory_stop: ({ reviewId }) => {
       requireReview(reviewId);
       q.deletePipeline.run(reviewId);
@@ -3227,7 +3516,7 @@ export default async function plugin(bb: BbPluginApi) {
       q.deleteSimplifier.run(reviewId);
       q.deleteSimple.run(reviewId);
       q.deleteBoardStage.run(reviewId);
-      for (const stmt of [q.deletePipeline, q.deleteRounds, q.deleteFindings, q.deleteAiReviewer, q.deleteBabysitter, q.deleteMap]) stmt.run(reviewId);
+      for (const stmt of [q.deletePipeline, q.deleteRounds, q.deleteFindings, q.deleteAiReviewer, q.deleteBabysitter, q.deleteMap, q.deleteFixRuns, q.deleteFixer]) stmt.run(reviewId);
       q.deleteReview.run(reviewId);
       publish(reviewId, "removed");
       // The worktree goes with the card, unless it has local changes.
@@ -3449,7 +3738,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "board", summary: "Print the board: every tracked PR under its column", usage: "bb review-desk board [--json]" },
       { name: "move", summary: "Drag a card to a column, or back to the column GitHub's state gives it", usage: "bb review-desk move <reviewId> <unreviewed|ai_review|human_review|changes_requested|babysit|auto> [--json]" },
       { name: "refresh", summary: "Sync every open PR with GitHub", usage: "bb review-desk refresh [--json]" },
-      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show|ping|resolve> <reviewId> [--json]" },
+      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show|ping|resolve|fix|deslop> <reviewId> [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "map", summary: "Write or print the PR's diffmap spec", usage: "bb review-desk map <reviewId> [--rewrite] [--json]" },
       { name: "simple", summary: "Queue Simple English rewrites of all the comments, redo them all, or request one comment by key", usage: "bb review-desk simple <reviewId> [--redo | --key <t:...|c:...|r:...>] [--json]" },
@@ -3517,11 +3806,14 @@ export default async function plugin(bb: BbPluginApi) {
               const resolved = last === undefined ? 0 : await resolveFindingThreads(row, last.head_sha);
               return ok({ resolved }, `Resolved ${resolved} thread${resolved === 1 ? "" : "s"} for fixed or obsolete findings`);
             }
-            if (action === "start") startFactory(row, true);
+            if (action === "fix" || action === "deslop") {
+              if (q.pipeline.get(row.id) === undefined) setStage(row, action === "deslop" ? "deslop" : "fixing");
+              await startFixRun(row, action, "manual");
+            } else if (action === "start") startFactory(row, true);
             else if (action === "stop") {
               q.deletePipeline.run(row.id);
               publish(row.id, "board");
-            } else if (action !== "show") return { exitCode: 1, stderr: "usage: bb review-desk factory <start|stop|show|ping|resolve> <reviewId>" };
+            } else if (action !== "show") return { exitCode: 1, stderr: "usage: bb review-desk factory <start|stop|show|ping|resolve|fix|deslop> <reviewId>" };
             const card = summarize(requireReview(row.id));
             const rounds = q.rounds.all(row.id);
             const findings = q.findings.all(row.id);
@@ -3529,6 +3821,7 @@ export default async function plugin(bb: BbPluginApi) {
               `${card.owner}/${card.repo}#${card.number} is in ${card.stage === null ? "merged or closed" : BOARD_STAGE_LABEL[card.stage]}${card.factory?.needsYou ? `; needs you: ${card.factory.needsYou}` : ""}`,
               ...rounds.map((r) => `  round ${r.round} ${r.status} at ${r.head_sha.slice(0, 10)}${r.high_value === null ? "" : `, ${r.high_value} above nit`}${r.review_url ? ` ${r.review_url}` : ""}${r.error ? ` (${r.error})` : ""}`),
               ...findings.map((f) => `    [${f.status}] r${f.round} ${f.severity} ${f.path}:${f.line} ${f.title}`),
+              ...q.fixRuns.all(row.id).map((r) => `  ${r.kind} run ${r.run} (${r.trigger}) ${r.status}${r.head_after ? ` -> ${r.head_after.slice(0, 10)}` : ""}${r.error ? `: ${r.error}` : ""}${r.summary ? `\n    ${r.summary}` : ""}`),
             ].join("\n");
             return ok({ card, rounds, findings }, text);
           }

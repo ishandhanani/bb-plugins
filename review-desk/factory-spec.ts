@@ -215,6 +215,8 @@ export function reviewBody(args: {
   nits: PostedFinding[];
   offDiff: PostedFinding[];
   handoff: boolean;
+  /** What happens next, when it is neither a hand-off nor waiting for a push. */
+  next?: string;
 }): string {
   const lines = [
     `### Round ${args.round} AI review`,
@@ -234,7 +236,7 @@ export function reviewBody(args: {
   const listed = (items: PostedFinding[]) => items.map((f) => `- \`${f.path}:${f.line}\` **[${f.severity}] ${f.title.trim()}**: ${f.body.trim().replace(/\n+/g, " ")}`);
   if (args.offDiff.length > 0) lines.push("", "**Findings outside the diff:**", ...listed(args.offDiff));
   if (args.nits.length > 0) lines.push("", `<details><summary>NITs (${args.nits.length})</summary>`, "", ...listed(args.nits), "", "</details>");
-  lines.push("", args.handoff ? "_AI review is done; a human reviewer takes it from here._" : "_The next AI round runs after new commits are pushed._");
+  lines.push("", `_${args.next ?? (args.handoff ? "AI review is done; a human reviewer takes it from here." : "The next AI round runs after new commits are pushed.")}_`);
   lines.push(`${AI_ROUND_MARKER} ${args.round} -->`);
   return lines.join("\n");
 }
@@ -273,4 +275,77 @@ const babysitReplySchema = z.object({ outcome: z.enum(BABYSIT_OUTCOMES), detail:
 
 export function parseBabysitReply(text: string): { outcome: BabysitOutcome; detail: string } {
   return babysitReplySchema.parse(replyJson(text, BABYSIT_FENCE));
+}
+
+// -- fixer: your own PRs ------------------------------------------------------
+//
+// On a PR you wrote, the factory does what you would: after an AI round it
+// pulls every comment fresh, judges each, fixes what is worth fixing, pushes,
+// and replies on the threads; before your review it deslops the diff. One
+// visible thread per PR, working in the PR branch's own worktree.
+
+export const FIX_FENCE = "ai-fix";
+export const FIX_VERDICTS = ["FIX", "SKIP", "ASK"] as const;
+export type FixVerdict = (typeof FIX_VERDICTS)[number];
+
+export function fixerIntro(c: { owner: string; repo: string; number: number; title: string; headRef: string; worktree: string; remote: string }): string {
+  return [
+    `You are the author's agent for pull request #${c.number} of ${c.owner}/${c.repo}: "${c.title}". The author wrote this PR; you act for them. Each message is one job; answer each with exactly one fenced block tagged ${FIX_FENCE} containing JSON, and nothing after it.`,
+    `Your working directory is the PR branch's worktree, ${c.worktree}, on branch ${c.headRef}. Push with: git push ${c.remote} HEAD:${c.headRef}.`,
+    "Allowed: edit files in this worktree, commit (one logical change per commit, plain messages, no co-author or tool trailers), push to the PR branch, reply on the PR's review threads, and resolve threads that the AI review opened.",
+    "Never: force-push, rebase, amend pushed commits, merge, switch branches, change other branches, close or mark the PR ready, resolve threads a human reviewer opened, or touch files outside this worktree.",
+    "If the worktree has uncommitted changes you did not make, or the branch is behind its remote, stop and report ASK on everything; the author is working here.",
+  ].join("\n");
+}
+
+const FIX_REPLY_SHAPE = [
+  `Reply with one fenced block tagged ${FIX_FENCE}:`,
+  "{",
+  '  "summary": string,   // 2-4 sentences for the author: what you changed and what you left',
+  '  "items": [{ "url": string, "author": string, "verdict": "FIX"|"SKIP"|"ASK", "reason": string, "commit"?: string }],   // one per comment or thread you judged; url is its GitHub URL',
+  '  "pushed": boolean,',
+  '  "head": string        // the branch head after your push (git rev-parse HEAD)',
+  "}",
+].join("\n");
+
+export function fixPrompt(c: { owner: string; repo: string; number: number; baseSha: string; headSha: string; round: number; reviewUrl: string | null }): string {
+  return [
+    `Job: triage and fix the feedback on ${c.owner}/${c.repo}#${c.number} after AI review round ${c.round}${c.reviewUrl ? ` (${c.reviewUrl})` : ""}. The PR head is ${c.headSha}; the merge base is ${c.baseSha}.`,
+    "",
+    "1. Pull every review comment fresh, including AI review threads, human reviewers, and bots: unresolved threads and conversation comments since the last push. If the gh-comment-ledger skill is available, use it to build the ledger.",
+    "2. Judge each one on the code at the head, not on the comment's confidence:",
+    "   FIX - it is right and worth changing in this PR.",
+    "   SKIP - it is wrong, already handled, out of scope, or not worth the churn; say why in one sentence.",
+    "   ASK - only the author can decide (design intent, product behavior, a trade-off); say what they need to decide.",
+    "3. Fix every FIX item with the smallest change that resolves it, one commit per item (or per group of items that are one change). Run the narrowest checks that prove each fix: the touched crate's or package's tests, the type checker, the linter; use the repository's own skills and guidance for how to build and test. Do not run GPU or load tests.",
+    "4. Push once at the end.",
+    "5. Reply on each thread you judged: \"Fixed in <short sha>: <what changed>\" for FIX, the reason for SKIP, and the question for ASK. Resolve the AI review's threads you fixed; leave human reviewers' threads for them to resolve.",
+    "",
+    FIX_REPLY_SHAPE,
+  ].join("\n");
+}
+
+export function deslopPrompt(c: { owner: string; repo: string; number: number; baseSha: string; headSha: string }): string {
+  return [
+    `Job: deslop ${c.owner}/${c.repo}#${c.number} before the author reviews it. The PR's own changes are git diff ${c.baseSha}..HEAD (head ${c.headSha}).`,
+    "Use the deslop skill on that diff: merge duplicate or redundant new types and structures, inline structures and helpers with one use, remove dead paths, defensive noise, and comments a person would not write, and keep behavior exactly. One cleanup per commit, the narrowest checks after each, then push once.",
+    "If nothing is worth removing, change nothing and say so.",
+    "",
+    `Reply with one fenced block tagged ${FIX_FENCE}: { "summary": string, "items": [{ "url": "", "author": "deslop", "verdict": "FIX", "reason": string, "commit": string }], "pushed": boolean, "head": string }, one item per cleanup commit.`,
+  ].join("\n");
+}
+
+const fixReplySchema = z.object({
+  summary: z.string().default(""),
+  items: z
+    .array(z.object({ url: z.string().default(""), author: z.string().default(""), verdict: z.string(), reason: z.string().default(""), commit: z.string().nullable().optional() }))
+    .default([]),
+  pushed: z.boolean().default(false),
+  head: z.string().default(""),
+});
+export type FixReply = z.infer<typeof fixReplySchema>;
+
+export function parseFixReply(text: string): FixReply {
+  const reply = fixReplySchema.parse(replyJson(text, FIX_FENCE));
+  return { ...reply, items: reply.items.map((i) => ({ ...i, verdict: (FIX_VERDICTS as readonly string[]).includes(i.verdict.toUpperCase()) ? i.verdict.toUpperCase() : "ASK" })) };
 }

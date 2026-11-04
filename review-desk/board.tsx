@@ -7,7 +7,7 @@ import type { DragEvent, FormEvent, ReactNode } from "react";
 import { toast } from "sonner";
 import { UrlLink, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { ReviewSummary, rpcContract } from "./server";
-import { BOARD_STAGES, BOARD_STAGE_HINT, BOARD_STAGE_LABEL, type BoardStage } from "./board-spec";
+import { BOARD_LANES, BOARD_STAGES, BOARD_STAGE_HINT, BOARD_STAGE_LABEL, stageLabel, type BoardLane, type BoardStage } from "./board-spec";
 import { Button } from "@/components/ui/button";
 import { Icon, type IconName } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
@@ -85,6 +85,15 @@ function FactoryChips({ card }: { card: ReviewSummary }) {
   return (
     <>
       {round}
+      {f.fix !== null ? (
+        <Chip
+          icon={f.fix.status === "running" ? "Clock" : f.fix.status === "failed" ? "AlertTriangle" : "EditFile"}
+          tone={f.fix.status === "failed" ? "bad" : f.fix.status === "running" ? "strong" : "muted"}
+          title={`The author's agent, run ${f.fix.run} (${f.fix.kind})`}
+        >
+          {f.fix.kind === "deslop" ? "deslop" : "fix"} {f.fix.status === "running" ? "running" : f.fix.status === "failed" ? "failed" : `${f.fix.fix} FIX · ${f.fix.skip} SKIP${f.fix.ask > 0 ? ` · ${f.fix.ask} ASK` : ""}`}
+        </Chip>
+      ) : null}
       {f.babysit !== null && f.babysit !== "needs_human" ? <Chip icon="Repeat" title="Last CI babysit pass">babysit: {f.babysit}</Chip> : null}
       {f.needsYou !== null ? <Chip icon="BellDot" tone="bad" title={f.needsYou}><span className="max-w-[180px] truncate">{f.needsYou}</span></Chip> : null}
     </>
@@ -204,10 +213,10 @@ function PrCard({ card, stage, onOpen, onUnpin, onRemove, onReview }: { card: Re
   );
 }
 
-function BoardColumn({ stage, count, over, onOver, onLeave, onDrop, children }: { stage: BoardStage; count: number; over: boolean; onOver: () => void; onLeave: () => void; onDrop: (reviewId: string) => void; children: ReactNode }) {
+function BoardColumn({ stage, label, count, over, onOver, onLeave, onDrop, children }: { stage: BoardStage; label: string; count: number; over: boolean; onOver: () => void; onLeave: () => void; onDrop: (reviewId: string) => void; children: ReactNode }) {
   return (
     <section
-      aria-label={BOARD_STAGE_LABEL[stage]}
+      aria-label={label}
       data-stage={stage}
       onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; if (!over) onOver(); }}
       onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) onLeave(); }}
@@ -215,7 +224,7 @@ function BoardColumn({ stage, count, over, onOver, onLeave, onDrop, children }: 
       className={cn("flex min-h-[180px] flex-col rounded-lg border border-transparent bg-foreground/5 transition-colors", over && "border-primary/50 bg-primary/10")}
     >
       <header className="flex items-center gap-2 px-3 pb-1.5 pt-2.5" title={BOARD_STAGE_HINT[stage]}>
-        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{BOARD_STAGE_LABEL[stage]}</span>
+        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{label}</span>
         <span className="rounded-full bg-foreground/10 px-1.5 text-[11px] tabular-nums text-muted-foreground">{count}</span>
       </header>
       <div className="flex-1 space-y-2 px-2 pb-2">
@@ -272,7 +281,7 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
   const [opening, setOpening] = useState(false);
   const [openError, setOpenError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [over, setOver] = useState<BoardStage | null>(null);
+  const [over, setOver] = useState<string | null>(null);
   // Cards you just dragged, drawn in their new column until the server's answer arrives.
   const [moves, setMoves] = useState<Record<string, BoardStage>>({});
   useEffect(() => {
@@ -365,16 +374,17 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
   };
 
   const columns = useMemo(() => {
-    const byStage = Object.fromEntries(BOARD_STAGES.map((stage) => [stage, [] as ReviewSummary[]])) as Record<BoardStage, ReviewSummary[]>;
+    const empty = () => Object.fromEntries(BOARD_STAGES.map((stage) => [stage, [] as ReviewSummary[]])) as Record<BoardStage, ReviewSummary[]>;
+    const byLane: Record<BoardLane, Record<BoardStage, ReviewSummary[]>> = { mine: empty(), reviewing: empty() };
     const closed: ReviewSummary[] = [];
     for (const r of reviews ?? []) {
       const stage = moves[r.id] ?? r.stage;
       if (stage === null) closed.push(r);
-      else byStage[stage].push(r);
+      else byLane[r.mine ? "mine" : "reviewing"][stage].push(r);
     }
-    for (const stage of BOARD_STAGES) byStage[stage].sort((a, b) => cardTime(b) - cardTime(a));
+    for (const lane of BOARD_LANES) for (const stage of BOARD_STAGES) byLane[lane.id][stage].sort((a, b) => cardTime(b) - cardTime(a));
     closed.sort((a, b) => cardTime(b) - cardTime(a));
-    return { byStage, closed };
+    return { byLane, closed };
   }, [reviews, moves]);
   const openCards = (reviews ?? []).filter((r) => r.stage !== null);
   const oldestSync = openCards.length === 0 ? null : Math.min(...openCards.map((r) => r.syncedAt));
@@ -398,26 +408,45 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
       {error ? <p role="alert" className="px-4 pt-2 text-sm text-destructive">{error}</p> : null}
       <div className="min-h-0 flex-1 overflow-y-auto">
         {reviews === null ? <p className="p-6 text-sm text-muted-foreground">Loading…</p> : (
-          <div className="grid gap-3 p-4 [grid-template-columns:repeat(auto-fit,minmax(240px,1fr))]">
-            {BOARD_STAGES.map((stage) => (
-              <BoardColumn
-                key={stage}
-                stage={stage}
-                count={columns.byStage[stage].length}
-                over={over === stage}
-                onOver={() => setOver(stage)}
-                onLeave={() => setOver((s) => (s === stage ? null : s))}
-                onDrop={(id) => {
-                  setOver(null);
-                  const card = reviews.find((r) => r.id === id);
-                  if (card !== undefined) void move(card, stage);
-                }}
-              >
-                {columns.byStage[stage].map((card) => (
-                  <PrCard key={card.id} card={card} stage={stage} onOpen={() => onOpen(card.id)} onUnpin={() => void move(card, null)} onRemove={() => void remove(card)} onReview={() => void review(card)} />
-                ))}
-              </BoardColumn>
-            ))}
+          <div className="space-y-2 pb-2">
+            {BOARD_LANES.map((lane) => {
+              const cards = columns.byLane[lane.id];
+              const total = BOARD_STAGES.reduce((n, stage) => n + cards[stage].length, 0);
+              // My PRs shows once you have one there; Reviewing is always on the board.
+              if (lane.id === "mine" && total === 0) return null;
+              // Columns a PR rarely sits in show only when one does.
+              const stages = lane.stages.filter((stage) => cards[stage].length > 0 || (stage !== "unreviewed" && stage !== "changes_requested"));
+              return (
+                <section key={lane.id} aria-label={lane.label}>
+                  <h2 className="px-4 pt-3 text-xs font-semibold text-muted-foreground">{lane.label} <span className="font-normal tabular-nums">{total}</span></h2>
+                  <div className="grid gap-3 px-4 pt-2 [grid-template-columns:repeat(auto-fit,minmax(220px,1fr))]">
+                    {stages.map((stage) => {
+                      const key = `${lane.id}:${stage}`;
+                      return (
+                        <BoardColumn
+                          key={key}
+                          stage={stage}
+                          label={stageLabel(stage, lane.id)}
+                          count={cards[stage].length}
+                          over={over === key}
+                          onOver={() => setOver(key)}
+                          onLeave={() => setOver((s) => (s === key ? null : s))}
+                          onDrop={(id) => {
+                            setOver(null);
+                            const card = reviews.find((r) => r.id === id);
+                            if (card !== undefined) void move(card, stage);
+                          }}
+                        >
+                          {cards[stage].map((card) => (
+                            <PrCard key={card.id} card={card} stage={stage} onOpen={() => onOpen(card.id)} onUnpin={() => void move(card, null)} onRemove={() => void remove(card)} onReview={() => void review(card)} />
+                          ))}
+                        </BoardColumn>
+                      );
+                    })}
+                  </div>
+                </section>
+              );
+            })}
           </div>
         )}
       </div>

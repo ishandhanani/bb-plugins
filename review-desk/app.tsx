@@ -30,7 +30,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { FileDiff, type DiffLineAnnotation, type FileDiffMetadata, type SelectedLineRange } from "@pierre/diffs/react";
 import { parsePatchFiles } from "@pierre/diffs";
-import type { CommitInfo, FileEntry, MapState, Note, NoteKind, PendingComment, ProviderOption, Review, Seat, SelectionRef, SimpleMode, SimpleState, rpcContract } from "./server";
+import type { CommitInfo, FileEntry, FixRun, MapState, Note, NoteKind, PendingComment, ProviderOption, Review, Seat, SelectionRef, SimpleMode, SimpleState, rpcContract } from "./server";
 import type { ChangedFile, GhThread } from "./host-contract";
 import { MENTION_PROVIDER_ID, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
 import { BoardPage } from "./board";
@@ -204,6 +204,8 @@ interface ReviewDetail {
   notesError: string | null;
   seen: { prevHead: string | null; seenHead: string | null };
   chatProjectId: string;
+  /** You wrote this PR, so it runs the author's pipeline. */
+  mine: boolean;
 }
 
 /** A commit view target parsed from the sub-path: `sha`, or `from..to` meaning the commits from `from` through `to` inclusive. */
@@ -1266,6 +1268,72 @@ function CommitView({ reviewId, review, target, theme, diffStyle, selection, onS
 
 type JumpFn = (path: string, line: number | null, side: "old" | "new") => void;
 
+/** Your own PR: what the author's agent did, run by run, with its verdict on each comment. */
+function AuthorAgentPanel({ reviewId }: { reviewId: string }) {
+  const rpc = useRpc<Contract>();
+  const navigate = useBbNavigate();
+  const [runs, setRuns] = useState<FixRun[] | null>(null);
+  const load = useCallback(() => {
+    rpc.call("fix_runs", { reviewId }).then((r) => setRuns(r.runs), () => setRuns([]));
+  }, [rpc, reviewId]);
+  useEffect(load, [load]);
+  useRealtime(REVIEW_CHANGED, (payload) => {
+    const p = payloadReview(payload);
+    if (p !== null && p.reviewId === reviewId) load();
+  });
+  const start = (kind: "fix" | "deslop") =>
+    rpc.call("fix_start", { reviewId, kind }).then(() => { toast.success(kind === "fix" ? "The author's agent is triaging the feedback" : "The author's agent is deslopping the diff"); load(); }, (cause: unknown) => toast.error(describeError(cause)));
+  const running = runs?.at(-1)?.status === "running";
+  const VERDICT_CLASS: Record<string, string> = {
+    FIX: "border-primary/50 bg-primary/10 text-primary",
+    SKIP: "border-border bg-muted text-muted-foreground",
+    ASK: "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  };
+  return (
+    <section className="rounded-lg border border-border bg-card p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-sm font-semibold">Author's agent</span>
+        <span className="text-xs text-muted-foreground">triages and fixes the feedback on your PR, then deslops it</span>
+        <span className="ml-auto flex items-center gap-1">
+          {runs?.at(-1)?.threadId ? (
+            <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs" onClick={() => navigate.toThread(runs.at(-1)?.threadId ?? "")}><Icon name="ExternalLink" className="size-3.5" />Thread</Button>
+          ) : null}
+          <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs" disabled={running} onClick={() => void start("fix")}>Fix now</Button>
+          <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs" disabled={running} onClick={() => void start("deslop")}>Deslop now</Button>
+        </span>
+      </div>
+      {runs === null ? <p className="mt-2 text-xs text-muted-foreground">Loading…</p> : runs.length === 0 ? <p className="mt-2 text-xs text-muted-foreground">Not run yet. It starts after the first AI round.</p> : (
+        <ol className="mt-3 space-y-3">
+          {[...runs].reverse().map((r) => (
+            <li key={r.run} className="space-y-1.5">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-medium">{r.kind === "deslop" ? "Deslop" : "Fix"} · run {r.run}</span>
+                <span className="text-muted-foreground">{r.trigger === "human" ? "after your comments" : r.trigger.startsWith("round:") ? `after AI round ${r.trigger.slice(6)}` : r.trigger === "manual" ? "started by you" : "after the fixes"}</span>
+                <span className={cn("rounded-full border px-1.5 text-[10px]", r.status === "failed" ? "border-destructive/50 text-destructive" : "border-border text-muted-foreground")}>{r.status}</span>
+                {r.headAfter && r.headAfter !== r.headBefore ? <span className="font-mono text-muted-foreground">{shortSha(r.headBefore)} → {shortSha(r.headAfter)}</span> : null}
+              </div>
+              {r.error ? <p className="text-xs text-destructive">{r.error}</p> : null}
+              {r.summary ? <p className="text-xs">{r.summary}</p> : null}
+              {r.items.length > 0 ? (
+                <ul className="divide-y divide-border/60 rounded-md border border-border/60 text-xs">
+                  {r.items.map((i, n) => (
+                    <li key={`${r.run}-${n}`} className="flex items-baseline gap-2 px-2.5 py-1.5">
+                      <span className={cn("shrink-0 rounded-full border px-1.5 text-[10px] font-medium", VERDICT_CLASS[i.verdict] ?? VERDICT_CLASS.SKIP)}>{i.verdict}</span>
+                      <span className="min-w-0 flex-1">{i.reason}{i.author && i.author !== "deslop" ? <span className="text-muted-foreground"> · @{i.author}</span> : null}</span>
+                      {i.commit ? <span className="shrink-0 font-mono text-muted-foreground">{i.commit.slice(0, 7)}</span> : null}
+                      {i.url ? <UrlLink href={i.url} className="shrink-0 text-muted-foreground hover:underline">thread</UrlLink> : null}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
+  );
+}
+
 /** The Map tab: the PR's diffmap, written by the helper from the code. */
 function MapPanel({ reviewId }: { reviewId: string }) {
   const { state, error, rewrite } = useMap(reviewId);
@@ -1602,6 +1670,7 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
 
           {tab === "comments" ? (
             <div className="mt-4 space-y-6">
+              {detail.mine ? <AuthorAgentPanel reviewId={reviewId} /> : null}
               <Description body={review.body} />
               <Discussion reviewId={reviewId} threads={threads} />
             </div>

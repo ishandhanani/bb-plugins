@@ -119,7 +119,8 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.events.on("thread.active", async ({ thread }) => {
-    if (thread.parentThreadId !== null || thread.originKind !== null) return;
+    // Subagents, forks, and threads a plugin started (it names them itself) keep their titles.
+    if (thread.parentThreadId !== null || thread.originKind !== null || thread.originPluginId != null) return;
     if (Date.now() - thread.createdAt > MAX_THREAD_AGE_MS) return;
     const doneKey = `done:${thread.id}`;
     if (inFlight.has(thread.id) || (await bb.storage.kv.get<boolean>(doneKey))) return;

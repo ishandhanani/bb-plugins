@@ -28,6 +28,9 @@ export const ghPrSchema = z.object({
   headRefName: z.string(),
   headRefOid: z.string(),
   baseRefOid: z.string(),
+  /** The repository the head branch lives in (a fork for cross-repository PRs). */
+  headOwner: z.string().nullable(),
+  headRepo: z.string().nullable(),
   additions: z.number(),
   deletions: z.number(),
   changedFiles: z.number(),
@@ -166,6 +169,15 @@ export const hostContract = defineRpcContract({
   gh_resolve: {
     input: z.object({ threadId: z.string(), resolve: z.boolean() }),
     output: z.object({ ok: z.literal(true) }),
+  },
+  /**
+   * The worktree with the PR's branch checked out, for the author's agent that
+   * commits and pushes: an existing one, or a new one tracking the branch on the
+   * remote that points at the PR's head repository.
+   */
+  branch_worktree: {
+    input: z.object({ repoPath: z.string(), branch: z.string(), headOwner: z.string(), headRepo: z.string(), worktreesDir: z.string(), key: z.string() }),
+    output: z.object({ worktree: z.string(), remote: z.string(), created: z.boolean() }),
   },
   /** A folder per repository that links each PR worktree as pr-<number>: the workspace Review Desk's visible threads share. */
   review_group_dir: {
