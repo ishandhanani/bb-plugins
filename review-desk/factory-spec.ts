@@ -29,8 +29,10 @@ export type AiFindingStatus = (typeof AI_FINDING_STATUSES)[number];
 
 export const AI_REVIEW_FENCE = "ai-review";
 export const BABYSIT_FENCE = "babysit";
-/** Marks a review the factory posted, so a human review can be told apart from it under the same login. */
-export const AI_ROUND_MARKER = "<!-- review-desk:ai-round";
+/** Starts every comment and review the factory posts under your login, so it is never read as your own feedback. */
+export const FACTORY_MARKER = "<!-- review-desk:";
+/** Marks a review an AI round posted. */
+export const AI_ROUND_MARKER = `${FACTORY_MARKER}ai-round`;
 
 /** Anything but a NIT keeps a PR in AI review. */
 export function isHighValue(label: string): boolean {
@@ -218,17 +220,15 @@ export function reviewBody(args: {
   /** What happens next, when it is neither a hand-off nor waiting for a push. */
   next?: string;
 }): string {
-  const lines = [
-    `### Round ${args.round} AI review`,
-    `_Automated review (round ${args.round} of up to ${args.maxRounds} before a human review). Findings may be wrong; reply on a thread to dispute one._`,
-    "",
-  ];
-  if (args.summary.trim() !== "") lines.push(args.summary.trim(), "");
+  // Folded under one line, so the PR conversation stays short; the findings themselves are inline on their lines.
   const tally = AI_LABELS.filter((l) => args.counts[l] > 0).map((l) => `${args.counts[l]} ${l}`);
-  lines.push(`**New findings:** ${tally.length === 0 ? "none" : tally.join(", ")}`);
-  if (args.resolved.length > 0 || args.stillOpen.length > 0) {
-    const fixed = args.resolved.filter((r) => r.status === "fixed").length;
-    const obsolete = args.resolved.filter((r) => r.status === "obsolete").length;
+  const fixed = args.resolved.filter((r) => r.status === "fixed").length;
+  const obsolete = args.resolved.filter((r) => r.status === "obsolete").length;
+  const earlier = args.resolved.length > 0 || args.stillOpen.length > 0 ? `earlier: ${fixed} fixed, ${args.stillOpen.length} still open` : null;
+  const headline = [`<b>Round ${args.round} AI review</b>`, tally.length === 0 ? "no new findings" : tally.join(", "), earlier].filter((x) => x !== null).join(" · ");
+  const lines = [`<details><summary>${headline}</summary>`, "", `_Automated review, round ${args.round} of up to ${args.maxRounds} before a human review. Findings may be wrong; reply on a thread to dispute one._`, ""];
+  if (args.summary.trim() !== "") lines.push(args.summary.trim(), "");
+  if (earlier !== null) {
     lines.push(`**Earlier findings:** ${fixed} fixed, ${obsolete} no longer apply, ${args.stillOpen.length} still open`);
     for (const r of args.stillOpen) lines.push(`- still open **[${normalizeLabel(r.severity)}]** ${r.title}`);
     for (const r of args.resolved.filter((x) => x.status === "obsolete" && x.note.trim() !== "")) lines.push(`- no longer applies: ${r.title} (${r.note.trim()})`);
@@ -236,8 +236,24 @@ export function reviewBody(args: {
   const listed = (items: PostedFinding[]) => items.map((f) => `- \`${f.path}:${f.line}\` **[${f.severity}] ${f.title.trim()}**: ${f.body.trim().replace(/\n+/g, " ")}`);
   if (args.offDiff.length > 0) lines.push("", "**Findings outside the diff:**", ...listed(args.offDiff));
   if (args.nits.length > 0) lines.push("", `<details><summary>NITs (${args.nits.length})</summary>`, "", ...listed(args.nits), "", "</details>");
-  lines.push("", `_${args.next ?? (args.handoff ? "AI review is done; a human reviewer takes it from here." : "The next AI round runs after new commits are pushed.")}_`);
+  lines.push("", `_${args.next ?? (args.handoff ? "AI review is done; a human reviewer takes it from here." : "The next AI round runs after new commits are pushed.")}_`, "", "</details>");
   lines.push(`${AI_ROUND_MARKER} ${args.round} -->`);
+  return lines.join("\n");
+}
+
+/** The deslop pass on your own PR, posted as a folded comment: what it removed, commit by commit, and what it kept. */
+export function deslopReportBody(args: { run: number; summary: string; items: { reason: string; commit?: string | null }[]; headBefore: string; headAfter: string | null }): string {
+  const cleanups = args.items.filter((i) => (i.commit ?? "") !== "");
+  const moved = args.headAfter !== null && args.headAfter !== "" && args.headAfter !== args.headBefore;
+  const headline = [
+    "<b>Deslop</b>",
+    cleanups.length === 0 ? "nothing removed" : `${cleanups.length} cleanup${cleanups.length === 1 ? "" : "s"}`,
+    moved ? `<code>${args.headBefore.slice(0, 7)}</code> → <code>${(args.headAfter ?? "").slice(0, 7)}</code>` : null,
+  ].filter((x) => x !== null).join(" · ");
+  const lines = [`<details><summary>${headline}</summary>`, "", "_Automated deslop of this PR's own diff: duplicate or redundant new structures, one-use abstractions, dead paths, and comments a person would not write, with behavior unchanged._", ""];
+  if (args.summary.trim() !== "") lines.push(args.summary.trim(), "");
+  for (const i of cleanups) lines.push(`- \`${(i.commit ?? "").slice(0, 10)}\` ${i.reason.trim().replace(/\n+/g, " ")}`);
+  lines.push("", "</details>", `${FACTORY_MARKER}deslop ${args.run} -->`);
   return lines.join("\n");
 }
 

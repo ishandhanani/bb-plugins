@@ -15,11 +15,12 @@ import { z } from "zod";
 import { MENTION_PROVIDER_ID, decodeMentionRef, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
 import { BOARD_STAGES, BOARD_STAGE_LABEL, isBoardStage, isPipelineStage, type BoardStage, type PipelineStage } from "./board-spec";
 import {
-  AI_ROUND_MARKER,
+  FACTORY_MARKER,
   AI_LABELS,
   babysitIntro,
   babysitPrompt,
   deslopPrompt,
+  deslopReportBody,
   fixPrompt,
   fixerIntro,
   parseFixReply,
@@ -3154,7 +3155,7 @@ export default async function plugin(bb: BbPluginApi) {
     const conversation = await host.call("gh_conversation", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
     q.setConversationCache.run(row.id, JSON.stringify(conversation), Date.now());
     const mine = conversation.reviews.filter(
-      (r) => r.author === login && !r.body.includes(AI_ROUND_MARKER) && (r.state !== "COMMENTED" || r.body.trim() !== "") && r.submittedAt !== null && Date.parse(r.submittedAt) > p.entered_at,
+      (r) => r.author === login && !r.body.includes(FACTORY_MARKER) && (r.state !== "COMMENTED" || r.body.trim() !== "") && r.submittedAt !== null && Date.parse(r.submittedAt) > p.entered_at,
     );
     if (isMine(row)) {
       await myFeedbackTick(row, p, login, conversation.reviews);
@@ -3180,7 +3181,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const windows = q.fixRuns.all(row.id).map((r) => [r.started_at, (r.finished_at ?? Date.now()) + 2 * 60_000] as const);
     const yours = reviews.filter((r) => {
-      if (r.author !== login || r.body.includes(AI_ROUND_MARKER) || r.submittedAt === null) return false;
+      if (r.author !== login || r.body.includes(FACTORY_MARKER) || r.submittedAt === null) return false;
       const at = Date.parse(r.submittedAt);
       return at > p.entered_at && !windows.some(([from, to]) => at >= from && at <= to);
     });
@@ -3463,7 +3464,10 @@ export default async function plugin(bb: BbPluginApi) {
       await letYouKnow(fresh, q.fixer.get(reviewId)?.thread_id, "ready_for_you", `${why}; moved to Babysit`);
       void advanceFactory(reviewId).catch(() => undefined);
     };
-    if (r.kind === "deslop") return toYou("AI review, fixes, and deslop are done");
+    if (r.kind === "deslop") {
+      await postDeslopReport(fresh, run).catch((cause: unknown) => bb.log.warn(`deslop report on ${prLabel(fresh)}: ${errorMessage(cause)}`));
+      return toYou("AI review, fixes, and deslop are done");
+    }
     if (r.trigger === "human") return toYou("the author's agent worked through your comments");
     const posted = q.rounds.all(reviewId).filter((x) => x.status === "posted").length;
     if (reply.pushed && fresh.head_sha !== r.head_before && posted < maxRounds) {
@@ -3483,6 +3487,15 @@ export default async function plugin(bb: BbPluginApi) {
     if (q.fixRuns.all(row.id).some((r) => r.trigger === `round:${last.round}`)) return false;
     await afterMyRound(row, last.round, last.high_value ?? 0);
     return true;
+  }
+
+  /** Post a deslop run's report on the PR, folded, as a COMMENT review at the current head. */
+  async function postDeslopReport(row: ReviewRow, run: number): Promise<string | null> {
+    const r = q.fixRun.get(row.id, run);
+    if (r === undefined || r.kind !== "deslop" || r.status !== "done") throw new Error(`deslop run ${run} is not done`);
+    const body = deslopReportBody({ run, summary: r.summary ?? "", items: parseJson<FixRun["items"]>(r.items_json, []), headBefore: r.head_before, headAfter: r.head_after });
+    const posted = await host.call("gh_submit_review", { owner: row.owner, repo: row.repo, number: row.number, commitId: row.head_sha, event: "COMMENT", body, comments: [] }, hostOptions(row));
+    return posted.url;
   }
 
   /** After a round on your own PR: the author's agent takes the feedback, or, with nothing to fix, deslops. */
@@ -3801,7 +3814,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "board", summary: "Print the board: every tracked PR under its column", usage: "bb review-desk board [--json]" },
       { name: "move", summary: "Drag a card to a column, or back to the column GitHub's state gives it", usage: "bb review-desk move <reviewId> <unreviewed|ai_review|human_review|changes_requested|babysit|auto> [--json]" },
       { name: "refresh", summary: "Sync every open PR with GitHub", usage: "bb review-desk refresh [--json]" },
-      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show|ping|resolve|fix|deslop> <reviewId> [--json]" },
+      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show|ping|resolve|fix|deslop|report> <reviewId> [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "map", summary: "Write or print the PR's diffmap spec", usage: "bb review-desk map <reviewId> [--rewrite] [--json]" },
       { name: "simple", summary: "Queue Simple English rewrites of all the comments, redo them all, or request one comment by key", usage: "bb review-desk simple <reviewId> [--redo | --key <t:...|c:...|r:...>] [--json]" },
@@ -3869,6 +3882,12 @@ export default async function plugin(bb: BbPluginApi) {
               const resolved = last === undefined ? 0 : await resolveFindingThreads(row, last.head_sha);
               return ok({ resolved }, `Resolved ${resolved} thread${resolved === 1 ? "" : "s"} for fixed or obsolete findings`);
             }
+            if (action === "report") {
+              const last = q.fixRuns.all(row.id).filter((r) => r.kind === "deslop" && r.status === "done").at(-1);
+              if (last === undefined) return { exitCode: 1, stderr: "no finished deslop run on this PR" };
+              const url = await postDeslopReport(row, last.run);
+              return ok({ url }, `Posted the report of deslop run ${last.run}: ${url}`);
+            }
             if (action === "fix" || action === "deslop") {
               if (q.pipeline.get(row.id) === undefined) setStage(row, action === "deslop" ? "deslop" : "fixing");
               await startFixRun(row, action, "manual");
@@ -3876,7 +3895,7 @@ export default async function plugin(bb: BbPluginApi) {
             else if (action === "stop") {
               q.deletePipeline.run(row.id);
               publish(row.id, "board");
-            } else if (action !== "show") return { exitCode: 1, stderr: "usage: bb review-desk factory <start|stop|show|ping|resolve|fix|deslop> <reviewId>" };
+            } else if (action !== "show") return { exitCode: 1, stderr: "usage: bb review-desk factory <start|stop|show|ping|resolve|fix|deslop|report> <reviewId>" };
             const card = summarize(requireReview(row.id));
             const rounds = q.rounds.all(row.id);
             const findings = q.findings.all(row.id);
