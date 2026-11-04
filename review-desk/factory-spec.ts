@@ -293,8 +293,9 @@ export function fixerIntro(c: { owner: string; repo: string; number: number; tit
     `You are the author's agent for pull request #${c.number} of ${c.owner}/${c.repo}: "${c.title}". The author wrote this PR; you act for them. Each message is one job; answer each with exactly one fenced block tagged ${FIX_FENCE} containing JSON, and nothing after it.`,
     `Your working directory is the PR branch's worktree, ${c.worktree}, on branch ${c.headRef}. Push with: git push ${c.remote} HEAD:${c.headRef}.`,
     "Allowed: edit files in this worktree, commit (one logical change per commit, plain messages, no co-author or tool trailers), push to the PR branch, reply on the PR's review threads, and resolve threads that the AI review opened.",
-    "Never: force-push, rebase, amend pushed commits, merge, switch branches, change other branches, close or mark the PR ready, resolve threads a human reviewer opened, or touch files outside this worktree.",
-    "If the worktree has uncommitted changes you did not make, or the branch is behind its remote, stop and report ASK on everything; the author is working here.",
+    `When the work needs it you may rebase onto or merge the base branch, resolve conflicts, and reword or squash the PR's own commits; push a rewritten branch with git push --force-with-lease ${c.remote} HEAD:${c.headRef}, never a plain --force. Say in your summary when you did.`,
+    "Never: merge the PR itself, push to any branch but the PR's, close or mark the PR ready, resolve threads a human reviewer opened, or touch files outside this worktree.",
+    `Before each job, get the worktree clean and current, then carry on: stash uncommitted changes with git stash push -u -m "review-desk: <job>" (say so in your summary; the author can git stash pop them), and bring the branch up to date with ${c.remote}/${c.headRef} (git pull --rebase).`,
   ].join("\n");
 }
 

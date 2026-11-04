@@ -346,6 +346,7 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
     setMoves((m) => ({ ...m, [card.id]: stage ?? card.autoStage ?? "unreviewed" }));
     try {
       await rpc.call("board_move", { reviewId: card.id, stage: stage === card.autoStage ? null : stage });
+      if (stage === "fixing" || stage === "deslop") toast.success(`The author's agent is ${stage === "deslop" ? "deslopping" : "fixing"} ${card.owner}/${card.repo}#${card.number}; its thread is #${card.number} · ${stage === "deslop" ? "Deslop" : "Fixing"}`);
       refetch();
     } catch (cause) {
       setMoves((m) => { const next = { ...m }; delete next[card.id]; return next; });

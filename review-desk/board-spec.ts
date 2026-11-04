@@ -33,8 +33,8 @@ export function isBoardStage(value: unknown): value is BoardStage {
   return typeof value === "string" && (BOARD_STAGES as readonly string[]).includes(value);
 }
 
-/** The stages the PR factory drives; Unreviewed and Babysit come from GitHub. */
-export const PIPELINE_STAGES = ["ai_review", "fixing", "deslop", "human_review", "changes_requested"] as const;
+/** The stages the PR factory drives. Unreviewed comes from GitHub; Babysit comes from an approval, or from the pipeline on your own PR. */
+export const PIPELINE_STAGES = ["ai_review", "fixing", "deslop", "human_review", "changes_requested", "babysit"] as const;
 export type PipelineStage = (typeof PIPELINE_STAGES)[number];
 
 export function isPipelineStage(value: unknown): value is PipelineStage {

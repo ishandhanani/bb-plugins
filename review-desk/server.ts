@@ -1344,6 +1344,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (stage === "unreviewed") q.deletePipeline.run(reviewId);
       else setStage(row, stage);
       if (stage === "ai_review") void advanceFactory(reviewId, true);
+      // A drag into Fixing or Deslop starts the author's agent on that job.
+      if (stage === "fixing" || stage === "deslop") void startFixRun(requireReview(reviewId), stage === "deslop" ? "deslop" : "fix", "manual").catch(() => undefined);
       publish(reviewId, "board");
       return summarize(requireReview(reviewId));
     }
@@ -2018,10 +2020,14 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         const thread = await bb.sdk.threads.get({ threadId: existing.thread_id });
         const sameIntro = !lane.replaceOnIntroChange || existing.intro_hash === introHash;
-        // A thread from before the shared environment moves there on its next job; a visible one is archived so it does not linger.
+        // A thread from before the shared environment moves there on its next job.
         const sameEnvironment = shared === null || shared.environmentId === null || existing.environment_id === shared.environmentId;
-        if (!sameEnvironment && thread.visibility === "visible" && thread.archivedAt === null) await bb.sdk.threads.archive({ threadId: existing.thread_id }).catch(() => undefined);
-        if (thread.archivedAt === null && thread.deletedAt === null && existing.provider_id === wantedProvider && sameIntro && sameEnvironment) {
+        const reusable = existing.provider_id === wantedProvider && sameIntro && sameEnvironment;
+        // A visible thread being replaced is archived, so it does not linger in the sidebar.
+        if (!reusable && thread.visibility === "visible" && thread.archivedAt === null) {
+          await bb.sdk.threads.archive({ threadId: existing.thread_id }).catch((cause: unknown) => bb.log.warn(`archiving replaced thread ${existing.thread_id}: ${errorMessage(cause)}`));
+        }
+        if (thread.archivedAt === null && thread.deletedAt === null && reusable) {
           lane.setJob(job, row.id);
           await bb.sdk.threads.send({
             threadId: existing.thread_id,
@@ -2883,8 +2889,9 @@ export default async function plugin(bb: BbPluginApi) {
       const row = q.review.get(reviewId);
       const p = q.pipeline.get(reviewId);
       if (row === undefined || p === undefined || row.state !== "OPEN") return;
-      // You cannot approve your own PR, so on yours a drag to Babysit starts it.
-      if (githubStage(row) === "babysit" || (isMine(row) && q.boardStage.get(row.id)?.stage === "babysit")) await babysitTick(row, p);
+      // Your own PR reaches Babysit through the pipeline (you cannot approve it); your comments there still go to its agent.
+      if (isMine(row) && p.stage === "babysit" && (await myFeedbackTick(row, p))) return;
+      if (githubStage(row) === "babysit" || p.stage === "babysit") await babysitTick(row, p);
       else if (p.stage === "ai_review" && isMine(row) && !force && (await myRoundCatchUp(row))) return;
       else if (p.stage === "ai_review") aiReviewTick(row, p, force);
       else if (p.stage === "human_review") await humanReviewTick(row, p);
@@ -3133,7 +3140,10 @@ export default async function plugin(bb: BbPluginApi) {
     const mine = conversation.reviews.filter(
       (r) => r.author === login && !r.body.includes(AI_ROUND_MARKER) && (r.state !== "COMMENTED" || r.body.trim() !== "") && r.submittedAt !== null && Date.parse(r.submittedAt) > p.entered_at,
     );
-    if (isMine(row)) return myReviewTick(row, p, login, conversation.reviews);
+    if (isMine(row)) {
+      await myFeedbackTick(row, p, login, conversation.reviews);
+      return;
+    }
     if (mine.length === 0 || mine.some((r) => r.state === "APPROVED")) return;
     setStage(row, "changes_requested");
   }
@@ -3144,14 +3154,23 @@ export default async function plugin(bb: BbPluginApi) {
    * comments included) goes to the author's agent. Reviews posted while that
    * agent was working are its own replies, under your login, and are skipped.
    */
-  async function myReviewTick(row: ReviewRow, p: PipelineRow, login: string, reviews: { author: string; body: string; submittedAt: string | null }[]): Promise<void> {
+  async function myFeedbackTick(row: ReviewRow, p: PipelineRow, knownLogin?: string, knownReviews?: { author: string; body: string; submittedAt: string | null }[]): Promise<boolean> {
+    const login = knownLogin ?? (await viewerLogin(row));
+    let reviews = knownReviews;
+    if (reviews === undefined) {
+      const conversation = await host.call("gh_conversation", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
+      q.setConversationCache.run(row.id, JSON.stringify(conversation), Date.now());
+      reviews = conversation.reviews;
+    }
     const windows = q.fixRuns.all(row.id).map((r) => [r.started_at, (r.finished_at ?? Date.now()) + 2 * 60_000] as const);
     const yours = reviews.filter((r) => {
       if (r.author !== login || r.body.includes(AI_ROUND_MARKER) || r.submittedAt === null) return false;
       const at = Date.parse(r.submittedAt);
       return at > p.entered_at && !windows.some(([from, to]) => at >= from && at <= to);
     });
-    if (yours.length > 0) await startFixRun(row, "fix", "human");
+    if (yours.length === 0) return false;
+    await startFixRun(row, "fix", "human");
+    return true;
   }
 
   /** One look at an approved PR's CI. A pass runs only for a failure no earlier pass at this head has seen. */
@@ -3291,7 +3310,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
     providerId: fixerProvider.trim(),
     model: fixerModel,
-    replaceOnIntroChange: false,
+    // Its rules are in the intro; a changed rule replaces the thread so it takes effect.
+    replaceOnIntroChange: true,
     visible: true,
     workspace: (row) => fixerTargets.get(row.id)?.worktree ?? null,
     get: (id) => q.fixer.get(id),
@@ -3398,9 +3418,17 @@ export default async function plugin(bb: BbPluginApi) {
     await syncReview(reviewId).catch((cause: unknown) => bb.log.warn(`sync after the author's agent on ${prLabel(row)}: ${errorMessage(cause)}`));
     const fresh = requireReview(reviewId);
     const asks = reply.items.filter((i) => i.verdict === "ASK").length;
+    // Done: on to Babysit, unless the agent left you questions, which wait in Your review.
     const toYou = async (why: string) => {
-      setStage(fresh, "human_review", asks > 0 ? `${why}; ${asks} question${asks === 1 ? "" : "s"} for you` : why);
-      await letYouKnow(fresh, q.fixer.get(reviewId)?.thread_id, "ready_for_you", asks > 0 ? `${why}; ${asks} question${asks === 1 ? "" : "s"} for you` : why);
+      if (asks > 0) {
+        const withAsks = `${why}; ${asks} question${asks === 1 ? "" : "s"} for you`;
+        setStage(fresh, "human_review", withAsks);
+        await letYouKnow(fresh, q.fixer.get(reviewId)?.thread_id, "needs_you", withAsks);
+        return;
+      }
+      setStage(fresh, "babysit", `${why}; CI babysitting`);
+      await letYouKnow(fresh, q.fixer.get(reviewId)?.thread_id, "ready_for_you", `${why}; moved to Babysit`);
+      void advanceFactory(reviewId).catch(() => undefined);
     };
     if (r.kind === "deslop") return toYou("AI review, fixes, and deslop are done");
     if (r.trigger === "human") return toYou("the author's agent worked through your comments");
@@ -3429,8 +3457,9 @@ export default async function plugin(bb: BbPluginApi) {
     const openThreads = cachedThreads(row).filter((t) => !t.isResolved).length;
     if (high > 0 || openThreads > 0) return startFixRun(row, "fix", `round:${round}`);
     if (deslopStage) return startFixRun(row, "deslop", `round:${round}`);
-    setStage(row, "human_review", `AI round ${round} found nothing above a nit`);
-    await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "ready_for_you", `AI round ${round} found nothing above a nit`);
+    setStage(row, "babysit", `AI round ${round} found nothing above a nit; CI babysitting`);
+    await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "ready_for_you", `AI round ${round} found nothing above a nit; moved to Babysit`);
+    void advanceFactory(row.id).catch(() => undefined);
   }
 
   // -- GitHub write paths ----------------------------------------------------
@@ -3456,7 +3485,8 @@ export default async function plugin(bb: BbPluginApi) {
     await refreshThreads(row).catch(() => undefined);
     publish(row.id, "pending");
     // Your own review from here: a comment or a change request waits on the author; an approval moves to Babysit through GitHub's state.
-    if (event !== "APPROVE" && q.pipeline.get(row.id)?.stage === "human_review") {
+    const stageNow = q.pipeline.get(row.id)?.stage;
+    if (event !== "APPROVE" && (stageNow === "human_review" || (isMine(row) && stageNow === "babysit"))) {
       if (isMine(row)) void startFixRun(row, "fix", "human");
       else setStage(row, "changes_requested");
     }
