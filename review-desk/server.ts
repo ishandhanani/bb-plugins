@@ -1903,7 +1903,7 @@ export default async function plugin(bb: BbPluginApi) {
      */
     shared?: boolean;
     /** Visible from the start (it does work you may want to watch), regardless of hideSeatThreads. */
-    visible?: boolean;
+    visible?: boolean | ((row: ReviewRow) => boolean);
     /** A workspace of its own (the author's agent works in the PR branch's worktree); null falls back to the PR worktree. */
     workspace?: (row: ReviewRow) => string | null;
     get: (reviewId: string) => HelperRow | undefined;
@@ -2012,7 +2012,10 @@ export default async function plugin(bb: BbPluginApi) {
   async function laneSend(lane: Lane, row: ReviewRow, job: string, text: string): Promise<void> {
     const existing = lane.get(row.id);
     const projectId = await chatProjectId(row);
-    const shared = lane.shared ? await sharedWorkspace(row, projectId) : null;
+    const ownWorkspace = lane.workspace?.(row) ?? null;
+    const shared = lane.shared && ownWorkspace === null ? await sharedWorkspace(row, projectId) : null;
+    /** The environment bb made for this lane's own workspace (it reuses one per path), once known. */
+    const ownEnvironment = ownWorkspace === null ? null : q.sharedEnv.get(`path:${ownWorkspace}`)?.environment_id ?? null;
     const wantedProvider = lane.providerId !== "" ? lane.providerId : (existing?.provider_id ?? defaultProvider);
     const intro = lane.intro(row);
     const introHash = simpleHash(intro);
@@ -2021,7 +2024,9 @@ export default async function plugin(bb: BbPluginApi) {
         const thread = await bb.sdk.threads.get({ threadId: existing.thread_id });
         const sameIntro = !lane.replaceOnIntroChange || existing.intro_hash === introHash;
         // A thread from before the shared environment moves there on its next job.
-        const sameEnvironment = shared === null || shared.environmentId === null || existing.environment_id === shared.environmentId;
+        const sameEnvironment = ownWorkspace !== null
+          ? ownEnvironment === null || existing.environment_id === ownEnvironment
+          : shared === null || shared.environmentId === null || existing.environment_id === shared.environmentId;
         const reusable = existing.provider_id === wantedProvider && sameIntro && sameEnvironment;
         // A visible thread being replaced is archived, so it does not linger in the sidebar.
         if (!reusable && thread.visibility === "visible" && thread.archivedAt === null) {
@@ -2049,8 +2054,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (provider === undefined) throw new Error(`unknown provider ${providerId}`);
     const modes = provider.capabilities.permissionModes;
     const permissionMode = modes.includes("auto") ? "auto" : modes.includes("accept-edits") ? "accept-edits" : undefined;
-    const ownWorkspace = lane.workspace?.(row) ?? null;
-    const knownEnvironment = ownWorkspace !== null ? null : shared !== null ? shared.environmentId : row.environment_id ?? q.seats.all(row.id).find((s) => s.environment_id !== null)?.environment_id ?? null;
+    const knownEnvironment = ownWorkspace !== null ? ownEnvironment : shared !== null ? shared.environmentId : row.environment_id ?? q.seats.all(row.id).find((s) => s.environment_id !== null)?.environment_id ?? null;
     const now = Date.now();
     const thread = await bb.sdk.threads.spawn({
       projectId,
@@ -2063,7 +2067,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...(lane.reasoningLevel === undefined ? {} : { reasoningLevel: lane.reasoningLevel }),
       title: `#${row.number} ${lane.title}`,
       sectionId: await sectionId(),
-      visibility: lane.visible || !hideSeatThreads ? "visible" : "hidden",
+      visibility: (typeof lane.visible === "function" ? lane.visible(row) : lane.visible) || !hideSeatThreads ? "visible" : "hidden",
       input: [{ type: "text", text: intro, mentions: [], visibility: "agent-only" }, { type: "text", text, mentions: [] }],
     });
     lane.upsert(row.id, thread.id, providerId, knownEnvironment, now, introHash);
@@ -2073,7 +2077,12 @@ export default async function plugin(bb: BbPluginApi) {
         const environmentId = thread.environmentId ?? (await waitForEnvironment(thread.id));
         if (environmentId === null) return null;
         lane.upsert(row.id, thread.id, providerId, environmentId, now, introHash);
-        if (ownWorkspace !== null) return environmentId;
+        if (ownWorkspace !== null) {
+          // The PR's threads fold into a folder named after this environment.
+          q.setSharedEnv.run(`path:${ownWorkspace}`, environmentId);
+          await bb.sdk.environments.update({ environmentId, name: `#${row.number} · ${row.title}`.slice(0, 60) }).catch((cause: unknown) => bb.log.warn(`naming ${prLabel(row)}'s environment: ${errorMessage(cause)}`));
+          return environmentId;
+        }
         if (shared === null) {
           q.setEnvironment.run(environmentId, row.id);
           return environmentId;
@@ -2774,6 +2783,10 @@ export default async function plugin(bb: BbPluginApi) {
     title: "AI review",
     intro: reviewerIntro,
     shared: true,
+    // On your own PR every thread works in the branch's worktree, so they fold into one folder per PR.
+    workspace: (row) => (isMine(row) ? fixerTargets.get(row.id)?.worktree ?? null : null),
+    // bb folds two or more visible threads, so on your own PR this one shows from the start.
+    visible: (row) => isMine(row),
     providerId: aiReviewProvider.trim(),
     model: aiReviewModel,
     replaceOnIntroChange: false,
@@ -2786,6 +2799,8 @@ export default async function plugin(bb: BbPluginApi) {
     title: "CI babysit",
     intro: babysitIntro,
     shared: true,
+    workspace: (row) => (isMine(row) ? fixerTargets.get(row.id)?.worktree ?? null : null),
+    visible: (row) => isMine(row),
     providerId: babysitProvider.trim(),
     model: babysitModel,
     reasoningLevel: "low",
@@ -2971,6 +2986,7 @@ export default async function plugin(bb: BbPluginApi) {
         extraSkills: skillsFor(row),
         empirical: aiReviewEmpirical,
       });
+      if (isMine(row)) await ensureBranchWorktree(row);
       await laneSend(reviewerLane, row, `round:${r.round}`, prompt);
     } catch (cause) {
       q.setRoundStatus.run("failed", errorMessage(cause), Date.now(), row.id, r.round);
@@ -3202,6 +3218,7 @@ export default async function plugin(bb: BbPluginApi) {
     q.setBabysit.run(row.head_sha, key, passes + 1, "running", now, row.id);
     publish(row.id, "board");
     try {
+      if (isMine(row)) await ensureBranchWorktree(row).catch(() => undefined);
       await laneSend(babysitterLane, row, "babysit", babysitPrompt({ owner: row.owner, repo: row.repo, number: row.number, headSha: row.head_sha, pass: passes + 1, maxPasses, failing: card.failingChecks, conflicting }));
     } catch (cause) {
       q.setBabysit.run(row.head_sha, key, passes + 1, null, Date.now(), row.id);
@@ -3365,6 +3382,22 @@ export default async function plugin(bb: BbPluginApi) {
     return { run: last.run, kind: last.kind, status: last.status, fix: count("FIX"), skip: count("SKIP"), ask: count("ASK") };
   }
 
+  /** The worktree with your PR's branch checked out (found or created) and its push remote; every thread of your PR works there. */
+  async function ensureBranchWorktree(row: ReviewRow): Promise<{ worktree: string; remote: string }> {
+    const known = fixerTargets.get(row.id);
+    if (known !== undefined) return known;
+    const pr = await host.call("gh_pr", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
+    if (pr.headOwner === null || pr.headRepo === null) throw new Error("GitHub did not say which repository the PR's branch lives in");
+    const target = await host.call(
+      "branch_worktree",
+      { repoPath: row.repo_path, branch: row.head_ref, headOwner: pr.headOwner, headRepo: pr.headRepo, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}` },
+      { ...hostOptions(row), timeoutMs: 5 * 60_000 },
+    );
+    const resolved = { worktree: target.worktree, remote: target.remote };
+    fixerTargets.set(row.id, resolved);
+    return resolved;
+  }
+
   /** Start the author's agent on a fix (after a round, or after your comments) or on the deslop pass. */
   async function startFixRun(row: ReviewRow, kind: "fix" | "deslop", trigger: string): Promise<void> {
     if (q.fixRuns.all(row.id).at(-1)?.status === "running") return;
@@ -3372,19 +3405,19 @@ export default async function plugin(bb: BbPluginApi) {
     q.insertFixRun.run(row.id, run, kind, trigger, row.head_sha, Date.now());
     setStage(row, kind === "deslop" ? "deslop" : "fixing");
     try {
-      const pr = await host.call("gh_pr", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
-      if (pr.headOwner === null || pr.headRepo === null) throw new Error("GitHub did not say which repository the PR's branch lives in");
-      const target = await host.call(
-        "branch_worktree",
-        { repoPath: row.repo_path, branch: row.head_ref, headOwner: pr.headOwner, headRepo: pr.headRepo, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}` },
-        { ...hostOptions(row), timeoutMs: 5 * 60_000 },
-      );
-      fixerTargets.set(row.id, { worktree: target.worktree, remote: target.remote });
+      await ensureBranchWorktree(row);
       const last = q.rounds.all(row.id).filter((r) => r.status === "posted").at(-1);
       const prompt = kind === "deslop"
         ? deslopPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha })
         : fixPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha, round: last?.round ?? 0, reviewUrl: trigger === "human" ? null : last?.review_url ?? null });
       await laneSend(fixerLane, row, `fix:${run}`, prompt);
+      // An environment bb made for this worktree before Review Desk tracked it is recorded and named now.
+      const target = fixerTargets.get(row.id);
+      const environmentId = q.fixer.get(row.id)?.environment_id ?? null;
+      if (target !== undefined && environmentId !== null && q.sharedEnv.get(`path:${target.worktree}`) === undefined) {
+        q.setSharedEnv.run(`path:${target.worktree}`, environmentId);
+        await bb.sdk.environments.update({ environmentId, name: `#${row.number} · ${row.title}`.slice(0, 60) }).catch(() => undefined);
+      }
       // The thread is visible: title it by PR and job so it reads in the sidebar.
       const threadId = q.fixer.get(row.id)?.thread_id;
       if (threadId !== undefined) await bb.sdk.threads.update({ threadId, title: `#${row.number} · ${kind === "deslop" ? "Deslop" : "Fixing"}` }).catch(() => undefined);
