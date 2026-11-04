@@ -2813,17 +2813,21 @@ export default async function plugin(bb: BbPluginApi) {
     return text.length <= n ? text : `${text.slice(0, n)}... [${text.length - n} more chars]`;
   };
 
-  /** The job's turn from the thread's event log: steps and context usage, trimmed. */
+  /**
+   * The job's turn from the thread's event log: steps and context usage, trimmed.
+   * Threads are reused across jobs, so it pages back from the newest event (the
+   * API serves at most 100 per page) and stops once it is past the job's start.
+   */
   async function jobTrajectory(threadId: string, startedAt: number, finishedAt: number): Promise<unknown[]> {
-    const out: unknown[] = [];
-    let afterSeq: string | undefined;
-    for (let page = 0; page < 40; page++) {
+    const kept: unknown[] = [];
+    let beforeSeq: string | undefined;
+    for (let page = 0; page < 200; page++) {
       const rows = await bb.sdk.threads.events.list({
         threadId,
         types: ["item/started", "item/completed", "thread/contextWindowUsage/updated"],
-        order: "asc",
-        limit: "500",
-        ...(afterSeq === undefined ? {} : { afterSeq }),
+        order: "desc",
+        limit: "100",
+        ...(beforeSeq === undefined ? {} : { beforeSeq }),
       });
       if (rows.length === 0) break;
       for (const row of rows) {
@@ -2831,7 +2835,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (at < startedAt - 5_000 || at > finishedAt + 5_000) continue;
         const data = (row as { data?: Record<string, unknown> }).data ?? {};
         const item = (data.item ?? {}) as Record<string, unknown>;
-        out.push({
+        kept.push({
           type: row.type,
           createdAt: at,
           ...(row.type === "thread/contextWindowUsage/updated"
@@ -2851,10 +2855,11 @@ export default async function plugin(bb: BbPluginApi) {
               }),
         });
       }
-      afterSeq = String((rows.at(-1) as { seq?: number | string }).seq);
-      if (rows.length < 500) break;
+      const oldest = rows.at(-1) as { seq?: number | string; createdAt?: number };
+      if (Number(oldest.createdAt ?? 0) < startedAt - 5_000 || rows.length < 100) break;
+      beforeSeq = String(oldest.seq);
     }
-    return out;
+    return kept.reverse();
   }
 
   /** Note what a job is about to be asked; `recordJob` picks it up when the job finishes. */
@@ -2882,7 +2887,12 @@ export default async function plugin(bb: BbPluginApi) {
     const startedAt = job.startedAt ?? asked?.startedAt ?? Date.now();
     const finishedAt = Date.now();
     void (async () => {
-      const events = job.threadId === null ? [] : await jobTrajectory(job.threadId, startedAt, finishedAt).catch(() => []);
+      const events = job.threadId === null
+        ? []
+        : await jobTrajectory(job.threadId, startedAt, finishedAt).catch((cause: unknown) => {
+            bb.log.warn(`telemetry trajectory for ${job.jobId}: ${errorMessage(cause)}`);
+            return [];
+          });
       emitTelemetry({
         type: "job",
         jobId: job.jobId,
