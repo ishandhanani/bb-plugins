@@ -1197,6 +1197,7 @@ function CreateRoomForm({ preset, onCreated }: { preset?: CreatePreset; onCreate
   const [options, setOptions] = useState<ContextOptions | null>(null);
   const [title, setTitle] = useState(preset?.title ?? "");
   const [projectId, setProjectId] = useState(preset?.projectId ?? "");
+  const [machine, setMachine] = useState("");
   const [seats, setSeats] = useState<SeatDraft[]>([]);
   const [docPath, setDocPath] = useState(".roundtable/plan.md");
   const [docOwner, setDocOwner] = useState("");
@@ -1218,6 +1219,13 @@ function CreateRoomForm({ preset, onCreated }: { preset?: CreatePreset; onCreate
     );
   }, [rpc]);
 
+  // Only machines holding a checkout of the project are offered; picking a
+  // project resets the machine to the one with its default checkout.
+  const machines = options?.projects.find((p) => p.id === projectId)?.machines ?? [];
+  useEffect(() => {
+    setMachine(machines[0]?.id ?? "");
+  }, [projectId, options]);
+
   const update = (index: number, patch: Partial<SeatDraft>) => setSeats((current) => current.map((s, i) => (i === index ? { ...s, ...patch } : s)));
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
@@ -1230,6 +1238,7 @@ function CreateRoomForm({ preset, onCreated }: { preset?: CreatePreset; onCreate
         title: title.trim(),
         projectId,
         environmentId: preset?.environmentId ?? null,
+        machine: preset?.environmentId || machine === "" ? null : machine,
         participants: seats.map(toParticipantInput),
         docPath: docPath.trim() === "" ? null : docPath.trim(),
         docOwner: docPath.trim() === "" || docOwner === "" ? null : docOwner,
@@ -1280,6 +1289,22 @@ function CreateRoomForm({ preset, onCreated }: { preset?: CreatePreset; onCreate
                 </option>
               ))}
             </select>
+          </label>
+        )}
+        {preset?.environmentId ? null : (
+          <label className="block space-y-1 text-xs text-muted-foreground">
+            Machine
+            {machines.length === 0 ? (
+              <p className="text-xs">This project has no checkout on a machine; bb picks one.</p>
+            ) : (
+              <select value={machine} onChange={(event) => setMachine(event.target.value)} className={cn(selectClass, "block h-9 w-full")}>
+                {machines.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name}{m.isDefault ? " (default checkout)" : ""}{m.connected ? "" : " (offline)"}
+                  </option>
+                ))}
+              </select>
+            )}
           </label>
         )}
 
