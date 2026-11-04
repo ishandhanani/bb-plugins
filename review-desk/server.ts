@@ -5,7 +5,7 @@
 // repository through the host entry (git, gh, tree-sitter). Chat with the PR
 // runs on ordinary hidden bb threads (one per provider per review) spawned into
 // the PR worktree; the UI renders them with bb's own ThreadChat.
-import { readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -2190,7 +2190,13 @@ export default async function plugin(bb: BbPluginApi) {
   async function sendMap(row: ReviewRow): Promise<void> {
     q.setMapStatus.run(row.id, row.head_sha, "writing", null, Date.now());
     publish(row.id, "map");
-    await runHelperJob(row, "map", () => mapPrompt(row), (message) => {
+    const jobId = `${row.id}:map:${Date.now()}`;
+    mapJobs.set(row.id, jobId);
+    await runHelperJob(row, "map", async () => {
+      const prompt = await mapPrompt(row);
+      noteJobPrompt(jobId, prompt, helperIntro(row));
+      return prompt;
+    }, (message) => {
       q.setMapStatus.run(row.id, row.head_sha, "failed", message, Date.now());
       publish(row.id, "map");
     });
@@ -2205,9 +2211,17 @@ export default async function plugin(bb: BbPluginApi) {
     return trimmed.startsWith("#") ? trimmed : null;
   }
 
+  /** The map job each review's helper is on, for telemetry. */
+  const mapJobs = new Map<string, string>();
+
   function completeMap(reviewId: string, text: string | null, error: string | null): void {
     if (q.map.get(reviewId) === undefined) return;
     const markdown = text === null ? null : extractMap(text);
+    const mapRow = q.review.get(reviewId);
+    const mapJob = mapJobs.get(reviewId);
+    if (mapRow !== undefined && mapJob !== undefined) {
+      recordJob({ jobId: mapJob, stage: "map", row: mapRow, lane: helperLane, threadId: q.helper.get(reviewId)?.thread_id ?? null, status: error === null && markdown ? "ok" : "failed", error, reply: text, result: { specChars: markdown?.length ?? 0 } });
+    }
     if (error !== null || markdown === null || markdown === "") q.setMapFailed.run(error ?? "the helper returned no spec", text, Date.now(), reviewId);
     else {
       q.setMapReady.run(markdown, text ?? "", Date.now(), reviewId);
@@ -2225,6 +2239,10 @@ export default async function plugin(bb: BbPluginApi) {
     const fixes = mapFixes.get(reviewId) ?? 0;
     if (row === undefined || fixes >= MAX_MAP_FIXES || helperBusy(row)) return;
     mapFixes.set(reviewId, fixes + 1);
+    const rejected = mapJobs.get(reviewId);
+    if (rejected !== undefined) emitOutcome(rejected, "diffmap_rejected", true, complaint.slice(-1_500));
+    const fixJob = `${reviewId}:map:${Date.now()}`;
+    mapJobs.set(reviewId, fixJob);
     // The diffmap error names the file and line in diffmap's own source first; the reason is the part after it.
     const reason = complaint.split("\n").filter((l) => /Error:|\[\[|not |missing|unknown|invalid/i.test(l)).slice(0, 8).join("\n") || complaint.slice(-1500);
     q.setMapStatus.run(row.id, row.head_sha, "writing", null, Date.now());
@@ -2754,6 +2772,142 @@ export default async function plugin(bb: BbPluginApi) {
     return parts.join("\n\n").trim();
   }
 
+  // -- telemetry: one record per factory job ----------------------------------
+  //
+  // Each finished job (an AI round, a fix or deslop run, a map, a babysit pass)
+  // is appended to ~/.review-desk/telemetry/events.jsonl with its prompt, the
+  // prompt's version, and the turn's trajectory from the thread's event log;
+  // outcomes that arrive later (a finding fixed, the author's agent skipping
+  // it, diffmap rejecting a map) are appended against the job's id. A separate
+  // ingester turns the file into MLflow traces with feedback. Writing the file
+  // never blocks or fails a job.
+
+  const TELEMETRY_FILE = join(homedir(), ".review-desk", "telemetry", "events.jsonl");
+  /** A prompt's version is a hash of the code that builds it, so editing a prompt changes its version. */
+  const promptVersion = (...parts: unknown[]) => simpleHash(parts.map((p) => String(p)).join("\n"));
+  const PROMPT_VERSIONS = {
+    ai_review: promptVersion(roundPrompt, reviewerIntro),
+    fix: promptVersion(fixPrompt, fixerIntro),
+    deslop: promptVersion(deslopPrompt, fixerIntro),
+    map: promptVersion(mapPrompt),
+    babysit: promptVersion(babysitPrompt, babysitIntro),
+  };
+  /** What each job was asked, kept until it finishes (lost on a reload; the record then has no prompt text). */
+  const jobPrompts = new Map<string, { text: string; intro: string; startedAt: number }>();
+
+  function emitTelemetry(record: Record<string, unknown>): void {
+    try {
+      mkdirSync(join(homedir(), ".review-desk", "telemetry"), { recursive: true });
+      appendFileSync(TELEMETRY_FILE, `${JSON.stringify({ ...record, at: Date.now() })}\n`);
+    } catch (cause) {
+      bb.log.warn(`telemetry: ${errorMessage(cause)}`);
+    }
+  }
+
+  function emitOutcome(jobId: string, name: string, value: number | string | boolean, rationale?: string): void {
+    emitTelemetry({ type: "outcome", jobId, name, value, ...(rationale ? { rationale } : {}) });
+  }
+
+  const clipText = (value: unknown, n: number) => {
+    const text = typeof value === "string" ? value : value === undefined || value === null ? "" : JSON.stringify(value);
+    return text.length <= n ? text : `${text.slice(0, n)}... [${text.length - n} more chars]`;
+  };
+
+  /** The job's turn from the thread's event log: steps and context usage, trimmed. */
+  async function jobTrajectory(threadId: string, startedAt: number, finishedAt: number): Promise<unknown[]> {
+    const out: unknown[] = [];
+    let afterSeq: string | undefined;
+    for (let page = 0; page < 40; page++) {
+      const rows = await bb.sdk.threads.events.list({
+        threadId,
+        types: ["item/started", "item/completed", "thread/contextWindowUsage/updated"],
+        order: "asc",
+        limit: "500",
+        ...(afterSeq === undefined ? {} : { afterSeq }),
+      });
+      if (rows.length === 0) break;
+      for (const row of rows) {
+        const at = Number((row as { createdAt?: number }).createdAt ?? 0);
+        if (at < startedAt - 5_000 || at > finishedAt + 5_000) continue;
+        const data = (row as { data?: Record<string, unknown> }).data ?? {};
+        const item = (data.item ?? {}) as Record<string, unknown>;
+        out.push({
+          type: row.type,
+          createdAt: at,
+          ...(row.type === "thread/contextWindowUsage/updated"
+            ? { usedTokens: ((data.contextWindowUsage ?? {}) as { usedTokens?: number }).usedTokens ?? null }
+            : {
+                item: {
+                  type: item.type,
+                  id: item.id,
+                  ...(item.command !== undefined ? { command: clipText(item.command, 4_000) } : {}),
+                  ...(item.aggregatedOutput !== undefined ? { aggregatedOutput: clipText(item.aggregatedOutput, 8_000) } : {}),
+                  ...(item.status !== undefined ? { status: item.status } : {}),
+                  ...(item.tool !== undefined ? { tool: item.tool, arguments: clipText(item.arguments, 4_000), result: clipText(item.result, 8_000) } : {}),
+                  ...(item.path !== undefined ? { path: item.path } : {}),
+                  ...(item.text !== undefined ? { text: clipText(item.text, 8_000) } : {}),
+                  ...(Array.isArray(item.content) ? { content: [clipText((item.content as unknown[]).join("\n"), 4_000)] } : {}),
+                },
+              }),
+        });
+      }
+      afterSeq = String((rows.at(-1) as { seq?: number | string }).seq);
+      if (rows.length < 500) break;
+    }
+    return out;
+  }
+
+  /** Note what a job is about to be asked; `recordJob` picks it up when the job finishes. */
+  function noteJobPrompt(jobId: string, text: string, intro: string): void {
+    jobPrompts.set(jobId, { text, intro, startedAt: Date.now() });
+  }
+
+  /** Append a finished job with its trajectory; runs in the background so a job never waits on it. */
+  function recordJob(job: {
+    jobId: string;
+    stage: keyof typeof PROMPT_VERSIONS;
+    row: ReviewRow;
+    lane: Lane;
+    threadId: string | null;
+    startedAt?: number;
+    status: "ok" | "failed";
+    error?: string | null;
+    reply?: string | null;
+    result?: Record<string, unknown>;
+    round?: number;
+    run?: number;
+  }): void {
+    const asked = jobPrompts.get(job.jobId);
+    jobPrompts.delete(job.jobId);
+    const startedAt = job.startedAt ?? asked?.startedAt ?? Date.now();
+    const finishedAt = Date.now();
+    void (async () => {
+      const events = job.threadId === null ? [] : await jobTrajectory(job.threadId, startedAt, finishedAt).catch(() => []);
+      emitTelemetry({
+        type: "job",
+        jobId: job.jobId,
+        stage: job.stage,
+        reviewId: job.row.id,
+        pr: prLabel(job.row),
+        mine: isMine(job.row),
+        headSha: job.row.head_sha,
+        ...(job.round === undefined ? {} : { round: job.round }),
+        ...(job.run === undefined ? {} : { run: job.run }),
+        threadId: job.threadId,
+        providerId: job.lane.providerId || defaultProvider,
+        model: job.lane.model.trim() || null,
+        prompt: { name: job.stage, version: PROMPT_VERSIONS[job.stage], intro: asked?.intro ?? null, text: asked?.text ?? null },
+        startedAt,
+        finishedAt,
+        status: job.status,
+        error: job.error ?? null,
+        reply: job.reply === undefined || job.reply === null ? null : clipText(job.reply, 50_000),
+        result: job.result ?? {},
+        events,
+      });
+    })();
+  }
+
   // -- PR factory -------------------------------------------------------------
   //
   // A PR added to the board goes to AI review: a hidden reviewer thread runs
@@ -2988,6 +3142,7 @@ export default async function plugin(bb: BbPluginApi) {
         empirical: aiReviewEmpirical,
       });
       if (isMine(row)) await ensureBranchWorktree(row);
+      noteJobPrompt(`${row.id}:round:${r.round}`, prompt, reviewerLane.intro(row));
       await laneSend(reviewerLane, row, `round:${r.round}`, prompt);
     } catch (cause) {
       q.setRoundStatus.run("failed", errorMessage(cause), Date.now(), row.id, r.round);
@@ -3028,6 +3183,8 @@ export default async function plugin(bb: BbPluginApi) {
         const f = open.get(prev.id);
         if (f === undefined || (prev.status !== "fixed" && prev.status !== "obsolete")) continue;
         q.setFindingStatus.run(prev.status, prev.note, now, f.id);
+        // Scored against the round that raised it: a finding later fixed was worth raising.
+        emitOutcome(`${reviewId}:round:${f.round}`, `finding_${prev.status}`, 1, `${f.severity} ${f.path}:${f.line} ${f.title}`);
         open.delete(f.id);
         resolved.push({ title: f.title, status: prev.status, note: prev.note });
       }
@@ -3089,6 +3246,11 @@ export default async function plugin(bb: BbPluginApi) {
       }
       for (const f of findings) q.insertFinding.run(newId(), reviewId, round, f.path, f.line, f.startLine, f.severity, f.title, f.body, f.suggestion, inline.includes(f) ? 1 : 0, now);
       q.setRoundPosted.run(reply.summary, high, posted.url, text.slice(0, 200_000), Date.now(), reviewId, round);
+      recordJob({
+        jobId: `${reviewId}:round:${round}`, stage: "ai_review", row, lane: reviewerLane, threadId: q.aiReviewer.get(reviewId)?.thread_id ?? null, startedAt: r.started_at,
+        status: "ok", reply: text, round, result: { findings: findings.length, high, counts, inline: inline.length, resolved: resolved.length, stillOpen: stillOpen.length, reviewUrl: posted.url },
+      });
+      emitOutcome(`${reviewId}:round:${round}`, "high_value_findings", high);
       await resolveFindingThreads(row, r.head_sha).catch((cause: unknown) => bb.log.warn(`resolving threads on ${prLabel(row)}: ${errorMessage(cause)}`));
       if (mine) await afterMyRound(row, round, high);
       else if (handoff) {
@@ -3098,6 +3260,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     } catch (cause) {
       q.setRoundStatus.run("failed", errorMessage(cause), Date.now(), reviewId, round);
+      recordJob({ jobId: `${reviewId}:round:${round}`, stage: "ai_review", row, lane: reviewerLane, threadId: q.aiReviewer.get(reviewId)?.thread_id ?? null, startedAt: r.started_at, status: "failed", error: errorMessage(cause), reply: text, round });
       bb.log.warn(`round ${round} of ${prLabel(row)}: ${errorMessage(cause)}`);
     }
     publish(reviewId, "board");
@@ -3220,7 +3383,9 @@ export default async function plugin(bb: BbPluginApi) {
     publish(row.id, "board");
     try {
       if (isMine(row)) await ensureBranchWorktree(row).catch(() => undefined);
-      await laneSend(babysitterLane, row, "babysit", babysitPrompt({ owner: row.owner, repo: row.repo, number: row.number, headSha: row.head_sha, pass: passes + 1, maxPasses, failing: card.failingChecks, conflicting }));
+      const sitPrompt = babysitPrompt({ owner: row.owner, repo: row.repo, number: row.number, headSha: row.head_sha, pass: passes + 1, maxPasses, failing: card.failingChecks, conflicting });
+      noteJobPrompt(`${row.id}:babysit:${row.head_sha}:${passes + 1}`, sitPrompt, babysitterLane.intro(row));
+      await laneSend(babysitterLane, row, "babysit", sitPrompt);
     } catch (cause) {
       q.setBabysit.run(row.head_sha, key, passes + 1, null, Date.now(), row.id);
       bb.log.warn(`babysit ${prLabel(row)}: ${errorMessage(cause)}`);
@@ -3242,6 +3407,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const now = Date.now();
     q.setBabysit.run(p.babysit_head, p.babysit_key, p.babysit_passes, outcome, now, reviewId);
+    const sitJob = `${reviewId}:babysit:${p.babysit_head}:${p.babysit_passes}`;
+    recordJob({ jobId: sitJob, stage: "babysit", row, lane: babysitterLane, threadId: q.babysitter.get(reviewId)?.thread_id ?? null, status: error === null ? "ok" : "failed", error, reply: text, result: { outcome, detail } });
+    emitOutcome(sitJob, "babysit_outcome", outcome, detail);
     if (outcome === "needs_human") {
       q.setNeedsYou.run(detail, now, reviewId);
       await letYouKnow(row, q.babysitter.get(reviewId)?.thread_id, "needs_you", detail);
@@ -3411,6 +3579,7 @@ export default async function plugin(bb: BbPluginApi) {
       const prompt = kind === "deslop"
         ? deslopPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha })
         : fixPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha, round: last?.round ?? 0, reviewUrl: trigger === "human" ? null : last?.review_url ?? null });
+      noteJobPrompt(`${row.id}:fix:${run}`, prompt, fixerLane.intro(row));
       await laneSend(fixerLane, row, `fix:${run}`, prompt);
       // An environment bb made for this worktree before Review Desk tracked it is recorded and named now.
       const target = fixerTargets.get(row.id);
@@ -3430,6 +3599,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function failFixRun(row: ReviewRow, run: number, message: string): Promise<void> {
     q.setFixRunFailed.run(message, Date.now(), row.id, run);
+    const failed = q.fixRun.get(row.id, run);
+    recordJob({ jobId: `${row.id}:fix:${run}`, stage: failed?.kind === "deslop" ? "deslop" : "fix", row, lane: fixerLane, threadId: q.fixer.get(row.id)?.thread_id ?? null, startedAt: failed?.started_at, status: "failed", error: message, run });
     const why = `the author's agent stopped: ${message.slice(0, 300)}`;
     setStage(row, "human_review", why);
     await letYouKnow(row, q.fixer.get(row.id)?.thread_id, "needs_you", why);
@@ -3448,6 +3619,24 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     q.setFixRunDone.run(reply.head || null, reply.summary, JSON.stringify(reply.items), Date.now(), reviewId, run);
+    {
+      const count = (v: string) => reply.items.filter((i) => i.verdict === v).length;
+      const fixJob = `${reviewId}:fix:${run}`;
+      recordJob({
+        jobId: fixJob, stage: r.kind === "deslop" ? "deslop" : "fix", row, lane: fixerLane, threadId: q.fixer.get(reviewId)?.thread_id ?? null, startedAt: r.started_at,
+        status: "ok", reply: text, run, result: { trigger: r.trigger, pushed: reply.pushed, headBefore: r.head_before, headAfter: reply.head || null, fix: count("FIX"), skip: count("SKIP"), ask: count("ASK"), items: reply.items },
+      });
+      emitOutcome(fixJob, "pushed", reply.pushed);
+      if (r.kind === "deslop") emitOutcome(fixJob, "cleanups", reply.items.filter((i) => (i.commit ?? "") !== "").length);
+      // The author's agent judging a round's findings is the best signal of that round's precision.
+      const raised = /^round:(\d+)$/.exec(r.trigger);
+      if (r.kind === "fix" && raised !== null) {
+        const roundJob = `${reviewId}:round:${raised[1]}`;
+        emitOutcome(roundJob, "author_fix", count("FIX"));
+        emitOutcome(roundJob, "author_skip", count("SKIP"));
+        emitOutcome(roundJob, "author_ask", count("ASK"));
+      }
+    }
     // Its push moved the head: read it before deciding what runs next.
     await syncReview(reviewId).catch((cause: unknown) => bb.log.warn(`sync after the author's agent on ${prLabel(row)}: ${errorMessage(cause)}`));
     const fresh = requireReview(reviewId);
