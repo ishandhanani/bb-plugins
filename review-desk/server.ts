@@ -146,6 +146,8 @@ const reviewSummarySchema = z.object({
       needsYou: z.string().nullable(),
       /** Outcome of the last CI babysit pass. */
       babysit: z.string().nullable(),
+      /** A newly added PR's first job starts at this time unless you move the card first. */
+      startsAt: z.number().nullable(),
       /** The author's agent's latest run on your own PR: fix or deslop, its state, and its verdicts. */
       fix: z.object({ run: z.number(), kind: z.string(), status: z.string(), fix: z.number(), skip: z.number(), ask: z.number() }).nullable(),
       error: z.string().nullable(),
@@ -1014,6 +1016,7 @@ export default async function plugin(bb: BbPluginApi) {
     boardRefresh: { type: "string", label: "Cron (5 fields, server-local time) for syncing the board's open PRs with GitHub in the background; empty turns it off", default: "*/15 * * * *" },
     threadSection: { type: "string", label: "Sidebar section (folder) for the threads Review Desk starts (chat, AI review, babysit); created on first use; empty leaves them unsectioned", default: "Review Desk" },
     worktreesDir: { type: "string", label: "Directory on the repository's machine for the PR worktrees; empty uses ~/.review-desk/worktrees. Keep it outside bb's data dir, or bb refuses to run the chat and helper threads there", default: "" },
+    startDelaySeconds: { type: "number", label: "PR factory: seconds a newly added PR waits before its first job starts, so you can drag it to another column first", default: 10 },
     autoAiReview: { type: "boolean", label: "PR factory: start AI review rounds when a PR is added to the board (they post COMMENT reviews to GitHub under your gh login)", default: true },
     aiReviewProvider: { type: "string", label: "PR factory: provider id for the AI reviewer", default: "claude-code" },
     aiReviewModel: { type: "string", label: "PR factory: model for the AI reviewer; empty uses the project's default", default: "claude-opus-5-5" },
@@ -1036,7 +1039,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   const {
     defaultProvider, hideSeatThreads, autoMap, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir, threadSection,
-    autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, authorPipeline, fixerProvider, fixerModel, deslopStage, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
+    startDelaySeconds, autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, authorPipeline, fixerProvider, fixerModel, deslopStage, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
   } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
 
@@ -1174,7 +1177,7 @@ export default async function plugin(bb: BbPluginApi) {
     await refreshFiles(row);
     void refreshThreads(row).catch((cause: unknown) => bb.log.warn(`threads for ${id}: ${errorMessage(cause)}`));
     publish(id, "opened");
-    if (autoAiReview && row.state === "OPEN") startFactory(row);
+    if (autoAiReview && row.state === "OPEN") startFactoryAfterGrace(row);
     if (autoMap) wantMap(row, false);
     return toReview(row);
   }
@@ -1344,9 +1347,13 @@ export default async function plugin(bb: BbPluginApi) {
     // Below an approval, a drag into a factory column moves the factory, and a drag to Unreviewed takes the PR out of it.
     if (githubStage(row) !== "babysit" && stage !== null && (isPipelineStage(stage) || (stage === "unreviewed" && q.pipeline.get(reviewId) !== undefined))) {
       q.deleteBoardStage.run(reviewId);
+      pendingStarts.delete(reviewId);
+      void stopForMove(row, stage).catch((cause: unknown) => bb.log.warn(`stopping work on ${prLabel(row)}: ${errorMessage(cause)}`));
       if (stage === "unreviewed") q.deletePipeline.run(reviewId);
       else setStage(row, stage);
       if (stage === "ai_review") void advanceFactory(reviewId, true);
+      // A drag into Babysit starts watching CI now (on your PR, a conflict gets merged).
+      if (stage === "babysit") void advanceFactory(reviewId).catch(() => undefined);
       // A drag into Fixing or Deslop starts the author's agent on that job.
       if (stage === "fixing" || stage === "deslop") void startFixRun(requireReview(reviewId), stage === "deslop" ? "deslop" : "fix", "manual").catch(() => undefined);
       publish(reviewId, "board");
@@ -3050,6 +3057,7 @@ export default async function plugin(bb: BbPluginApi) {
       reviewUrl: rounds.filter((r) => r.review_url !== null).at(-1)?.review_url ?? null,
       needsYou: p.needs_you,
       babysit: p.babysit_head === row.head_sha ? p.babysit_outcome : null,
+      startsAt: pendingStarts.get(row.id) ?? null,
       fix: fixSummary(row),
       error: last?.status === "failed" ? last.error : null,
     };
@@ -3061,6 +3069,54 @@ export default async function plugin(bb: BbPluginApi) {
     const approved = githubStage(row) === "babysit";
     if (p === undefined || (force && !approved && p.stage !== "ai_review")) setStage(row, approved ? "human_review" : "ai_review");
     void advanceFactory(row.id, force).catch((cause: unknown) => bb.log.warn(`factory ${prLabel(row)}: ${errorMessage(cause)}`));
+  }
+
+  /** Newly added PRs waiting out the grace period, and when their first job starts. */
+  const pendingStarts = new Map<string, number>();
+
+  /**
+   * A newly added PR shows in AI review at once, but its first job waits
+   * startDelaySeconds: drag the card elsewhere (Babysit, say) in that time and
+   * the factory follows the column you chose instead.
+   */
+  function startFactoryAfterGrace(row: ReviewRow): void {
+    const delay = Math.max(0, startDelaySeconds) * 1000;
+    if (delay === 0) return startFactory(row);
+    if (q.pipeline.get(row.id) === undefined) setStage(row, githubStage(row) === "babysit" ? "human_review" : "ai_review");
+    const stageAtStart = q.pipeline.get(row.id)?.stage;
+    pendingStarts.set(row.id, Date.now() + delay);
+    publish(row.id, "board");
+    setTimeout(() => {
+      pendingStarts.delete(row.id);
+      publish(row.id, "board");
+      // Moved during the grace period: the move already started what that column does.
+      if (q.pipeline.get(row.id)?.stage !== stageAtStart) return;
+      void advanceFactory(row.id).catch((cause: unknown) => bb.log.warn(`factory ${prLabel(row)}: ${errorMessage(cause)}`));
+    }, delay);
+  }
+
+  /** Stop what the old column was running when you move a card: a round still in AI review, or the author's agent mid-job. */
+  async function stopForMove(row: ReviewRow, to: BoardStage): Promise<void> {
+    const round = q.lastRound.get(row.id);
+    if (to !== "ai_review" && (round?.status === "queued" || round?.status === "running")) {
+      q.setRoundStatus.run("failed", `stopped: you moved the card to ${BOARD_STAGE_LABEL[to]}`, Date.now(), row.id, round.round);
+      const reviewer = q.aiReviewer.get(row.id);
+      if (round.status === "running" && reviewer !== undefined) {
+        q.setAiReviewerJob.run(null, row.id);
+        await bb.sdk.threads.stop({ threadId: reviewer.thread_id }).catch(() => undefined);
+      }
+      pumpRounds();
+    }
+    const run = q.fixRuns.all(row.id).at(-1);
+    const keeps = run?.kind === "sync" ? to === "babysit" : to === "fixing" || to === "deslop";
+    if (run?.status === "running" && !keeps) {
+      q.setFixRunFailed.run(`stopped: you moved the card to ${BOARD_STAGE_LABEL[to]}`, Date.now(), row.id, run.run);
+      const fixer = q.fixer.get(row.id);
+      if (fixer !== undefined) {
+        q.setFixerJob.run(null, row.id);
+        await bb.sdk.threads.stop({ threadId: fixer.thread_id }).catch(() => undefined);
+      }
+    }
   }
 
   const advancing = new Set<string>();
@@ -3265,8 +3321,10 @@ export default async function plugin(bb: BbPluginApi) {
       });
       emitOutcome(`${reviewId}:round:${round}`, "high_value_findings", high);
       await resolveFindingThreads(row, r.head_sha).catch((cause: unknown) => bb.log.warn(`resolving threads on ${prLabel(row)}: ${errorMessage(cause)}`));
-      if (mine) await afterMyRound(row, round, high);
-      else if (handoff) {
+      // A card you moved out of AI review stays where you put it.
+      const stillReviewing = q.pipeline.get(reviewId)?.stage === "ai_review";
+      if (stillReviewing && mine) await afterMyRound(row, round, high);
+      else if (stillReviewing && handoff) {
         const why = high === 0 ? `AI round ${round} found nothing above a nit` : `${high} finding${high === 1 ? "" : "s"} above a nit still open after ${round} AI round${round === 1 ? "" : "s"}`;
         setStage(row, "human_review", why);
         await letYouKnow(row, q.aiReviewer.get(reviewId)?.thread_id, "ready_for_you", why);

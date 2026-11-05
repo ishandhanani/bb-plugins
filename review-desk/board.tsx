@@ -72,10 +72,22 @@ function babysitVerdict(card: ReviewSummary): { label: string; tone: ChipTone; i
   return { label: "Ready to merge", tone: "ok", icon: "CircleCheck" };
 }
 
+/** A newly added PR's countdown to its first job; drag the card before it ends to send it elsewhere. */
+function StartCountdown({ startsAt }: { startsAt: number }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(timer);
+  }, []);
+  const left = Math.max(0, Math.ceil((startsAt - now) / 1000));
+  return <Chip icon="Clock" tone="strong" title="Drag the card to another column before this ends and the factory does that instead">starts in {left}s</Chip>;
+}
+
 /** Where the PR factory is with this card, in at most three chips. */
 function FactoryChips({ card }: { card: ReviewSummary }) {
   const f = card.factory;
   if (f === null) return null;
+  if (f.startsAt !== null) return <StartCountdown startsAt={f.startsAt} />;
   const round = f.round > 0 ? (
     f.roundStatus === "running" ? <Chip icon="Clock" tone="strong" title="The AI reviewer is working on this round">AI round {f.round} running</Chip>
     : f.roundStatus === "queued" ? <Chip icon="Clock" title="Waiting for a free AI reviewer">AI round {f.round} queued</Chip>
