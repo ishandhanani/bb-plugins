@@ -729,6 +729,7 @@ function createStore(db: Database.Database) {
     touch: db.prepare<[number, string]>(`UPDATE reviews SET updated_at = ? WHERE id = ?`),
     deleteReview: db.prepare<[string]>(`DELETE FROM reviews WHERE id = ?`),
     setWorktree: db.prepare<[string, string]>(`UPDATE reviews SET worktree = ? WHERE id = ?`),
+    setRepoHome: db.prepare<[string, string, string, string]>(`UPDATE reviews SET repo_path = ?, host_id = ?, project_id = ? WHERE id = ?`),
     filesCache: db.prepare<[string], { head_sha: string; json: string }>(`SELECT head_sha, json FROM files_cache WHERE review_id = ?`),
     setFilesCache: db.prepare<[string, string, string]>(`INSERT INTO files_cache (review_id, head_sha, json) VALUES (?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET head_sha = excluded.head_sha, json = excluded.json`),
     viewed: db.prepare<[string], { path: string }>(`SELECT path FROM viewed WHERE review_id = ?`),
@@ -1101,15 +1102,31 @@ export default async function plugin(bb: BbPluginApi) {
 
   // -- repository resolution -------------------------------------------------
 
-  async function locateRepo(owner: string, repo: string): Promise<{ repoPath: string; hostId: string; projectId: string | null }> {
+  /** A project checkout for owner/repo: one whose origin is it, else one with any remote pointing at it (a fork you push to). */
+  async function findProjectRepo(owner: string, repo: string): Promise<{ repoPath: string; hostId: string; projectId: string } | null> {
     const projects = await bb.sdk.projects.list();
+    const sourceOf = async (projectId: string) => {
+      const detail = await bb.sdk.projects.get({ projectId });
+      const sources = (detail as { sources?: { type: string; path: string; hostId: string; isDefault: boolean }[] }).sources ?? [];
+      return sources.find((s) => s.type === "local_path" && s.isDefault) ?? sources.find((s) => s.type === "local_path") ?? null;
+    };
     for (const project of projects) {
       if (!remoteMatches(project.gitRemoteUrl, owner, repo)) continue;
-      const detail = await bb.sdk.projects.get({ projectId: project.id });
-      const sources = (detail as { sources?: { type: string; path: string; hostId: string; isDefault: boolean }[] }).sources ?? [];
-      const source = sources.find((s) => s.type === "local_path" && s.isDefault) ?? sources.find((s) => s.type === "local_path");
+      const source = await sourceOf(project.id);
       if (source) return { repoPath: source.path, hostId: source.hostId, projectId: project.id };
     }
+    for (const project of projects) {
+      const source = await sourceOf(project.id).catch(() => null);
+      if (source === null) continue;
+      const { remote } = await host.call("repo_remote_for", { repoPath: source.path, owner, repo }, { hostId: source.hostId }).catch(() => ({ remote: null }));
+      if (remote !== null) return { repoPath: source.path, hostId: source.hostId, projectId: project.id };
+    }
+    return null;
+  }
+
+  async function locateRepo(owner: string, repo: string): Promise<{ repoPath: string; hostId: string; projectId: string | null }> {
+    const found = await findProjectRepo(owner, repo);
+    if (found !== null) return found;
     const hostId = await primaryHostId();
     const cloned = await host.call("repo_clone", { owner, repo, dest: "" }, { hostId });
     return { repoPath: cloned.repoPath, hostId, projectId: null };
@@ -1166,7 +1183,7 @@ export default async function plugin(bb: BbPluginApi) {
     const key = `${parsed.owner}__${parsed.repo}__${parsed.number}`;
     const prepared = await host.call(
       "repo_prepare",
-      { repoPath: located.repoPath, number: parsed.number, headSha: pr.headRefOid, baseRefName: pr.baseRefName, worktreesDir: worktreesDir.trim(), key },
+      { repoPath: located.repoPath, number: parsed.number, headSha: pr.headRefOid, baseRefName: pr.baseRefName, worktreesDir: worktreesDir.trim(), key, owner: parsed.owner, repo: parsed.repo },
       { hostId: located.hostId },
     );
     const id = newId();
@@ -1182,14 +1199,30 @@ export default async function plugin(bb: BbPluginApi) {
     return toReview(row);
   }
 
+  /**
+   * A review opened before any project matched its repository runs from a
+   * private clone outside every project, so threads cannot start there. Once a
+   * project has a checkout with a remote for it, the review moves onto that
+   * checkout (its worktree follows on the next prepare).
+   */
+  async function rehome(row: ReviewRow): Promise<void> {
+    if (row.project_id !== null) return;
+    const found = await findProjectRepo(row.owner, row.repo).catch(() => null);
+    if (found === null) return;
+    q.setRepoHome.run(found.repoPath, found.hostId, found.projectId, row.id);
+    for (const stmt of q.clearEnvironments) stmt.run(row.id);
+    bb.log.info(`${prLabel(row)} now uses the ${found.repoPath} checkout`);
+  }
+
   async function syncReview(reviewId: string): Promise<{ review: Review; headChanged: boolean }> {
+    await rehome(requireReview(reviewId));
     const row = requireReview(reviewId);
     const pr = await host.call("gh_pr", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
     const headChanged = pr.headRefOid !== row.head_sha;
     const key = `${row.owner}__${row.repo}__${row.number}`;
     const prepared = await host.call(
       "repo_prepare",
-      { repoPath: row.repo_path, number: row.number, headSha: pr.headRefOid, baseRefName: pr.baseRefName, worktreesDir: worktreesDir.trim(), key },
+      { repoPath: row.repo_path, number: row.number, headSha: pr.headRefOid, baseRefName: pr.baseRefName, worktreesDir: worktreesDir.trim(), key, owner: row.owner, repo: row.repo },
       hostOptions(row),
     );
     applyPr(row, pr, prepared);
@@ -1375,7 +1408,7 @@ export default async function plugin(bb: BbPluginApi) {
     // The head did not move, so no fetch; this still keeps the worktree where it belongs.
     const prepared = await host.call(
       "repo_prepare",
-      { repoPath: row.repo_path, number: row.number, headSha: row.head_sha, baseRefName: pr.baseRefName, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}`, fetch: false },
+      { repoPath: row.repo_path, number: row.number, headSha: row.head_sha, baseRefName: pr.baseRefName, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}`, fetch: false, owner: row.owner, repo: row.repo },
       hostOptions(row),
     );
     applyPr(row, pr, prepared);
@@ -1387,7 +1420,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function ensureWorktree(row: ReviewRow): Promise<void> {
     const prepared = await host.call(
       "repo_prepare",
-      { repoPath: row.repo_path, number: row.number, headSha: row.head_sha, baseRefName: row.base_ref, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}`, fetch: false },
+      { repoPath: row.repo_path, number: row.number, headSha: row.head_sha, baseRefName: row.base_ref, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}`, fetch: false, owner: row.owner, repo: row.repo },
       hostOptions(row),
     );
     if (prepared.worktree === row.worktree) return;

@@ -96,8 +96,16 @@ export const hostContract = defineRpcContract({
       worktreesDir: z.string(),
       key: z.string(),
       fetch: z.boolean().optional(),
+      /** The PR's repository: its pull refs and base branch are fetched from the remote that points at it (origin when none does). */
+      owner: z.string().optional(),
+      repo: z.string().optional(),
     }),
     output: z.object({ worktree: z.string(), headSha: z.string(), baseSha: z.string() }),
+  },
+  /** The checkout's remote that points at owner/repo, if any (a fork is often not origin). */
+  repo_remote_for: {
+    input: z.object({ repoPath: z.string(), owner: z.string(), repo: z.string() }),
+    output: z.object({ remote: z.string().nullable() }),
   },
   /** Remove a PR worktree the plugin created, unless it has local changes. */
   repo_remove_worktree: {
