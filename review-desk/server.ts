@@ -18,8 +18,10 @@ import {
   FACTORY_MARKER,
   AI_LABELS,
   babysitIntro,
+  babysitComment,
   babysitPrompt,
   deslopPrompt,
+  syncPrompt,
   deslopReportBody,
   fixPrompt,
   fixerIntro,
@@ -2791,6 +2793,7 @@ export default async function plugin(bb: BbPluginApi) {
     deslop: promptVersion(deslopPrompt, fixerIntro),
     map: promptVersion(mapPrompt),
     babysit: promptVersion(babysitPrompt, babysitIntro),
+    sync: promptVersion(syncPrompt, fixerIntro),
   };
   /** What each job was asked, kept until it finishes (lost on a reload; the record then has no prompt text). */
   const jobPrompts = new Map<string, { text: string; intro: string; startedAt: number }>();
@@ -3378,6 +3381,15 @@ export default async function plugin(bb: BbPluginApi) {
       if (fresh || p.babysit_key !== null || p.needs_you !== null) publish(row.id, "board");
       return;
     }
+    // A conflict on your own PR: the author's agent merges the base in and resolves it, once per head.
+    if (conflicting && isMine(row)) {
+      const runs = q.fixRuns.all(row.id);
+      const triedHere = runs.some((r) => r.kind === "sync" && r.head_before === row.head_sha);
+      if (runs.at(-1)?.status !== "running" && !triedHere) {
+        await startFixRun(row, "sync", `sync:the branch conflicts with ${row.base_ref}`);
+        return;
+      }
+    }
     if (outcome === "needs_human" || (q.babysitter.get(row.id)?.job ?? null) !== null) return;
     const key = `${conflicting ? "conflict|" : ""}${card.failingChecks.map((c) => c.name).sort().join("|")}#${card.checks.failed}`;
     if (!fresh && key === p.babysit_key) return;
@@ -3393,7 +3405,7 @@ export default async function plugin(bb: BbPluginApi) {
     publish(row.id, "board");
     try {
       if (isMine(row)) await ensureBranchWorktree(row).catch(() => undefined);
-      const sitPrompt = babysitPrompt({ owner: row.owner, repo: row.repo, number: row.number, headSha: row.head_sha, pass: passes + 1, maxPasses, failing: card.failingChecks, conflicting });
+      const sitPrompt = babysitPrompt({ owner: row.owner, repo: row.repo, number: row.number, headSha: row.head_sha, baseRef: row.base_ref, pass: passes + 1, maxPasses, failing: card.failingChecks, conflicting, canMergeBase: isMine(row) });
       noteJobPrompt(`${row.id}:babysit:${row.head_sha}:${passes + 1}`, sitPrompt, babysitterLane.intro(row));
       await laneSend(babysitterLane, row, "babysit", sitPrompt);
     } catch (cause) {
@@ -3408,18 +3420,26 @@ export default async function plugin(bb: BbPluginApi) {
     if (row === undefined || p === undefined) return;
     let outcome: string;
     let detail: string;
+    let jobs: string[] = [];
     try {
       if (error !== null || text === null) throw new Error(error ?? "no reply");
-      ({ outcome, detail } = parseBabysitReply(text));
+      ({ outcome, detail, jobs } = parseBabysitReply(text));
     } catch (cause) {
       outcome = "needs_human";
       detail = `the babysitter failed: ${errorMessage(cause)}`;
     }
+    // merge_base is only offered on your own PR; anywhere else it reads as a call for you.
+    if (outcome === "merge_base" && !isMine(row)) outcome = "needs_human";
     const now = Date.now();
     q.setBabysit.run(p.babysit_head, p.babysit_key, p.babysit_passes, outcome, now, reviewId);
     const sitJob = `${reviewId}:babysit:${p.babysit_head}:${p.babysit_passes}`;
     recordJob({ jobId: sitJob, stage: "babysit", row, lane: babysitterLane, threadId: q.babysitter.get(reviewId)?.thread_id ?? null, status: error === null ? "ok" : "failed", error, reply: text, result: { outcome, detail } });
     emitOutcome(sitJob, "babysit_outcome", outcome, detail);
+    if (outcome === "rerun") {
+      const named = jobs.length > 0 ? jobs : summarize(row).failingChecks.map((c) => c.name);
+      await postBabysitComment(row, `re-ran ${named.length} failed job${named.length === 1 ? "" : "s"}`, detail, named.map((j) => `- ${j}`));
+    }
+    if (outcome === "merge_base") void startFixRun(row, "sync", `sync:${detail.replace(/\.$/, "") || `CI needs the latest ${row.base_ref}`}`).catch(() => undefined);
     if (outcome === "needs_human") {
       q.setNeedsYou.run(detail, now, reviewId);
       await letYouKnow(row, q.babysitter.get(reviewId)?.thread_id, "needs_you", detail);
@@ -3497,7 +3517,7 @@ export default async function plugin(bb: BbPluginApi) {
   // PR's branch checked out.
 
   /** Where the author's agent works for each PR: the branch's worktree and the remote it pushes to. */
-  const fixerTargets = new Map<string, { worktree: string; remote: string }>();
+  const fixerTargets = new Map<string, { worktree: string; remote: string; baseRemote: string }>();
   const fixerLane: Lane = {
     title: "author's agent",
     intro: (row) => {
@@ -3562,45 +3582,50 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** The worktree with your PR's branch checked out (found or created) and its push remote; every thread of your PR works there. */
-  async function ensureBranchWorktree(row: ReviewRow): Promise<{ worktree: string; remote: string }> {
+  async function ensureBranchWorktree(row: ReviewRow): Promise<{ worktree: string; remote: string; baseRemote: string }> {
     const known = fixerTargets.get(row.id);
     if (known !== undefined) return known;
     const pr = await host.call("gh_pr", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
     if (pr.headOwner === null || pr.headRepo === null) throw new Error("GitHub did not say which repository the PR's branch lives in");
     const target = await host.call(
       "branch_worktree",
-      { repoPath: row.repo_path, branch: row.head_ref, headOwner: pr.headOwner, headRepo: pr.headRepo, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}` },
+      { repoPath: row.repo_path, branch: row.head_ref, headOwner: pr.headOwner, headRepo: pr.headRepo, baseOwner: row.owner, baseRepo: row.repo, worktreesDir: worktreesDir.trim(), key: `${row.owner}__${row.repo}__${row.number}` },
       { ...hostOptions(row), timeoutMs: 5 * 60_000 },
     );
-    const resolved = { worktree: target.worktree, remote: target.remote };
+    const resolved = { worktree: target.worktree, remote: target.remote, baseRemote: target.baseRemote };
     fixerTargets.set(row.id, resolved);
     return resolved;
   }
 
-  /** Start the author's agent on a fix (after a round, or after your comments) or on the deslop pass. */
-  async function startFixRun(row: ReviewRow, kind: "fix" | "deslop", trigger: string): Promise<void> {
+  /**
+   * Start the author's agent on a fix (after a round, or after your comments),
+   * the deslop pass, or a sync (bring the base branch in, resolving conflicts;
+   * the trigger then says why). A sync leaves the PR in Babysit.
+   */
+  async function startFixRun(row: ReviewRow, kind: "fix" | "deslop" | "sync", trigger: string): Promise<void> {
     if (q.fixRuns.all(row.id).at(-1)?.status === "running") return;
     const run = (q.fixRuns.all(row.id).at(-1)?.run ?? 0) + 1;
     q.insertFixRun.run(row.id, run, kind, trigger, row.head_sha, Date.now());
-    setStage(row, kind === "deslop" ? "deslop" : "fixing");
+    if (kind !== "sync") setStage(row, kind === "deslop" ? "deslop" : "fixing");
     try {
-      await ensureBranchWorktree(row);
+      const target = await ensureBranchWorktree(row);
       const last = q.rounds.all(row.id).filter((r) => r.status === "posted").at(-1);
-      const prompt = kind === "deslop"
+      const prompt = kind === "sync"
+        ? syncPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseRef: row.base_ref, baseRemote: target.baseRemote, reason: trigger.replace(/^sync:/, "") })
+        : kind === "deslop"
         ? deslopPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha })
         : fixPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha, round: last?.round ?? 0, reviewUrl: trigger === "human" ? null : last?.review_url ?? null });
       noteJobPrompt(`${row.id}:fix:${run}`, prompt, fixerLane.intro(row));
       await laneSend(fixerLane, row, `fix:${run}`, prompt);
       // An environment bb made for this worktree before Review Desk tracked it is recorded and named now.
-      const target = fixerTargets.get(row.id);
       const environmentId = q.fixer.get(row.id)?.environment_id ?? null;
-      if (target !== undefined && environmentId !== null && q.sharedEnv.get(`path:${target.worktree}`) === undefined) {
+      if (environmentId !== null && q.sharedEnv.get(`path:${target.worktree}`) === undefined) {
         q.setSharedEnv.run(`path:${target.worktree}`, environmentId);
         await bb.sdk.environments.update({ environmentId, name: `#${row.number} · ${row.title}`.slice(0, 60) }).catch(() => undefined);
       }
       // The thread is visible: title it by PR and job so it reads in the sidebar.
       const threadId = q.fixer.get(row.id)?.thread_id;
-      if (threadId !== undefined) await bb.sdk.threads.update({ threadId, title: `#${row.number} · ${kind === "deslop" ? "Deslop" : "Fixing"}` }).catch(() => undefined);
+      if (threadId !== undefined) await bb.sdk.threads.update({ threadId, title: `#${row.number} · ${kind === "deslop" ? "Deslop" : kind === "sync" ? `Merging ${row.base_ref}` : "Fixing"}` }).catch(() => undefined);
       publish(row.id, "board");
     } catch (cause) {
       await failFixRun(row, run, errorMessage(cause));
@@ -3610,7 +3635,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function failFixRun(row: ReviewRow, run: number, message: string): Promise<void> {
     q.setFixRunFailed.run(message, Date.now(), row.id, run);
     const failed = q.fixRun.get(row.id, run);
-    recordJob({ jobId: `${row.id}:fix:${run}`, stage: failed?.kind === "deslop" ? "deslop" : "fix", row, lane: fixerLane, threadId: q.fixer.get(row.id)?.thread_id ?? null, startedAt: failed?.started_at, status: "failed", error: message, run });
+    recordJob({ jobId: `${row.id}:fix:${run}`, stage: failed?.kind === "deslop" ? "deslop" : failed?.kind === "sync" ? "sync" : "fix", row, lane: fixerLane, threadId: q.fixer.get(row.id)?.thread_id ?? null, startedAt: failed?.started_at, status: "failed", error: message, run });
     const why = `the author's agent stopped: ${message.slice(0, 300)}`;
     setStage(row, "human_review", why);
     await letYouKnow(row, q.fixer.get(row.id)?.thread_id, "needs_you", why);
@@ -3633,11 +3658,12 @@ export default async function plugin(bb: BbPluginApi) {
       const count = (v: string) => reply.items.filter((i) => i.verdict === v).length;
       const fixJob = `${reviewId}:fix:${run}`;
       recordJob({
-        jobId: fixJob, stage: r.kind === "deslop" ? "deslop" : "fix", row, lane: fixerLane, threadId: q.fixer.get(reviewId)?.thread_id ?? null, startedAt: r.started_at,
+        jobId: fixJob, stage: r.kind === "deslop" ? "deslop" : r.kind === "sync" ? "sync" : "fix", row, lane: fixerLane, threadId: q.fixer.get(reviewId)?.thread_id ?? null, startedAt: r.started_at,
         status: "ok", reply: text, run, result: { trigger: r.trigger, pushed: reply.pushed, headBefore: r.head_before, headAfter: reply.head || null, fix: count("FIX"), skip: count("SKIP"), ask: count("ASK"), items: reply.items },
       });
       emitOutcome(fixJob, "pushed", reply.pushed);
       if (r.kind === "deslop") emitOutcome(fixJob, "cleanups", reply.items.filter((i) => (i.commit ?? "") !== "").length);
+      if (r.kind === "sync") emitOutcome(fixJob, "conflicts_resolved", reply.items.filter((i) => i.verdict === "FIX").length, r.trigger);
       // The author's agent judging a round's findings is the best signal of that round's precision.
       const raised = /^round:(\d+)$/.exec(r.trigger);
       if (r.kind === "fix" && raised !== null) {
@@ -3663,6 +3689,7 @@ export default async function plugin(bb: BbPluginApi) {
       await letYouKnow(fresh, q.fixer.get(reviewId)?.thread_id, "ready_for_you", `${why}; moved to Babysit`);
       void advanceFactory(reviewId).catch(() => undefined);
     };
+    if (r.kind === "sync") return afterSync(fresh, r, reply, asks);
     if (r.kind === "deslop") {
       await postDeslopReport(fresh, run).catch((cause: unknown) => bb.log.warn(`deslop report on ${prLabel(fresh)}: ${errorMessage(cause)}`));
       return toYou("AI review, fixes, and deslop are done");
@@ -3686,6 +3713,39 @@ export default async function plugin(bb: BbPluginApi) {
     if (q.fixRuns.all(row.id).some((r) => r.trigger === `round:${last.round}`)) return false;
     await afterMyRound(row, last.round, last.high_value ?? 0);
     return true;
+  }
+
+  /** Say on the PR what the factory did to keep CI green: a short conversation comment, details folded. */
+  async function postBabysitComment(row: ReviewRow, headline: string, detail: string, lines: string[] = []): Promise<void> {
+    try {
+      await host.call("gh_comment", { owner: row.owner, repo: row.repo, number: row.number, body: babysitComment({ headline, detail, lines }) }, hostOptions(row));
+    } catch (cause) {
+      bb.log.warn(`babysit comment on ${prLabel(row)}: ${errorMessage(cause)}`);
+    }
+  }
+
+  /** After the author's agent merged the base in: say so on the PR, and babysit the new head, or hand the PR to you. */
+  async function afterSync(row: ReviewRow, r: FixRunRow, reply: ReturnType<typeof parseFixReply>, asks: number): Promise<void> {
+    const reason = r.trigger.replace(/^sync:/, "");
+    const resolved = reply.items.filter((i) => i.verdict === "FIX");
+    const moved = reply.pushed && row.head_sha !== r.head_before;
+    const now = Date.now();
+    if (moved) {
+      const headline = `merged \`${row.base_ref}\` into the branch (\`${row.head_sha.slice(0, 7)}\`)${resolved.length > 0 ? `, resolving ${resolved.length} conflict${resolved.length === 1 ? "" : "s"}` : ""}`;
+      await postBabysitComment(row, headline, `Why: ${reason}. ${reply.summary}`, resolved.map((i) => `- ${i.reason.trim().replace(/\n+/g, " ")}`));
+    }
+    if (asks > 0 || !moved) {
+      // Nothing pushed, or a conflict only you can settle: the PR waits for you at this head.
+      const why = asks > 0 ? `merging ${row.base_ref} needs your call: ${reply.items.filter((i) => i.verdict === "ASK").map((i) => i.reason).join("; ")}` : `merging ${row.base_ref} changed nothing: ${reply.summary}`;
+      q.setBabysit.run(row.head_sha, null, q.pipeline.get(row.id)?.babysit_passes ?? 0, "needs_human", now, row.id);
+      q.setNeedsYou.run(why.slice(0, 500), now, row.id);
+      setStage(row, "babysit", why.slice(0, 500));
+      await letYouKnow(row, q.fixer.get(row.id)?.thread_id, "needs_you", why.slice(0, 300));
+      return;
+    }
+    // A new head: CI starts over, and the babysitter looks at it fresh.
+    setStage(row, "babysit");
+    publish(row.id, "board");
   }
 
   /** Post a deslop run's report on the PR, folded, as a COMMENT review at the current head. */

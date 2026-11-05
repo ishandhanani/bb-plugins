@@ -91,7 +91,7 @@ function FactoryChips({ card }: { card: ReviewSummary }) {
           tone={f.fix.status === "failed" ? "bad" : f.fix.status === "running" ? "strong" : "muted"}
           title={`The author's agent, run ${f.fix.run} (${f.fix.kind})`}
         >
-          {f.fix.kind === "deslop" ? "deslop" : "fix"} {f.fix.status === "running" ? "running" : f.fix.status === "failed" ? "failed" : `${f.fix.fix} FIX · ${f.fix.skip} SKIP${f.fix.ask > 0 ? ` · ${f.fix.ask} ASK` : ""}`}
+          {f.fix.kind === "deslop" ? "deslop" : f.fix.kind === "sync" ? "merge base" : "fix"} {f.fix.status === "running" ? "running" : f.fix.status === "failed" ? "failed" : `${f.fix.fix} FIX · ${f.fix.skip} SKIP${f.fix.ask > 0 ? ` · ${f.fix.ask} ASK` : ""}`}
         </Chip>
       ) : null}
       {f.babysit !== null && f.babysit !== "needs_human" ? <Chip icon="Repeat" title="Last CI babysit pass">babysit: {f.babysit}</Chip> : null}

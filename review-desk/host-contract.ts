@@ -162,6 +162,11 @@ export const hostContract = defineRpcContract({
     }),
     output: z.object({ url: z.string().nullable(), id: z.number().nullable() }),
   },
+  /** A conversation comment on the PR (an issue comment). */
+  gh_comment: {
+    input: z.object({ owner: z.string(), repo: z.string(), number: z.number(), body: z.string() }),
+    output: z.object({ url: z.string().nullable() }),
+  },
   gh_reply: {
     input: z.object({ owner: z.string(), repo: z.string(), number: z.number(), commentId: z.number(), body: z.string() }),
     output: z.object({ ok: z.literal(true) }),
@@ -176,8 +181,9 @@ export const hostContract = defineRpcContract({
    * remote that points at the PR's head repository.
    */
   branch_worktree: {
-    input: z.object({ repoPath: z.string(), branch: z.string(), headOwner: z.string(), headRepo: z.string(), worktreesDir: z.string(), key: z.string() }),
-    output: z.object({ worktree: z.string(), remote: z.string(), created: z.boolean() }),
+    input: z.object({ repoPath: z.string(), branch: z.string(), headOwner: z.string(), headRepo: z.string(), baseOwner: z.string(), baseRepo: z.string(), worktreesDir: z.string(), key: z.string() }),
+    /** remote pushes the branch; baseRemote fetches the base branch (the same remote unless the PR comes from a fork). */
+    output: z.object({ worktree: z.string(), remote: z.string(), baseRemote: z.string(), created: z.boolean() }),
   },
   /** A folder per repository that links each PR worktree as pr-<number>: the workspace Review Desk's visible threads share. */
   review_group_dir: {

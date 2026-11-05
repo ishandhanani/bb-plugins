@@ -259,38 +259,53 @@ export function deslopReportBody(args: { run: number; summary: string; items: { 
 
 // -- babysitter -------------------------------------------------------------
 
-export const BABYSIT_OUTCOMES = ["rerun", "waiting", "needs_human", "ok"] as const;
+export const BABYSIT_OUTCOMES = ["rerun", "merge_base", "waiting", "needs_human", "ok"] as const;
 export type BabysitOutcome = (typeof BABYSIT_OUTCOMES)[number];
 
 export function babysitIntro(c: { owner: string; repo: string; number: number; title: string; worktree: string }): string {
   return [
     `You babysit CI for pull request #${c.number} of ${c.owner}/${c.repo}: "${c.title}" until it merges. Each message is one pass. Answer each pass with exactly one fenced block tagged ${BABYSIT_FENCE} containing JSON, and nothing after it.`,
     worktreeLine(c.worktree),
-    "Hard rules: never edit files, never commit, never push, never merge, never close, never comment on the PR or its threads. The only GitHub write you may make is re-running failed jobs (gh run rerun <run-id> --failed).",
-    "Anything that needs a code change, a rebase, a push, or a decision goes back to the human: report needs_human and stop.",
+    "Hard rules: never edit files, never commit, never push, never merge, never close, never comment on the PR or its threads. The only GitHub write you may make is re-running failed jobs (gh run rerun <run-id> --failed). Review Desk posts what you did on the PR.",
+    "Anything that needs a code change or a decision goes back to the human: report needs_human and stop.",
   ].join("\n");
 }
 
-export function babysitPrompt(c: { owner: string; repo: string; number: number; headSha: string; pass: number; maxPasses: number; failing: { name: string; url: string | null }[]; conflicting: boolean }): string {
+export function babysitPrompt(c: { owner: string; repo: string; number: number; headSha: string; baseRef: string; pass: number; maxPasses: number; failing: { name: string; url: string | null }[]; conflicting: boolean; canMergeBase: boolean }): string {
   return [
     `Pass ${c.pass} of at most ${c.maxPasses} at head ${c.headSha} of ${c.owner}/${c.repo}#${c.number}.`,
     c.conflicting ? "GitHub reports merge conflicts with the base branch." : "",
     c.failing.length === 0 ? "No failing checks are reported." : `Failing checks:\n${c.failing.map((f) => `  ${f.name}${f.url ? ` ${f.url}` : ""}`).join("\n")}`,
     "",
     "If you have a skill for watching a PR's CI, use it to diagnose; the rules you were given win over it. Otherwise read gh pr checks and gh run view --log-failed.",
-    "Decide for each failure whether the PR caused it. Re-run the failed jobs the PR did not cause (infra, flakes, cancelled runs), once per pass. Do nothing else on GitHub.",
+    "Decide for each failure what will make it pass:",
+    "- A flake, an infra failure, or a cancelled run: re-run the failed jobs (gh run rerun <run-id> --failed), once per pass.",
+    c.canMergeBase
+      ? `- A failure the branch would not have with the latest ${c.baseRef}: a fix that has landed on ${c.baseRef} since the merge base (check git log <merge-base>..origin/${c.baseRef} for it), or a test that only fails against an old base. Answer merge_base; the author's agent merges ${c.baseRef} into the branch and pushes. Do not merge yourself. Only when ${c.baseRef} actually has what fixes it: merging a base with the same failure does not help.`
+      : "",
+    "- A failure the PR causes, or one nothing above fixes: needs_human, saying what is wrong and what would fix it.",
     "",
     `Reply with one fenced block tagged ${BABYSIT_FENCE}:`,
-    '{ "outcome": "rerun" | "waiting" | "needs_human" | "ok", "detail": string }',
-    "rerun: you re-ran flaky or infra jobs. waiting: checks are still running and nothing needs doing. ok: nothing is failing. needs_human: a failure is caused by the PR, there are merge conflicts, a re-run cannot help, or you are unsure.",
-    "detail: one or two sentences for the human: which check, why, and what they need to do (for example: ask the author to rebase, or fix the failing test in path/to/test.py).",
+    `{ "outcome": "rerun"${c.canMergeBase ? ' | "merge_base"' : ""} | "waiting" | "needs_human" | "ok", "detail": string, "jobs": string[] }`,
+    "rerun: you re-ran failed jobs; list them in jobs. waiting: checks are still running and nothing needs doing. ok: nothing is failing. needs_human: as above.",
+    "detail: one or two sentences: which check, why it failed, and why your choice will fix it (or what the human must do).",
   ].filter((l) => l !== "").join("\n");
 }
 
-const babysitReplySchema = z.object({ outcome: z.enum(BABYSIT_OUTCOMES), detail: z.string().default("") });
+const babysitReplySchema = z.object({ outcome: z.enum(BABYSIT_OUTCOMES), detail: z.string().default(""), jobs: z.array(z.string()).default([]) });
 
-export function parseBabysitReply(text: string): { outcome: BabysitOutcome; detail: string } {
+export function parseBabysitReply(text: string): { outcome: BabysitOutcome; detail: string; jobs: string[] } {
   return babysitReplySchema.parse(replyJson(text, BABYSIT_FENCE));
+}
+
+/** A short PR comment for one thing the factory did to keep CI green, its details folded. */
+export function babysitComment(c: { headline: string; detail: string; lines?: string[] }): string {
+  const body = [c.detail.trim(), ...(c.lines ?? [])].filter((l) => l !== "");
+  return [
+    `**CI babysit** · ${c.headline}`,
+    ...(body.length > 0 ? ["", "<details><summary>Details</summary>", "", ...body, "", "</details>"] : []),
+    `${FACTORY_MARKER}babysit -->`,
+  ].join("\n");
 }
 
 // -- fixer: your own PRs ------------------------------------------------------
@@ -349,6 +364,17 @@ export function deslopPrompt(c: { owner: string; repo: string; number: number; b
     "If nothing is worth removing, change nothing and say so.",
     "",
     `Reply with one fenced block tagged ${FIX_FENCE}: { "summary": string, "items": [{ "url": "", "author": "deslop", "verdict": "FIX", "reason": string, "commit": string }], "pushed": boolean, "head": string }, one item per cleanup commit.`,
+  ].join("\n");
+}
+
+export function syncPrompt(c: { owner: string; repo: string; number: number; baseRef: string; baseRemote: string; reason: string }): string {
+  return [
+    `Job: bring ${c.baseRef} into ${c.owner}/${c.repo}#${c.number}'s branch, because ${c.reason}.`,
+    `git fetch ${c.baseRemote} ${c.baseRef}, then git merge --no-edit ${c.baseRemote}/${c.baseRef}. Merge, do not rebase: nothing pushed gets rewritten.`,
+    `Resolve every conflict by keeping both intents: what this PR changes and what ${c.baseRef} changed. Read both sides (git log and the diff of ${c.baseRef} for the conflicted files) before choosing. Then build and run the narrowest checks for the files you touched, commit the merge, and push.`,
+    "If a conflict needs a decision only the author can make, abort the merge (git merge --abort) and report ASK for it.",
+    "",
+    `Reply with one fenced block tagged ${FIX_FENCE}: { "summary": string, "items": [{ "url": "", "author": "sync", "verdict": "FIX"|"ASK", "reason": string, "commit": string }], "pushed": boolean, "head": string }, one item per conflicted file saying how you resolved it (none when the merge was clean), with the merge commit.`,
   ].join("\n");
 }
 

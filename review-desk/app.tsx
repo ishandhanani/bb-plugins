@@ -1307,8 +1307,8 @@ function AuthorAgentPanel({ reviewId }: { reviewId: string }) {
           {[...runs].reverse().map((r) => (
             <li key={r.run} className="space-y-1.5">
               <div className="flex flex-wrap items-center gap-2 text-xs">
-                <span className="font-medium">{r.kind === "deslop" ? "Deslop" : "Fix"} · run {r.run}</span>
-                <span className="text-muted-foreground">{r.trigger === "human" ? "after your comments" : r.trigger.startsWith("round:") ? `after AI round ${r.trigger.slice(6)}` : r.trigger === "manual" ? "started by you" : "after the fixes"}</span>
+                <span className="font-medium">{r.kind === "deslop" ? "Deslop" : r.kind === "sync" ? "Merge base" : "Fix"} · run {r.run}</span>
+                <span className="text-muted-foreground">{r.trigger === "human" ? "after your comments" : r.trigger.startsWith("round:") ? `after AI round ${r.trigger.slice(6)}` : r.trigger.startsWith("sync:") ? `CI babysit: ${r.trigger.slice(5)}` : r.trigger === "manual" ? "started by you" : "after the fixes"}</span>
                 <span className={cn("rounded-full border px-1.5 text-[10px]", r.status === "failed" ? "border-destructive/50 text-destructive" : "border-border text-muted-foreground")}>{r.status}</span>
                 {r.headAfter && r.headAfter !== r.headBefore ? <span className="font-mono text-muted-foreground">{shortSha(r.headBefore)} → {shortSha(r.headAfter)}</span> : null}
               </div>
