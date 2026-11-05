@@ -3427,6 +3427,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** One look at an approved PR's CI. A pass runs only for a failure no earlier pass at this head has seen. */
   async function babysitTick(row: ReviewRow, p: PipelineRow): Promise<void> {
+    // Until your gh login is known, your PR looks like anyone's; wait rather than babysit it the wrong way.
+    if (authorPipeline && myLogin === null) return;
     const card = summarize(row);
     const conflicting = row.mergeable === "CONFLICTING";
     const fresh = p.babysit_head !== row.head_sha;
@@ -3489,6 +3491,11 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // merge_base is only offered on your own PR; anywhere else it reads as a call for you.
     if (outcome === "merge_base" && !isMine(row)) outcome = "needs_human";
+    // On your PR a conflict is the author's agent's to resolve, whatever the babysitter answered.
+    if (outcome === "needs_human" && isMine(row) && row.mergeable === "CONFLICTING") {
+      outcome = "merge_base";
+      detail = `the branch conflicts with ${row.base_ref}`;
+    }
     const now = Date.now();
     q.setBabysit.run(p.babysit_head, p.babysit_key, p.babysit_passes, outcome, now, reviewId);
     const sitJob = `${reviewId}:babysit:${p.babysit_head}:${p.babysit_passes}`;
@@ -3847,8 +3854,10 @@ export default async function plugin(bb: BbPluginApi) {
       await letYouKnow(row, q.fixer.get(row.id)?.thread_id, "needs_you", why.slice(0, 300));
       return;
     }
-    // A new head: CI starts over, and the babysitter looks at it fresh.
+    // A new head: CI starts over, and the babysitter looks at it fresh. "Needs you" is over.
     setStage(row, "babysit");
+    const sitter = q.babysitter.get(row.id)?.thread_id;
+    if (sitter !== undefined) await bb.sdk.threads.update({ threadId: sitter, title: `#${row.number} · Babysit` }).catch(() => undefined);
     publish(row.id, "board");
   }
 

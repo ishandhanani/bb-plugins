@@ -283,6 +283,7 @@ export function babysitPrompt(c: { owner: string; repo: string; number: number; 
     c.canMergeBase
       ? `- A failure the branch would not have with the latest ${c.baseRef}: a fix that has landed on ${c.baseRef} since the merge base (check git log <merge-base>..origin/${c.baseRef} for it), or a test that only fails against an old base. Answer merge_base; the author's agent merges ${c.baseRef} into the branch and pushes. Do not merge yourself. Only when ${c.baseRef} actually has what fixes it: merging a base with the same failure does not help.`
       : "",
+    c.canMergeBase ? `- Merge conflicts with ${c.baseRef}, failing checks or not: merge_base; the author's agent merges ${c.baseRef} in and resolves them. A conflict is never a reason for needs_human here.` : "",
     "- A failure the PR causes, or one nothing above fixes: needs_human, saying what is wrong and what would fix it.",
     "",
     `Reply with one fenced block tagged ${BABYSIT_FENCE}:`,
