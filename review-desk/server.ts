@@ -2091,6 +2091,7 @@ export default async function plugin(bb: BbPluginApi) {
           // The PR's threads fold into a folder named after this environment.
           q.setSharedEnv.run(`path:${ownWorkspace}`, environmentId);
           await bb.sdk.environments.update({ environmentId, name: `#${row.number} · ${row.title}`.slice(0, 60) }).catch((cause: unknown) => bb.log.warn(`naming ${prLabel(row)}'s environment: ${errorMessage(cause)}`));
+          void ensurePrAnchor(row, environmentId, ownWorkspace).catch((cause: unknown) => bb.log.warn(`folder thread for ${prLabel(row)}: ${errorMessage(cause)}`));
           return environmentId;
         }
         if (shared === null) {
@@ -3603,6 +3604,7 @@ export default async function plugin(bb: BbPluginApi) {
       viewers.set(hostId, login);
       myLogin = login;
       for (const row of q.reviews.all()) publish(row.id, "board");
+      void anchorSweep();
     } catch (cause) {
       if (attempt < 10) setTimeout(() => void learnMyLogin(attempt + 1), 1000 * (attempt + 1));
       else bb.log.warn(`could not learn your gh login: ${errorMessage(cause)}`);
@@ -3656,6 +3658,49 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
+   * The thread that keeps your PR's folder in the sidebar. bb folds threads into
+   * a folder only when two or more visible ones share a worktree environment,
+   * and agent threads come, go, and get archived; this one stays. It is also a
+   * place to talk to an agent on the PR's branch. One short turn on the
+   * babysitter's model creates it.
+   */
+  async function ensurePrAnchor(row: ReviewRow, environmentId: string, worktree: string): Promise<void> {
+    const key = `anchor:${worktree}`;
+    const known = q.sharedEnv.get(key)?.environment_id ?? null;
+    if (known !== null) {
+      const alive = await bb.sdk.threads.get({ threadId: known }).then((t) => t.archivedAt === null && t.deletedAt === null, () => false);
+      if (alive) return;
+    }
+    const thread = await bb.sdk.threads.spawn({
+      projectId: await chatProjectId(row),
+      environment: { type: "reuse", environmentId },
+      providerId: babysitProvider.trim() || defaultProvider,
+      ...(babysitModel.trim() !== "" ? { model: babysitModel.trim() } : {}),
+      title: `#${row.number} · PR`,
+      sectionId: await sectionId(),
+      visibility: "visible",
+      input: [{ type: "text", text: `This thread holds the Review Desk folder for ${prLabel(row)}: "${row.title}" (${row.url}). Its worktree is ${worktree}, on the PR's branch; ask here about the PR. Reply with only: ok`, mentions: [] }],
+    });
+    q.setSharedEnv.run(key, thread.id);
+    // Its one-word reply is not news.
+    setTimeout(() => void bb.sdk.threads.markRead({ threadId: thread.id }).catch(() => undefined), 90_000);
+  }
+
+  /** After a restart: every PR of yours whose worktree environment is known keeps its folder thread. */
+  async function anchorSweep(): Promise<void> {
+    for (const row of q.reviews.all()) {
+      if (row.state !== "OPEN" || !isMine(row) || q.pipeline.get(row.id) === undefined) continue;
+      try {
+        const target = await ensureBranchWorktree(row);
+        const environmentId = q.sharedEnv.get(`path:${target.worktree}`)?.environment_id;
+        if (environmentId !== undefined) await ensurePrAnchor(row, environmentId, target.worktree);
+      } catch (cause) {
+        bb.log.warn(`folder thread for ${prLabel(row)}: ${errorMessage(cause)}`);
+      }
+    }
+  }
+
+  /**
    * Start the author's agent on a fix (after a round, or after your comments),
    * the deslop pass, or a sync (bring the base branch in, resolving conflicts;
    * the trigger then says why). A sync leaves the PR in Babysit.
@@ -3681,6 +3726,7 @@ export default async function plugin(bb: BbPluginApi) {
         q.setSharedEnv.run(`path:${target.worktree}`, environmentId);
         await bb.sdk.environments.update({ environmentId, name: `#${row.number} · ${row.title}`.slice(0, 60) }).catch(() => undefined);
       }
+      if (environmentId !== null) void ensurePrAnchor(row, environmentId, target.worktree).catch((cause: unknown) => bb.log.warn(`folder thread for ${prLabel(row)}: ${errorMessage(cause)}`));
       // The thread is visible: title it by PR and job so it reads in the sidebar.
       const threadId = q.fixer.get(row.id)?.thread_id;
       if (threadId !== undefined) await bb.sdk.threads.update({ threadId, title: `#${row.number} · ${kind === "deslop" ? "Deslop" : kind === "sync" ? `Merging ${row.base_ref}` : "Fixing"}` }).catch(() => undefined);
