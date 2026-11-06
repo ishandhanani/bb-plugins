@@ -20,7 +20,8 @@ const richText = (text: string, link?: string): Block => ({
   type: "rich_text",
   elements: [{ type: "rich_text_section", elements: [link ? { type: "link", text, url: link } : { type: "text", text }] }],
 });
-const cell = (text: string, link?: string): Block => (link ? richText(text, link) : { type: "raw_text", text });
+// Slack refuses a table cell with empty text.
+const cell = (text: string, link?: string): Block => (link ? richText(text || "-", link) : { type: "raw_text", text: text || "-" });
 
 export function prStage(card: ReviewSummary): string {
   if (card.stage === null) return card.state === "MERGED" ? "Merged" : "Closed";

@@ -9,8 +9,8 @@ export interface SlackEnvelope {
 }
 
 export class SlackApiError extends Error {
-  constructor(readonly method: string, readonly code: string) {
-    super(`slack ${method}: ${code}`);
+  constructor(readonly method: string, readonly code: string, details: string[] = []) {
+    super(`slack ${method}: ${code}${details.length > 0 ? ` (${details.join("; ")})` : ""}`);
   }
 }
 
@@ -27,8 +27,8 @@ export async function slackApi<T = Record<string, unknown>>(base: string, token:
       await new Promise((resolve) => setTimeout(resolve, Math.max(1, wait) * 1000));
       continue;
     }
-    const data = (await response.json()) as { ok?: boolean; error?: string } & T;
-    if (!data.ok) throw new SlackApiError(method, data.error ?? `http ${response.status}`);
+    const data = (await response.json()) as { ok?: boolean; error?: string; response_metadata?: { messages?: string[] } } & T;
+    if (!data.ok) throw new SlackApiError(method, data.error ?? `http ${response.status}`, data.response_metadata?.messages ?? []);
     return data;
   }
 }
