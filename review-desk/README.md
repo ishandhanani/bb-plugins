@@ -73,12 +73,14 @@ bb review-desk map <reviewId> [--rewrite]
 - `simpleEnglishSkill` (default empty): optional file appended to the rewrite prompt as vocabulary help, for example a `simple-english` SKILL.md. Empty uses a short built-in word list. A long rule set makes a fast model paraphrase instead of shorten, so the default is the short list.
 - `boardRefresh` (default `*/15 * * * *`): cron (5 fields, server-local time) for syncing the board's open PRs with GitHub in the background; empty turns it off.
 - `autoAiReview` (default true): put a PR in the factory when it is added to the board. Rounds post COMMENT reviews under your `gh` login.
-- `aiReviewProvider` / `aiReviewModel` (default `claude-code` / `claude-opus-5-5`): the AI reviewer.
+- `aiReviewProvider` / `aiReviewModel` (default `claude-code` / `claude-fable-5-1`): the AI reviewer.
 - `aiReviewMaxRounds` (default 2): AI rounds before Human review; a round that leaves only nits hands off sooner.
 - `aiReviewConcurrency` (default 2): rounds running at once across the board.
 - `aiReviewSettleMinutes` (default 10): how long a new head must sit unchanged before the next round. Pushes are noticed on the `boardRefresh` cron.
 - `aiReviewSkills` (default empty): skills the reviewer must use on top of the ones it picks; comma separated, `owner/repo=skill` for one repository.
 - `aiReviewEmpirical` (default false): let the reviewer run skills that build, launch servers, or run GPU or load tests. Off, it applies them by reading the code.
+- `fixerProvider` / `fixerModel` (default `claude-code` / `claude-opus-5-5`): the author's agent on your own PRs, which fixes feedback and merges the base.
+- `deslopModel` (default `claude-fable-5-1`; empty uses `fixerModel`): the author's agent's deslop turns, in the same thread.
 - `babysitProvider` / `babysitModel` (default `claude-code` / `claude-opus-5-5`): the CI babysitter.
 - `babysitMaxPasses` (default 3): babysit passes per head before CI failures are handed to you.
 - `slackBotToken` / `slackAppToken` (secrets, default empty): the Slack bridge's bot token (`xoxb-…`) and app-level token (`xapp-…`, `connections:write`). Create the app from `slack-app-manifest.yaml`. The bridge's settings apply live: it connects when both tokens are set and reconnects when any of them change.

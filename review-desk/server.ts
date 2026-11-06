@@ -1031,7 +1031,7 @@ export default async function plugin(bb: BbPluginApi) {
     startDelaySeconds: { type: "number", label: "PR factory: seconds a newly added PR waits before its first job starts, so you can drag it to another column first", default: 10 },
     autoAiReview: { type: "boolean", label: "PR factory: start AI review rounds when a PR is added to the board (they post COMMENT reviews to GitHub under your gh login)", default: true },
     aiReviewProvider: { type: "string", label: "PR factory: provider id for the AI reviewer", default: "claude-code" },
-    aiReviewModel: { type: "string", label: "PR factory: model for the AI reviewer; empty uses the project's default", default: "claude-opus-5-5" },
+    aiReviewModel: { type: "string", label: "PR factory: model for the AI reviewer; empty uses the project's default", default: "claude-fable-5-1" },
     aiReviewMaxRounds: { type: "number", label: "PR factory: AI review rounds before the PR moves to Human review (it moves sooner when a round leaves only nits)", default: 2 },
     aiReviewConcurrency: { type: "number", label: "PR factory: AI review rounds running at once across the board", default: 2 },
     aiReviewSettleMinutes: { type: "number", label: "PR factory: minutes a new head must sit unchanged before the next AI round starts", default: 10 },
@@ -1042,7 +1042,8 @@ export default async function plugin(bb: BbPluginApi) {
     babysitMaxPasses: { type: "number", label: "PR factory: babysit passes per head before CI failures are handed to you", default: 3 },
     authorPipeline: { type: "boolean", label: "PR factory: on your own PRs, an agent triages and fixes the feedback after each AI round, pushes, and deslops the diff before your review", default: true },
     fixerProvider: { type: "string", label: "PR factory: provider id for the author's agent on your own PRs", default: "claude-code" },
-    fixerModel: { type: "string", label: "PR factory: model for the author's agent on your own PRs", default: "claude-opus-5-5" },
+    fixerModel: { type: "string", label: "PR factory: model for the author's agent on your own PRs (fixing, merging the base)", default: "claude-opus-5-5" },
+    deslopModel: { type: "string", label: "PR factory: model for the author's agent's deslop turns; empty uses fixerModel", default: "claude-fable-5-1" },
     deslopStage: { type: "boolean", label: "PR factory: on your own PRs, deslop the diff (the bundled deslop skill) after the AI rounds and before your review", default: true },
     slackWebhookUrl: { type: "string", secret: true, label: "PR factory: Slack incoming webhook URL; when set, you are pinged there whenever a PR needs you", default: "" },
     slackMention: { type: "string", label: "PR factory: optional mention at the start of each Slack ping, for example <@U0123ABCD>", default: "" },
@@ -1059,7 +1060,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   const {
     defaultProvider, hideSeatThreads, autoMap, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir, threadSection,
-    startDelaySeconds, autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, authorPipeline, fixerProvider, fixerModel, deslopStage, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
+    startDelaySeconds, autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, authorPipeline, fixerProvider, fixerModel, deslopModel, deslopStage, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
   } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
 
@@ -3662,6 +3663,9 @@ export default async function plugin(bb: BbPluginApi) {
     setJob: (job, id) => { q.setFixerJob.run(job, id); },
     remove: (id) => { q.deleteFixer.run(id); },
   };
+  /** Deslop turns run in the author's agent's thread, on their own model. */
+  const deslopLane: Lane = { ...fixerLane, model: deslopModel.trim() || fixerModel };
+  const fixRunLane = (kind: string | undefined) => (kind === "deslop" ? deslopLane : fixerLane);
 
   /** Your gh login, learned once from the primary machine; a PR it authored runs the author's pipeline. */
   let myLogin: string | null = null;
@@ -3787,7 +3791,7 @@ export default async function plugin(bb: BbPluginApi) {
         ? deslopPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha })
         : fixPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha, round: last?.round ?? 0, reviewUrl: trigger === "human" ? null : last?.review_url ?? null });
       noteJobPrompt(`${row.id}:fix:${run}`, prompt, fixerLane.intro(row));
-      await laneSend(fixerLane, row, `fix:${run}`, prompt);
+      await laneSend(fixRunLane(kind), row, `fix:${run}`, prompt);
       // An environment bb made for this worktree before Review Desk tracked it is recorded and named now.
       const environmentId = q.fixer.get(row.id)?.environment_id ?? null;
       if (environmentId !== null && q.sharedEnv.get(`path:${target.worktree}`) === undefined) {
@@ -3815,7 +3819,7 @@ export default async function plugin(bb: BbPluginApi) {
     q.setFixRunFailed.run(message, Date.now(), row.id, run);
     slackFixRun(row, run);
     const failed = q.fixRun.get(row.id, run);
-    recordJob({ jobId: `${row.id}:fix:${run}`, stage: failed?.kind === "deslop" ? "deslop" : failed?.kind === "sync" ? "sync" : "fix", row, lane: fixerLane, threadId: q.fixer.get(row.id)?.thread_id ?? null, startedAt: failed?.started_at, status: "failed", error: message, run });
+    recordJob({ jobId: `${row.id}:fix:${run}`, stage: failed?.kind === "deslop" ? "deslop" : failed?.kind === "sync" ? "sync" : "fix", row, lane: fixRunLane(failed?.kind), threadId: q.fixer.get(row.id)?.thread_id ?? null, startedAt: failed?.started_at, status: "failed", error: message, run });
     const why = `the author's agent stopped: ${message.slice(0, 300)}`;
     setStage(row, "human_review", why);
     await letYouKnow(row, q.fixer.get(row.id)?.thread_id, "needs_you", why);
@@ -3839,7 +3843,7 @@ export default async function plugin(bb: BbPluginApi) {
       const count = (v: string) => reply.items.filter((i) => i.verdict === v).length;
       const fixJob = `${reviewId}:fix:${run}`;
       recordJob({
-        jobId: fixJob, stage: r.kind === "deslop" ? "deslop" : r.kind === "sync" ? "sync" : "fix", row, lane: fixerLane, threadId: q.fixer.get(reviewId)?.thread_id ?? null, startedAt: r.started_at,
+        jobId: fixJob, stage: r.kind === "deslop" ? "deslop" : r.kind === "sync" ? "sync" : "fix", row, lane: fixRunLane(r.kind), threadId: q.fixer.get(reviewId)?.thread_id ?? null, startedAt: r.started_at,
         status: "ok", reply: text, run, result: { trigger: r.trigger, pushed: reply.pushed, headBefore: r.head_before, headAfter: reply.head || null, fix: count("FIX"), skip: count("SKIP"), ask: count("ASK"), items: reply.items },
       });
       emitOutcome(fixJob, "pushed", reply.pushed);
