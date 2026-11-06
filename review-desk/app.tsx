@@ -206,6 +206,7 @@ interface ReviewDetail {
   chatProjectId: string;
   /** You wrote this PR, so it runs the author's pipeline. */
   mine: boolean;
+  slack: { ready: boolean; on: boolean; url: string | null };
 }
 
 /** A commit view target parsed from the sub-path: `sha`, or `from..to` meaning the commits from `from` through `to` inclusive. */
@@ -1269,6 +1270,30 @@ function CommitView({ reviewId, review, target, theme, diffStyle, selection, onS
 type JumpFn = (path: string, line: number | null, side: "old" | "new") => void;
 
 /** Your own PR: what the author's agent did, run by run, with its verdict on each comment. */
+/** Post this PR to the Slack bridge's channel (its card and a thread of the factory's events), or stop. */
+function SlackToggle({ reviewId, slack, onChanged }: { reviewId: string; slack: { ready: boolean; on: boolean; url: string | null }; onChanged: () => void }) {
+  const rpc = useRpc<Contract>();
+  const [busy, setBusy] = useState(false);
+  if (!slack.ready && !slack.on) return null;
+  const set = (on: boolean) => {
+    setBusy(true);
+    rpc.call("slack_post", { reviewId, on }).then(onChanged, (cause: unknown) => toast.error(describeError(cause))).finally(() => setBusy(false));
+  };
+  if (!slack.on) {
+    return (
+      <Button variant="outline" size="sm" className="ml-auto h-6 px-2 text-xs" disabled={busy} onClick={() => set(true)}>
+        <Icon name={busy ? "Loading" : "Sent"} className={cn("size-3.5", busy && "animate-spin")} />Post to Slack
+      </Button>
+    );
+  }
+  return (
+    <span className="ml-auto inline-flex items-center gap-1 text-muted-foreground">
+      {slack.url ? <UrlLink href={slack.url} className="inline-flex items-center gap-1 hover:text-foreground"><Icon name="Sent" className="size-3.5" />On Slack</UrlLink> : <span className="inline-flex items-center gap-1"><Icon name="Sent" className="size-3.5" />On Slack</span>}
+      <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs" disabled={busy} onClick={() => set(false)} title="Stop posting this PR to Slack">Stop</Button>
+    </span>
+  );
+}
+
 function AuthorAgentPanel({ reviewId }: { reviewId: string }) {
   const rpc = useRpc<Contract>();
   const navigate = useBbNavigate();
@@ -1652,6 +1677,7 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
               <Icon name="ChevronLeft" className="size-3 text-muted-foreground" />
               <span className="rounded-md border border-border bg-card px-1.5 py-0.5 font-mono">{review.headRefName}</span>
               <span className="font-mono text-muted-foreground">{shortSha(review.headSha)}</span>
+              <SlackToggle reviewId={reviewId} slack={detail.slack} onChanged={refetch} />
             </div>
             <div className="text-xs text-muted-foreground">
               Opened {timeAgo(review.createdAt)} · {files.length} files · <span className="text-primary">+{review.additions}</span> <span className="text-destructive">-{review.deletions}</span> · {review.commits.length} commits · synced {timeAgo(review.syncedAt)}

@@ -17,10 +17,13 @@ export class SlackApiError extends Error {
 /** POST a Web API method; waits out 429s (Retry-After) up to three times. */
 export async function slackApi<T = Record<string, unknown>>(base: string, token: string, method: string, body: Record<string, unknown> = {}): Promise<T> {
   for (let attempt = 0; ; attempt++) {
+    // Form-encoded, because Slack's read methods ignore JSON bodies; blocks and other objects go as JSON strings.
+    const form = new URLSearchParams();
+    for (const [key, value] of Object.entries(body)) if (value !== undefined) form.set(key, typeof value === "object" ? JSON.stringify(value) : String(value));
     const response = await fetch(`${base}/${method}`, {
       method: "POST",
-      headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${token}` },
-      body: JSON.stringify(body),
+      headers: { "content-type": "application/x-www-form-urlencoded", authorization: `Bearer ${token}` },
+      body: form,
     });
     if (response.status === 429 && attempt < 3) {
       const wait = Number(response.headers.get("retry-after") ?? "1");

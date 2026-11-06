@@ -1,8 +1,8 @@
-// Block Kit for the Slack bridge: the pinned board, each PR's card (the root
-// of its thread), and the replies the factory posts in that thread. Pure
+// Block Kit for the Slack bridge: each PR's card (the root of its thread),
+// and the replies the factory posts in that thread. Pure
 // functions of Review Desk's data; slack-bridge in server.ts posts them.
 
-import { stageLabel } from "./board-spec";
+import { BOARD_LANES, stageLabel } from "./board-spec";
 import { AI_LABELS, isHighValue, type AiLabel } from "./factory-spec";
 import type { FixRun, ReviewSummary } from "./server";
 
@@ -46,19 +46,18 @@ export function nowLine(card: ReviewSummary): string {
   return "";
 }
 
-const PR_ACTIONS: Record<string, { text: string; action: string }> = {
-  babysit: { text: "Babysit", action: "rd_babysit" },
-  fix: { text: "Fix now", action: "rd_fix" },
-  deslop: { text: "Deslop", action: "rd_deslop" },
-  review: { text: "AI round", action: "rd_review" },
-};
+/** The PR's path through its lane, the current stage in bold: AI review › Fixing › *Deslop* › Babysit. */
+export function stagePath(card: ReviewSummary): string {
+  if (card.stage === null) return `*${prStage(card)}*`;
+  const lane = BOARD_LANES.find((l) => l.id === (card.mine ? "mine" : "reviewing"));
+  const stages = (lane?.stages ?? []).filter((s) => s !== "unreviewed" && (s !== "changes_requested" || card.stage === s));
+  if (!stages.includes(card.stage as never)) return `*${prStage(card)}*`;
+  return stages.map((s) => (s === card.stage ? `*${stageLabel(s, card.mine ? "mine" : "reviewing")}*` : stageLabel(s, card.mine ? "mine" : "reviewing"))).join(" › ");
+}
 
 /** The root of a PR's thread: one card, repainted as the PR moves. */
 export function prCard(card: ReviewSummary): { text: string; blocks: Block[] } {
   const now = nowLine(card);
-  const buttons: Block[] = [{ type: "button", text: plain("Open PR"), url: card.url, action_id: "rd_open" }];
-  const wanted = card.stage === "babysit" ? (card.mine ? ["deslop", "fix"] : ["review"]) : card.mine ? ["babysit", "deslop"] : ["babysit", "review"];
-  for (const key of wanted.slice(0, 2)) buttons.push({ type: "button", text: plain(PR_ACTIONS[key].text), action_id: PR_ACTIONS[key].action, value: card.id });
   const text = `${card.owner}/${card.repo}#${card.number} ${card.title} · ${prStage(card)}`;
   return {
     text,
@@ -67,31 +66,10 @@ export function prCard(card: ReviewSummary): { text: string; blocks: Block[] } {
         type: "card",
         title: mrkdwn(clip(`*<${card.url}|#${card.number}>* ${esc(card.title)}`, 150)),
         subtitle: mrkdwn(clip(`${card.owner}/${card.repo}${card.author ? ` · ${esc(card.author)}` : ""}${card.isDraft ? " · draft" : ""}`, 150)),
-        body: mrkdwn(clip(`*${prStage(card)}* · ${ciLine(card)}${card.unresolvedThreads > 0 ? ` · ${card.unresolvedThreads} open thread${card.unresolvedThreads === 1 ? "" : "s"}` : ""}`, 200)),
+        body: mrkdwn(clip(`${stagePath(card)}\n${ciLine(card)}${card.unresolvedThreads > 0 ? ` · ${card.unresolvedThreads} open thread${card.unresolvedThreads === 1 ? "" : "s"}` : ""}`, 200)),
         ...(now ? { subtext: mrkdwn(clip(esc(now), 200)) } : {}),
-        actions: buttons,
+        actions: [{ type: "button", text: plain("Open PR"), url: card.url, action_id: "rd_open" }],
       },
-    ],
-  };
-}
-
-/** The pinned board: counts per column, then one row per open PR. */
-export function boardMessage(cards: ReviewSummary[], updatedAt: number): { text: string; blocks: Block[] } {
-  const open = cards.filter((c) => c.stage !== null);
-  const counts = new Map<string, number>();
-  for (const c of open) counts.set(prStage(c), (counts.get(prStage(c)) ?? 0) + 1);
-  const needs = open.filter((c) => c.factory?.needsYou).length;
-  const seconds = Math.floor(updatedAt / 1000);
-  const rows: Block[][] = [[cell("PR"), cell("Stage"), cell("CI"), cell("Now")]];
-  for (const c of open.slice(0, 99)) rows.push([cell(clip(`#${c.number} ${c.title}`, 70), c.url), cell(prStage(c)), cell(ciLine(c)), cell(clip(nowLine(c), 90))]);
-  const summary = [...counts.entries()].map(([stage, n]) => `${n} ${stage}`).join(" · ") || "nothing open";
-  return {
-    text: `PR factory: ${summary}`,
-    blocks: [
-      { type: "header", text: plain("PR factory") },
-      { type: "context", elements: [mrkdwn(`Updated <!date^${seconds}^{date_short_pretty} {time}|${new Date(updatedAt).toISOString()}> · Review Desk repaints this from GitHub and the factory`)] },
-      { type: "section", text: mrkdwn(`${summary}${needs > 0 ? ` · *${needs} need${needs === 1 ? "s" : ""} you*` : ""}`) },
-      ...(open.length > 0 ? [{ type: "table", column_settings: [{ is_wrapped: true }, {}, {}, { is_wrapped: true }], rows }] : []),
     ],
   };
 }
