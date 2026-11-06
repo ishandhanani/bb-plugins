@@ -4035,10 +4035,21 @@ export default async function plugin(bb: BbPluginApi) {
     if (!slackOn()) return;
     dirtyCards.add(reviewId);
     boardDirty = true;
+    schedulePaint(3_000);
+  }
+
+  function schedulePaint(delay: number): void {
     paintTimer ??= setTimeout(() => {
       paintTimer = null;
-      void paint().catch((cause: unknown) => bb.log.warn(`slack repaint: ${errorMessage(cause)}`));
-    }, 3_000);
+      const cards = [...dirtyCards];
+      void paint().catch((cause: unknown) => {
+        // Not in the channel yet, Slack down: keep what was owed and try again in a minute.
+        bb.log.warn(`slack repaint: ${errorMessage(cause)}`);
+        for (const id of cards) dirtyCards.add(id);
+        boardDirty = true;
+        if (slackOn()) schedulePaint(60_000);
+      });
+    }, delay);
   }
 
   async function paint(): Promise<void> {
