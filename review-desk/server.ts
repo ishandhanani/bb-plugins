@@ -3559,11 +3559,15 @@ export default async function plugin(bb: BbPluginApi) {
       q.setConversationCache.run(row.id, JSON.stringify(conversation), Date.now());
       reviews = conversation.reviews;
     }
-    const windows = q.fixRuns.all(row.id).map((r) => [r.started_at, (r.finished_at ?? Date.now()) + 2 * 60_000] as const);
+    const runs = q.fixRuns.all(row.id);
+    const windows = runs.map((r) => [r.started_at, (r.finished_at ?? Date.now()) + 2 * 60_000] as const);
+    // New to the author's agent: anything since it last read the comments (a fix run's start), whatever stage
+    // the PR was in then, so a reply made during deslop or the final check still counts.
+    const lastRead = runs.filter((r) => r.kind === "fix").at(-1)?.started_at ?? p.entered_at;
     const yours = reviews.filter((r) => {
       if (r.author !== login || r.body.includes(FACTORY_MARKER) || r.submittedAt === null) return false;
       const at = Date.parse(r.submittedAt);
-      return at > p.entered_at && !windows.some(([from, to]) => at >= from && at <= to);
+      return at > lastRead && !windows.some(([from, to]) => at >= from && at <= to);
     });
     if (yours.length === 0) return false;
     await startFixRun(row, "fix", "human");
