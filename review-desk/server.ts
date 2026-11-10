@@ -18,6 +18,12 @@ import { agentReply, babysitReply, fixRunReply, handoffReply, prCard, roundReply
 import { runSocketMode, slackApi, SlackApiError, type SlackEnvelope } from "./slack-client";
 import {
   FACTORY_MARKER,
+  finalCheckBody,
+  finalCheckPrompt,
+  parseVerifyReply,
+  recheckPrompt,
+  verifyPrompt,
+  type CandidateFinding,
   AI_LABELS,
   babysitIntro,
   babysitComment,
@@ -152,6 +158,8 @@ const reviewSummarySchema = z.object({
       startsAt: z.number().nullable(),
       /** The author's agent's latest run on your own PR: fix or deslop, its state, and its verdicts. */
       fix: z.object({ run: z.number(), kind: z.string(), status: z.string(), fix: z.number(), skip: z.number(), ask: z.number() }).nullable(),
+      /** The final check: review (fresh reviewer), verify, fixing, recheck, done, or failed, and its verdict counts. */
+      final: z.object({ status: z.string(), confirmed: z.number(), refuted: z.number(), unsure: z.number(), error: z.string().nullable() }).nullable(),
       error: z.string().nullable(),
     })
     .nullable(),
@@ -672,6 +680,25 @@ const MIGRATIONS = [
    )`,
   // The Slack bridge's small state: PR threads, posted messages to edit, Slack threads mapped to bb threads, pending turns.
   `CREATE TABLE IF NOT EXISTS slack_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+  // The final check: its fresh reviewer's thread (a new one per check), and the check itself, one per PR.
+  `CREATE TABLE IF NOT EXISTS final_checkers (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL, intro_hash TEXT)`,
+  `CREATE TABLE IF NOT EXISTS final_checks (
+     review_id TEXT PRIMARY KEY,
+     base_sha TEXT NOT NULL,
+     head_sha TEXT NOT NULL,
+     status TEXT NOT NULL,
+     reason TEXT NOT NULL,
+     findings_json TEXT,
+     verdicts_json TEXT,
+     summary TEXT,
+     review_url TEXT,
+     confirmed INTEGER,
+     refuted INTEGER,
+     unsure INTEGER,
+     error TEXT,
+     started_at INTEGER NOT NULL,
+     finished_at INTEGER
+   )`,
 ];
 
 interface ReviewRow {
@@ -683,6 +710,11 @@ interface ReviewRow {
 interface PendingRow { id: string; review_id: string; path: string; line: number; start_line: number | null; side: string; body: string; created_at: number }
 interface SeatRow { review_id: string; provider_id: string; thread_id: string; environment_id: string | null; created_at: number }
 interface CacheRow { review_id: string; json: string; fetched_at: number }
+/** status: review (the fresh reviewer), verify, fixing (your PR), recheck (your PR), done, failed. */
+interface FinalCheckRow {
+  review_id: string; base_sha: string; head_sha: string; status: string; reason: string; findings_json: string | null; verdicts_json: string | null; summary: string | null;
+  review_url: string | null; confirmed: number | null; refuted: number | null; unsure: number | null; error: string | null; started_at: number; finished_at: number | null;
+}
 interface HelperRow { review_id: string; thread_id: string; provider_id: string; environment_id: string | null; job: string | null; created_at: number; intro_hash?: string | null }
 interface SimpleRow { review_id: string; comment_key: string; body_hash: string; status: string; text: string | null; error: string | null; updated_at: number; requested_at: number | null }
 interface NoteRow {
@@ -884,6 +916,19 @@ function createStore(db: Database.Database) {
     ),
     setAiReviewerJob: db.prepare<[string | null, string]>(`UPDATE ai_reviewers SET job = ? WHERE review_id = ?`),
     deleteAiReviewer: db.prepare<[string]>(`DELETE FROM ai_reviewers WHERE review_id = ?`),
+    finalChecker: db.prepare<[string], HelperRow>(`SELECT * FROM final_checkers WHERE review_id = ?`),
+    finalCheckerByThread: db.prepare<[string], HelperRow>(`SELECT * FROM final_checkers WHERE thread_id = ?`),
+    upsertFinalChecker: db.prepare<[string, string, string, string | null, number, string | null]>(
+      `INSERT INTO final_checkers (review_id, thread_id, provider_id, environment_id, created_at, intro_hash) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id, intro_hash = excluded.intro_hash`,
+    ),
+    setFinalCheckerJob: db.prepare<[string | null, string]>(`UPDATE final_checkers SET job = ? WHERE review_id = ?`),
+    deleteFinalChecker: db.prepare<[string]>(`DELETE FROM final_checkers WHERE review_id = ?`),
+    finalCheck: db.prepare<[string], FinalCheckRow>(`SELECT * FROM final_checks WHERE review_id = ?`),
+    activeFinalChecks: db.prepare<[], FinalCheckRow>(`SELECT * FROM final_checks WHERE status IN ('review', 'verify', 'recheck')`),
+    saveFinalCheck: db.prepare<[FinalCheckRow]>(
+      `INSERT OR REPLACE INTO final_checks (review_id, base_sha, head_sha, status, reason, findings_json, verdicts_json, summary, review_url, confirmed, refuted, unsure, error, started_at, finished_at)
+       VALUES (@review_id, @base_sha, @head_sha, @status, @reason, @findings_json, @verdicts_json, @summary, @review_url, @confirmed, @refuted, @unsure, @error, @started_at, @finished_at)`,
+    ),
     babysitter: db.prepare<[string], HelperRow>(`SELECT * FROM babysitters WHERE review_id = ?`),
     babysitterByThread: db.prepare<[string], HelperRow>(`SELECT * FROM babysitters WHERE thread_id = ?`),
     upsertBabysitter: db.prepare<[string, string, string, string | null, number, string | null]>(
@@ -1032,7 +1077,7 @@ export default async function plugin(bb: BbPluginApi) {
     autoAiReview: { type: "boolean", label: "PR factory: start AI review rounds when a PR is added to the board (they post COMMENT reviews to GitHub under your gh login)", default: true },
     aiReviewProvider: { type: "string", label: "PR factory: provider id for the AI reviewer", default: "claude-code" },
     aiReviewModel: { type: "string", label: "PR factory: model for the AI reviewer; empty uses the project's default", default: "claude-fable-5-1" },
-    aiReviewMaxRounds: { type: "number", label: "PR factory: AI review rounds before the PR moves to Human review (it moves sooner when a round leaves only nits)", default: 2 },
+    aiReviewMaxRounds: { type: "number", label: "PR factory: safety cap on AI review rounds; the loop ends sooner once a round leaves only nits or makes no progress", default: 4 },
     aiReviewConcurrency: { type: "number", label: "PR factory: AI review rounds running at once across the board", default: 2 },
     aiReviewSettleMinutes: { type: "number", label: "PR factory: minutes a new head must sit unchanged before the next AI round starts", default: 10 },
     aiReviewSkills: { type: "string", label: "PR factory: optional skills the reviewer must use on top of the ones it picks (your own and the repository's); comma separated, owner/repo=skill for one repository", default: "" },
@@ -1043,6 +1088,9 @@ export default async function plugin(bb: BbPluginApi) {
     authorPipeline: { type: "boolean", label: "PR factory: on your own PRs, an agent triages and fixes the feedback after each AI round, pushes, and deslops the diff before your review", default: true },
     fixerProvider: { type: "string", label: "PR factory: provider id for the author's agent on your own PRs", default: "claude-code" },
     fixerModel: { type: "string", label: "PR factory: model for the author's agent on your own PRs (fixing, merging the base)", default: "claude-opus-5-5" },
+    finalCheck: { type: "boolean", label: "PR factory: after the review rounds, a fresh-context final check whose findings a second model tries to refute", default: true },
+    finalCheckModel: { type: "string", label: "PR factory: model for the final check's fresh-context reviewer", default: "claude-fable-5-1" },
+    verifyModel: { type: "string", label: "PR factory: model for the final check's verifier (it has the PR's full history); a different model than the reviewer catches more", default: "claude-opus-5-5" },
     deslopModel: { type: "string", label: "PR factory: model for the author's agent's deslop turns; empty uses fixerModel", default: "claude-fable-5-1" },
     deslopStage: { type: "boolean", label: "PR factory: on your own PRs, deslop the diff (the bundled deslop skill) after the AI rounds and before your review", default: true },
     slackWebhookUrl: { type: "string", secret: true, label: "PR factory: Slack incoming webhook URL; when set, you are pinged there whenever a PR needs you", default: "" },
@@ -1060,7 +1108,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   const {
     defaultProvider, hideSeatThreads, autoMap, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir, threadSection,
-    startDelaySeconds, autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, authorPipeline, fixerProvider, fixerModel, deslopModel, deslopStage, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
+    startDelaySeconds, autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, authorPipeline, fixerProvider, fixerModel, deslopModel, deslopStage, finalCheck, finalCheckModel, verifyModel, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
   } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
 
@@ -1413,6 +1461,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (stage === "babysit") void advanceFactory(reviewId).catch(() => undefined);
       // A drag into Fixing or Deslop starts the author's agent on that job.
       if (stage === "fixing" || stage === "deslop") void startFixRun(requireReview(reviewId), stage === "deslop" ? "deslop" : "fix", "manual").catch(() => undefined);
+      // A drag into Final check runs a new one at the current head.
+      if (stage === "final_check") void startFinalCheck(requireReview(reviewId), "you moved it to Final check").catch(() => undefined);
       publish(reviewId, "board");
       return summarize(requireReview(reviewId));
     }
@@ -2862,6 +2912,9 @@ export default async function plugin(bb: BbPluginApi) {
     map: promptVersion(mapPrompt),
     babysit: promptVersion(babysitPrompt, babysitIntro),
     sync: promptVersion(syncPrompt, fixerIntro),
+    final_review: promptVersion(finalCheckPrompt, reviewerIntro),
+    final_verify: promptVersion(verifyPrompt, reviewerIntro),
+    final_recheck: promptVersion(recheckPrompt, reviewerIntro),
   };
   /** What each job was asked, kept until it finishes (lost on a reload; the record then has no prompt text). */
   const jobPrompts = new Map<string, { text: string; intro: string; startedAt: number }>();
@@ -3121,6 +3174,7 @@ export default async function plugin(bb: BbPluginApi) {
       babysit: p.babysit_head === row.head_sha ? p.babysit_outcome : null,
       startsAt: pendingStarts.get(row.id) ?? null,
       fix: fixSummary(row),
+      final: finalSummary(row.id),
       error: last?.status === "failed" ? last.error : null,
     };
   }
@@ -3159,6 +3213,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** Stop what the old column was running when you move a card: a round still in AI review, or the author's agent mid-job. */
   async function stopForMove(row: ReviewRow, to: BoardStage): Promise<void> {
+    await stopFinal(row, `stopped: you moved the card to ${BOARD_STAGE_LABEL[to]}`);
     const round = q.lastRound.get(row.id);
     if (to !== "ai_review" && (round?.status === "queued" || round?.status === "running")) {
       q.setRoundStatus.run("failed", `stopped: you moved the card to ${BOARD_STAGE_LABEL[to]}`, Date.now(), row.id, round.round);
@@ -3195,7 +3250,10 @@ export default async function plugin(bb: BbPluginApi) {
       if (githubStage(row) === "babysit" || p.stage === "babysit") await babysitTick(row, p);
       else if (p.stage === "ai_review" && isMine(row) && !force && (await myRoundCatchUp(row))) return;
       else if (p.stage === "ai_review") aiReviewTick(row, p, force);
-      else if (p.stage === "human_review") await humanReviewTick(row, p);
+      else if (p.stage === "final_check") {
+        // A card that reached Final check without a check (a reload mid-move) gets one.
+        if (q.finalCheck.get(row.id) === undefined) await startFinalCheck(row, "moved to Final check");
+      } else if (p.stage === "human_review") await humanReviewTick(row, p);
       else if (p.stage === "changes_requested" && p.head_seen_at !== null && p.head_seen_at > p.entered_at) {
         setStage(row, "human_review", "New commits since your review");
         await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "ready_again", "new commits since your review");
@@ -3282,6 +3340,63 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  /** A reviewer's findings as they post: paths matched to the diff's files, line ranges as GitHub takes them. */
+  function toPosted(files: ChangedFile[], findings: { severity: string; path: string; line: number; endLine?: number | null; title: string; body: string; suggestion?: string | null }[]): PostedFinding[] {
+    return findings.map((f) => {
+      const clean = f.path.trim().replace(/^\.\//, "");
+      const path = files.find((x) => x.path === clean)?.path ?? files.find((x) => x.path.endsWith(`/${clean}`))?.path ?? clean;
+      const end = typeof f.endLine === "number" && f.endLine > f.line ? Math.round(f.endLine) : null;
+      return {
+        severity: f.severity,
+        path,
+        line: end ?? Math.round(f.line),
+        startLine: end === null ? null : Math.round(f.line),
+        title: f.title.trim().slice(0, 200),
+        body: f.body.trim(),
+        suggestion: f.suggestion ?? null,
+      };
+    });
+  }
+
+  /**
+   * Post findings as one COMMENT review: inline where the diff shows their
+   * lines, the rest listed in the body (`body` gets those). GitHub refuses the
+   * whole review when one comment does not anchor; then they all go in the body.
+   */
+  async function submitFindings(row: ReviewRow, baseSha: string, headSha: string, files: ChangedFile[], findings: PostedFinding[], round: number | null, body: (offDiff: PostedFinding[]) => string): Promise<{ url: string | null; inline: PostedFinding[] }> {
+    const wanted = new Set(findings.filter((f) => isHighValue(f.severity)).map((f) => f.path));
+    const shown = await rightLines(row, baseSha, headSha, files.filter((f) => wanted.has(f.path)));
+    const anchors = (f: PostedFinding) => {
+      const lines = shown.get(f.path);
+      if (lines === undefined) return false;
+      for (let l = f.startLine ?? f.line; l <= f.line; l++) if (!lines.has(l)) return false;
+      return true;
+    };
+    let inline = findings.filter((f) => isHighValue(f.severity) && anchors(f));
+    const submit = (onDiff: PostedFinding[]) =>
+      host.call(
+        "gh_submit_review",
+        {
+          owner: row.owner,
+          repo: row.repo,
+          number: row.number,
+          commitId: headSha,
+          event: "COMMENT",
+          body: body(findings.filter((f) => isHighValue(f.severity) && !onDiff.includes(f))),
+          comments: onDiff.map((f) => ({ path: f.path, line: f.line, side: "RIGHT" as const, startLine: f.startLine, body: findingComment(f, round) })),
+        },
+        hostOptions(row),
+      );
+    try {
+      return { url: (await submit(inline)).url, inline };
+    } catch (cause) {
+      if (inline.length === 0) throw cause;
+      bb.log.warn(`${round === null ? "final check" : `round ${round}`} of ${prLabel(row)}: inline comments refused (${errorMessage(cause)}); posting them in the review body`);
+      inline = [];
+      return { url: (await submit(inline)).url, inline };
+    }
+  }
+
   /** Head-side line numbers each file's diff shows (added or context): the lines GitHub accepts an inline comment on. */
   async function rightLines(row: ReviewRow, baseSha: string, headSha: string, files: ChangedFile[]): Promise<Map<string, Set<number>>> {
     const out = new Map<string, Set<number>>();
@@ -3322,59 +3437,22 @@ export default async function plugin(bb: BbPluginApi) {
       const stillOpen = [...open.values()].map((f) => ({ title: f.title, severity: f.severity }));
       // New findings, anchored to the diff this round reviewed.
       const files = (await host.call("git_files", { worktree: row.worktree, baseSha: r.base_sha, headSha: r.head_sha }, hostOptions(row))).files;
-      const findings: PostedFinding[] = reply.findings.map((f) => {
-        const clean = f.path.trim().replace(/^\.\//, "");
-        const path = files.find((x) => x.path === clean)?.path ?? files.find((x) => x.path.endsWith(`/${clean}`))?.path ?? clean;
-        const end = typeof f.endLine === "number" && f.endLine > f.line ? Math.round(f.endLine) : null;
-        return {
-          severity: f.severity,
-          path,
-          line: end ?? Math.round(f.line),
-          startLine: end === null ? null : Math.round(f.line),
-          title: f.title.trim().slice(0, 200),
-          body: f.body.trim(),
-          suggestion: f.suggestion ?? null,
-        };
-      });
-      const wanted = new Set(findings.filter((f) => isHighValue(f.severity)).map((f) => f.path));
-      const shown = await rightLines(row, r.base_sha, r.head_sha, files.filter((f) => wanted.has(f.path)));
-      const anchors = (f: PostedFinding) => {
-        const lines = shown.get(f.path);
-        if (lines === undefined) return false;
-        for (let l = f.startLine ?? f.line; l <= f.line; l++) if (!lines.has(l)) return false;
-        return true;
-      };
-      let inline = findings.filter((f) => isHighValue(f.severity) && anchors(f));
+      const findings = toPosted(files, reply.findings);
       const nits = findings.filter((f) => !isHighValue(f.severity));
       const counts = Object.fromEntries(AI_LABELS.map((l) => [l, 0])) as Record<AiLabel, number>;
       for (const f of findings) counts[f.severity as AiLabel]++;
-      const high = findings.filter((f) => isHighValue(f.severity)).length + stillOpen.length;
+      const newHigh = findings.filter((f) => isHighValue(f.severity)).length;
+      const high = newHigh + stillOpen.length;
       const mine = isMine(row);
-      const handoff = !mine && (round >= maxRounds || high === 0);
-      const submit = (onDiff: PostedFinding[]) =>
-        host.call(
-          "gh_submit_review",
-          {
-            owner: row.owner,
-            repo: row.repo,
-            number: row.number,
-            commitId: r.head_sha,
-            event: "COMMENT",
-            body: reviewBody({ round, maxRounds, summary: reply.summary, counts, resolved, stillOpen, nits, offDiff: findings.filter((f) => isHighValue(f.severity) && !onDiff.includes(f)), handoff, ...(mine ? { next: "The author's agent picks up this feedback next." } : {}) }),
-            comments: onDiff.map((f) => ({ path: f.path, line: f.line, side: "RIGHT" as const, startLine: f.startLine, body: findingComment(f, round) })),
-          },
-          hostOptions(row),
-        );
-      let posted: { url: string | null };
-      try {
-        posted = await submit(inline);
-      } catch (cause) {
-        if (inline.length === 0) throw cause;
-        // GitHub refuses the whole review when one comment does not anchor; put them all in the body instead.
-        bb.log.warn(`round ${round} of ${prLabel(row)}: inline comments refused (${errorMessage(cause)}); posting them in the review body`);
-        inline = [];
-        posted = await submit(inline);
-      }
+      // Someone else's PR leaves AI review once it converges: nothing above a nit open, or a push that changed
+      // nothing (no finding resolved, none new); the round cap is only a safety stop.
+      const stalled = round > 1 && newHigh === 0 && resolved.length === 0;
+      const handoff = !mine && (high === 0 || stalled || round >= maxRounds);
+      const next = mine ? "The author's agent picks up this feedback next." : handoff && finalCheck ? "AI review rounds are done; a final check runs next, then a human reviewer takes it from here." : undefined;
+      const { url: reviewUrl, inline } = await submitFindings(row, r.base_sha, r.head_sha, files, findings, round, (offDiff) =>
+        reviewBody({ round, maxRounds, summary: reply.summary, counts, resolved, stillOpen, nits, offDiff, handoff, ...(next === undefined ? {} : { next }) }),
+      );
+      const posted = { url: reviewUrl };
       for (const f of findings) q.insertFinding.run(newId(), reviewId, round, f.path, f.line, f.startLine, f.severity, f.title, f.body, f.suggestion, inline.includes(f) ? 1 : 0, now);
       q.setRoundPosted.run(reply.summary, high, posted.url, text.slice(0, 200_000), Date.now(), reviewId, round);
       void slackReply(reviewId, roundReply({ round, counts, findings, reviewUrl: posted.url }));
@@ -3386,11 +3464,16 @@ export default async function plugin(bb: BbPluginApi) {
       await resolveFindingThreads(row, r.head_sha).catch((cause: unknown) => bb.log.warn(`resolving threads on ${prLabel(row)}: ${errorMessage(cause)}`));
       // A card you moved out of AI review stays where you put it.
       const stillReviewing = q.pipeline.get(reviewId)?.stage === "ai_review";
-      if (stillReviewing && mine) await afterMyRound(row, round, high);
+      if (stillReviewing && mine) await afterMyRound(row, round, high, newHigh, q.rounds.all(reviewId).filter((x) => x.status === "posted" && x.round < round).at(-1)?.high_value ?? null);
       else if (stillReviewing && handoff) {
-        const why = high === 0 ? `AI round ${round} found nothing above a nit` : `${high} finding${high === 1 ? "" : "s"} above a nit still open after ${round} AI round${round === 1 ? "" : "s"}`;
-        setStage(row, "human_review", why);
-        await letYouKnow(row, q.aiReviewer.get(reviewId)?.thread_id, "ready_for_you", why);
+        const why = high === 0 ? `AI round ${round} found nothing above a nit`
+          : stalled ? `the latest push resolved none of the ${high} open finding${high === 1 ? "" : "s"} and AI round ${round} found nothing new`
+          : `${high} finding${high === 1 ? "" : "s"} above a nit still open after ${round} AI rounds`;
+        if (finalCheck) await startFinalCheck(row, why);
+        else {
+          setStage(row, "human_review", why);
+          await letYouKnow(row, q.aiReviewer.get(reviewId)?.thread_id, "ready_for_you", why);
+        }
       }
     } catch (cause) {
       q.setRoundStatus.run("failed", errorMessage(cause), Date.now(), reviewId, round);
@@ -3581,7 +3664,15 @@ export default async function plugin(bb: BbPluginApi) {
     if (reviewer !== undefined) {
       q.setAiReviewerJob.run(null, reviewer.review_id);
       if (reviewer.job !== null && reviewer.job.startsWith("round:")) void completeRound(reviewer.review_id, Number(reviewer.job.slice("round:".length)), text, error);
+      else if (reviewer.job === "verify") void completeFinalVerify(reviewer.review_id, text, error);
+      else if (reviewer.job === "recheck") void completeFinalRecheck(reviewer.review_id, text, error);
       else pumpRounds();
+      return true;
+    }
+    const checker = q.finalCheckerByThread.get(threadId);
+    if (checker !== undefined) {
+      q.setFinalCheckerJob.run(null, checker.review_id);
+      if (checker.job === "final") void completeFinalReview(checker.review_id, text, error);
       return true;
     }
     const fixer = q.fixerByThread.get(threadId);
@@ -3624,6 +3715,16 @@ export default async function plugin(bb: BbPluginApi) {
       q.setFixerJob.run(null, r.review_id);
       const row = q.review.get(r.review_id);
       if (row !== undefined) await failFixRun(row, r.run, "its thread stopped before it replied (plugin reload?)");
+    }
+    // A final check whose thread stopped without a reply hands the PR to you.
+    for (const fc of q.activeFinalChecks.all()) {
+      const lane = fc.status === "review" ? q.finalChecker.get(fc.review_id) : q.aiReviewer.get(fc.review_id);
+      const job = fc.status === "review" ? "final" : fc.status;
+      if (lane?.job === job && (await working(lane.thread_id))) continue;
+      if (fc.status === "review") q.setFinalCheckerJob.run(null, fc.review_id);
+      else q.setAiReviewerJob.run(null, fc.review_id);
+      const row = q.review.get(fc.review_id);
+      if (row !== undefined) await failFinal(row, fc, "its thread stopped before it replied (plugin reload?)");
     }
     for (const sitter of q.babysittersWithJob.all()) {
       if (await working(sitter.thread_id)) continue;
@@ -3789,6 +3890,8 @@ export default async function plugin(bb: BbPluginApi) {
         ? syncPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseRef: row.base_ref, baseRemote: target.baseRemote, reason: trigger.replace(/^sync:/, "") })
         : kind === "deslop"
         ? deslopPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha })
+        : trigger === "final"
+        ? fixPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha, round: last?.round ?? 0, reviewUrl: q.finalCheck.get(row.id)?.review_url ?? null, source: "the final check" })
         : fixPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha, round: last?.round ?? 0, reviewUrl: trigger === "human" ? null : last?.review_url ?? null });
       noteJobPrompt(`${row.id}:fix:${run}`, prompt, fixerLane.intro(row));
       await laneSend(fixRunLane(kind), row, `fix:${run}`, prompt);
@@ -3862,22 +3965,24 @@ export default async function plugin(bb: BbPluginApi) {
     await syncReview(reviewId).catch((cause: unknown) => bb.log.warn(`sync after the author's agent on ${prLabel(row)}: ${errorMessage(cause)}`));
     const fresh = requireReview(reviewId);
     const asks = reply.items.filter((i) => i.verdict === "ASK").length;
-    // Done: on to Babysit, unless the agent left you questions, which wait in Your review.
-    const toYou = async (why: string) => {
+    // Done: on to the final check (or Babysit), unless the agent left you questions, which wait in Your review.
+    const toYou = async (why: string, final = false) => {
       if (asks > 0) {
         const withAsks = `${why}; ${asks} question${asks === 1 ? "" : "s"} for you`;
         setStage(fresh, "human_review", withAsks);
         await letYouKnow(fresh, q.fixer.get(reviewId)?.thread_id, "needs_you", withAsks);
         return;
       }
+      if (final && finalCheck) return startFinalCheck(fresh, why);
       setStage(fresh, "babysit", `${why}; CI babysitting`);
       await letYouKnow(fresh, q.fixer.get(reviewId)?.thread_id, "ready_for_you", `${why}; moved to Babysit`);
       void advanceFactory(reviewId).catch(() => undefined);
     };
     if (r.kind === "sync") return afterSync(fresh, r, reply, asks);
+    if (r.trigger === "final") return recheckFinal(fresh);
     if (r.kind === "deslop") {
       await postDeslopReport(fresh, run).catch((cause: unknown) => bb.log.warn(`deslop report on ${prLabel(fresh)}: ${errorMessage(cause)}`));
-      return toYou("AI review, fixes, and deslop are done");
+      return toYou("AI review, fixes, and deslop are done", true);
     }
     if (r.trigger === "human") return toYou("the author's agent worked through your comments");
     const posted = q.rounds.all(reviewId).filter((x) => x.status === "posted").length;
@@ -3888,7 +3993,7 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     if (deslopStage) return startFixRun(fresh, "deslop", `after-fix:${run}`);
-    return toYou("AI review and fixes are done");
+    return toYou("AI review and fixes are done", true);
   }
 
   /** A round on your own PR at this head that the author's agent never picked up (posted before it existed, or lost to a reload) is handed over now. */
@@ -3896,7 +4001,7 @@ export default async function plugin(bb: BbPluginApi) {
     const last = q.lastRound.get(row.id);
     if (last === undefined || last.status !== "posted" || last.head_sha !== row.head_sha) return false;
     if (q.fixRuns.all(row.id).some((r) => r.trigger === `round:${last.round}`)) return false;
-    await afterMyRound(row, last.round, last.high_value ?? 0);
+    await afterMyRound(row, last.round, last.high_value ?? 0, last.high_value ?? 0, null);
     return true;
   }
 
@@ -3946,13 +4051,267 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** After a round on your own PR: the author's agent takes the feedback, or, with nothing to fix, deslops. */
-  async function afterMyRound(row: ReviewRow, round: number, high: number): Promise<void> {
-    const openThreads = cachedThreads(row).filter((t) => !t.isResolved).length;
-    if (high > 0 || openThreads > 0) return startFixRun(row, "fix", `round:${round}`);
+  /**
+   * After a round on your own PR, the author's agent works while it can make
+   * progress: the round found something new, or fewer findings are open than
+   * after the round before. Findings it already judged and left open (SKIP,
+   * ASK) would be judged the same way again, so they end the loop; deslop and
+   * the final check come next. People's unresolved threads always go to it.
+   */
+  async function afterMyRound(row: ReviewRow, round: number, high: number, newHigh: number, prevHigh: number | null): Promise<void> {
+    const peoplesThreads = cachedThreads(row).filter((t) => !t.isResolved && !/\((AI review, round \d+|AI final check)\)/.test(t.comments[0]?.body ?? "")).length;
+    const progress = newHigh > 0 || (high > 0 && (prevHigh === null || high < prevHigh));
+    if (progress || peoplesThreads > 0) return startFixRun(row, "fix", `round:${round}`);
+    const why = high === 0 ? `AI round ${round} found nothing above a nit` : `AI round ${round} found nothing new; ${high} finding${high === 1 ? "" : "s"} the author's agent already judged stay open`;
     if (deslopStage) return startFixRun(row, "deslop", `round:${round}`);
-    setStage(row, "babysit", `AI round ${round} found nothing above a nit; CI babysitting`);
-    await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "ready_for_you", `AI round ${round} found nothing above a nit; moved to Babysit`);
+    if (finalCheck) return startFinalCheck(row, why);
+    setStage(row, "babysit", `${why}; CI babysitting`);
+    await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "ready_for_you", `${why}; moved to Babysit`);
     void advanceFactory(row.id).catch(() => undefined);
+  }
+
+  // -- final check --------------------------------------------------------------
+  //
+  // Once the review loop has converged, a reviewer with fresh context (a new
+  // thread on finalCheckModel, nothing from the earlier rounds) reviews the
+  // whole PR. The reviewer thread, which has the PR's full history, then tries
+  // to refute each finding on verifyModel; only what it can show at the head
+  // is posted inline, the refuted ones folded with its evidence. On your PR
+  // the author's agent fixes what held up and the verifier checks each one is
+  // gone; then Babysit. On anyone else's the PR goes to Human review.
+
+  const finalLane: Lane = {
+    ...reviewerLane,
+    title: "final check",
+    model: finalCheckModel,
+    get: (id) => q.finalChecker.get(id),
+    upsert: (id, threadId, providerId, environmentId, createdAt, introHash) => { q.upsertFinalChecker.run(id, threadId, providerId, environmentId, createdAt, introHash); },
+    setJob: (job, id) => { q.setFinalCheckerJob.run(job, id); },
+    remove: (id) => { q.deleteFinalChecker.run(id); },
+  };
+  /** The verifier is the reviewer thread itself (it has every round), on its own model. */
+  const verifierLane: Lane = { ...reviewerLane, model: verifyModel.trim() || reviewerLane.model };
+
+  const finalJob = (fc: FinalCheckRow, step: "review" | "verify" | "recheck") => `${fc.review_id}:final:${fc.started_at}:${step}`;
+  function saveFinal(fc: FinalCheckRow, patch: Partial<FinalCheckRow>): FinalCheckRow {
+    const next = { ...fc, ...patch };
+    q.saveFinalCheck.run(next);
+    publish(fc.review_id, "board");
+    return next;
+  }
+
+  function finalSummary(reviewId: string): NonNullable<ReviewSummary["factory"]>["final"] {
+    const fc = q.finalCheck.get(reviewId);
+    return fc === undefined ? null : { status: fc.status, confirmed: fc.confirmed ?? 0, refuted: fc.refuted ?? 0, unsure: fc.unsure ?? 0, error: fc.error };
+  }
+
+  /** Start (or restart) the final check at the current head. */
+  async function startFinalCheck(row: ReviewRow, reason: string): Promise<void> {
+    setStage(row, "final_check");
+    let fc = saveFinal(
+      { review_id: row.id, base_sha: row.base_sha, head_sha: row.head_sha, status: "review", reason, findings_json: null, verdicts_json: null, summary: null, review_url: null, confirmed: null, refuted: null, unsure: null, error: null, started_at: Date.now(), finished_at: null },
+      {},
+    );
+    try {
+      if (isMine(row)) await ensureBranchWorktree(row);
+      const files = await host.call("git_files", { worktree: row.worktree, baseSha: fc.base_sha, headSha: fc.head_sha }, hostOptions(row));
+      const prompt = finalCheckPrompt({
+        owner: row.owner, repo: row.repo, number: row.number, title: row.title, author: row.author, baseRef: row.base_ref, baseSha: fc.base_sha, headSha: fc.head_sha,
+        changedPaths: files.files.map((f) => f.path), extraSkills: skillsFor(row), empirical: aiReviewEmpirical,
+      });
+      // Fresh context means a new thread every time.
+      const old = q.finalChecker.get(row.id);
+      if (old !== undefined) {
+        q.deleteFinalChecker.run(row.id);
+        await bb.sdk.threads.archive({ threadId: old.thread_id }).catch(() => undefined);
+      }
+      noteJobPrompt(finalJob(fc, "review"), prompt, finalLane.intro(row));
+      await laneSend(finalLane, row, "final", prompt);
+      const threadId = q.finalChecker.get(row.id)?.thread_id;
+      if (threadId !== undefined) await bb.sdk.threads.update({ threadId, title: `#${row.number} · Final check` }).catch(() => undefined);
+    } catch (cause) {
+      fc = q.finalCheck.get(row.id) ?? fc;
+      await failFinal(row, fc, errorMessage(cause));
+    }
+  }
+
+  /** What the verifier knows about the PR's review so far: rounds, findings and their fate, the author's agent's verdicts, open threads. */
+  function finalHistory(row: ReviewRow): string[] {
+    const oneLine = (text: string, n: number) => text.replace(/\s+/g, " ").trim().slice(0, n);
+    const lines: string[] = [];
+    for (const r of q.rounds.all(row.id).filter((x) => x.status === "posted")) lines.push(`Round ${r.round} at ${r.head_sha.slice(0, 10)}: ${oneLine(r.summary ?? "", 400)}`);
+    for (const f of q.findings.all(row.id)) lines.push(`Round ${f.round} finding [${f.severity}] ${f.path}:${f.line} "${oneLine(f.title, 120)}": ${f.status}${f.note ? ` (${oneLine(f.note, 200)})` : ""}`);
+    for (const r of q.fixRuns.all(row.id)) for (const item of toFixRun(r).items) lines.push(`Author's agent, run ${r.run} (${r.kind}): ${item.verdict} ${oneLine(item.reason, 300)}`);
+    for (const t of cachedThreads(row).filter((x) => !x.isResolved).slice(0, 40)) lines.push(`Open thread ${threadLine(t)}`);
+    return lines.slice(0, 200);
+  }
+
+  async function completeFinalReview(reviewId: string, text: string | null, error: string | null): Promise<void> {
+    const row = q.review.get(reviewId);
+    let fc = q.finalCheck.get(reviewId);
+    if (row === undefined || fc === undefined || fc.status !== "review") return;
+    const threadId = q.finalChecker.get(reviewId)?.thread_id ?? null;
+    try {
+      if (error !== null || text === null) throw new Error(error ?? "the final check's reviewer returned nothing");
+      const reply = parseAiReply(text);
+      const files = (await host.call("git_files", { worktree: row.worktree, baseSha: fc.base_sha, headSha: fc.head_sha }, hostOptions(row))).files;
+      // NITs never hold a PR up, so only what could is worth verifying.
+      const candidates: CandidateFinding[] = toPosted(files, reply.findings)
+        .filter((f) => isHighValue(f.severity))
+        .map((f, i) => ({ id: `F${i + 1}`, severity: f.severity, path: f.path, line: f.startLine ?? f.line, endLine: f.startLine === null ? null : f.line, title: f.title, body: f.body, suggestion: f.suggestion }));
+      recordJob({ jobId: finalJob(fc, "review"), stage: "final_review", row, lane: finalLane, threadId, startedAt: fc.started_at, status: "ok", reply: text, result: { findings: reply.findings.length, high: candidates.length } });
+      fc = saveFinal(fc, { findings_json: JSON.stringify(candidates), summary: reply.summary });
+      if (candidates.length === 0) return await postFinal(row, fc, files, candidates, { summary: "", verdicts: new Map() });
+      fc = saveFinal(fc, { status: "verify" });
+      const prompt = verifyPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: fc.base_sha, headSha: fc.head_sha, findings: candidates, history: finalHistory(row) });
+      noteJobPrompt(finalJob(fc, "verify"), prompt, verifierLane.intro(row));
+      await laneSend(verifierLane, row, "verify", prompt);
+    } catch (cause) {
+      recordJob({ jobId: finalJob(fc, "review"), stage: "final_review", row, lane: finalLane, threadId, startedAt: fc.started_at, status: "failed", error: errorMessage(cause), reply: text });
+      await failFinal(row, q.finalCheck.get(reviewId) ?? fc, errorMessage(cause));
+    }
+  }
+
+  async function completeFinalVerify(reviewId: string, text: string | null, error: string | null): Promise<void> {
+    const row = q.review.get(reviewId);
+    const fc = q.finalCheck.get(reviewId);
+    if (row === undefined || fc === undefined || fc.status !== "verify") return;
+    const threadId = q.aiReviewer.get(reviewId)?.thread_id ?? null;
+    try {
+      if (error !== null || text === null) throw new Error(error ?? "the verifier returned nothing");
+      const candidates = parseJson<CandidateFinding[]>(fc.findings_json ?? "[]", []);
+      const verdict = parseVerifyReply(text, candidates.map((c) => c.id));
+      const files = (await host.call("git_files", { worktree: row.worktree, baseSha: fc.base_sha, headSha: fc.head_sha }, hostOptions(row))).files;
+      await postFinal(row, fc, files, candidates, verdict, text);
+    } catch (cause) {
+      recordJob({ jobId: finalJob(fc, "verify"), stage: "final_verify", row, lane: verifierLane, threadId, startedAt: fc.started_at, status: "failed", error: errorMessage(cause), reply: text });
+      await failFinal(row, fc, errorMessage(cause));
+    }
+  }
+
+  /** Post the final check to GitHub: confirmed findings inline, unsettled ones as QUESTIONs, refuted ones folded with the evidence. Then move on. */
+  async function postFinal(row: ReviewRow, fc: FinalCheckRow, files: ChangedFile[], candidates: CandidateFinding[], verdict: ReturnType<typeof parseVerifyReply>, verifyText?: string): Promise<void> {
+    const judged = candidates.map((c) => {
+      const v = verdict.verdicts.get(c.id) ?? { verdict: "UNSURE" as const, label: null, evidence: "" };
+      const severity = v.label ?? c.severity;
+      // A finding the verifier downgrades to a NIT no longer holds the PR up.
+      const outcome = v.verdict === "CONFIRMED" && !isHighValue(severity) ? "REFUTED" : v.verdict;
+      return { ...c, severity: outcome === "UNSURE" ? "QUESTION" : severity, verdict: outcome, evidence: v.evidence };
+    });
+    const posted = judged.filter((j) => j.verdict !== "REFUTED");
+    const confirmed = judged.filter((j) => j.verdict === "CONFIRMED").length;
+    const unsure = judged.filter((j) => j.verdict === "UNSURE").length;
+    const refuted = judged.filter((j) => j.verdict === "REFUTED");
+    const mine = isMine(row);
+    const next = posted.length === 0
+      ? mine ? "Nothing held up; the PR moves to CI babysitting." : "Nothing held up; a human reviewer takes it from here."
+      : mine ? "The author's agent fixes what held up next, and the verifier checks each fix." : "A human reviewer takes it from here.";
+    const findings: PostedFinding[] = posted.map((j) => ({
+      severity: j.severity,
+      path: j.path,
+      line: j.endLine ?? j.line,
+      startLine: j.endLine === null ? null : j.line,
+      title: j.title,
+      body: `${j.body}\n\n_${j.verdict === "CONFIRMED" ? "Verified" : "Not settled"}: ${j.evidence || "no detail given"}_`,
+      suggestion: j.suggestion,
+    }));
+    const { url } = await submitFindings(row, fc.base_sha, fc.head_sha, files, findings, null, (offDiff) =>
+      finalCheckBody({ summary: fc.summary ?? "", verifySummary: verdict.summary, confirmed, unsure, refuted, offDiff, next }),
+    );
+    const done = saveFinal(fc, { verdicts_json: JSON.stringify(judged), review_url: url, confirmed, refuted: refuted.length, unsure });
+    if (verifyText !== undefined) {
+      recordJob({
+        jobId: finalJob(fc, "verify"), stage: "final_verify", row, lane: verifierLane, threadId: q.aiReviewer.get(row.id)?.thread_id ?? null, startedAt: fc.started_at,
+        status: "ok", reply: verifyText, result: { confirmed, refuted: refuted.length, unsure, reviewUrl: url },
+      });
+    }
+    // Scored against the fresh reviewer: how much of what it raised held up.
+    emitOutcome(finalJob(fc, "review"), "final_confirmed", confirmed);
+    emitOutcome(finalJob(fc, "review"), "final_refuted", refuted.length);
+    emitOutcome(finalJob(fc, "review"), "final_unsure", unsure);
+    const tally = `final check: ${confirmed} confirmed, ${refuted.length} refuted${unsure > 0 ? `, ${unsure} unsettled` : ""}`;
+    if (mine && posted.length > 0) {
+      saveFinal(done, { status: "fixing" });
+      return startFixRun(row, "fix", "final");
+    }
+    saveFinal(done, { status: "done", finished_at: Date.now() });
+    if (mine) {
+      setStage(row, "babysit", `${done.reason}; ${tally}; CI babysitting`);
+      await letYouKnow(row, q.finalChecker.get(row.id)?.thread_id, "ready_for_you", `${done.reason}; ${tally}; moved to Babysit`);
+      void advanceFactory(row.id).catch(() => undefined);
+      return;
+    }
+    setStage(row, "human_review", `${done.reason}; ${tally}`);
+    await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "ready_for_you", `${done.reason}; ${tally}`);
+  }
+
+  /** Your PR: the author's agent pushed fixes for what held up; the verifier checks each one is gone. */
+  async function recheckFinal(row: ReviewRow): Promise<void> {
+    const fc = q.finalCheck.get(row.id);
+    if (fc === undefined || fc.status !== "fixing") return;
+    const held = parseJson<(CandidateFinding & { verdict: string })[]>(fc.verdicts_json ?? "[]", []).filter((j) => j.verdict !== "REFUTED");
+    const next = saveFinal(fc, { status: "recheck", head_sha: row.head_sha });
+    setStage(row, "final_check");
+    try {
+      const prompt = recheckPrompt({ owner: row.owner, repo: row.repo, number: row.number, headSha: row.head_sha, findings: held });
+      noteJobPrompt(finalJob(next, "recheck"), prompt, verifierLane.intro(row));
+      await laneSend(verifierLane, row, "recheck", prompt);
+    } catch (cause) {
+      await failFinal(row, next, errorMessage(cause));
+    }
+  }
+
+  async function completeFinalRecheck(reviewId: string, text: string | null, error: string | null): Promise<void> {
+    const row = q.review.get(reviewId);
+    const fc = q.finalCheck.get(reviewId);
+    if (row === undefined || fc === undefined || fc.status !== "recheck") return;
+    const threadId = q.aiReviewer.get(reviewId)?.thread_id ?? null;
+    try {
+      if (error !== null || text === null) throw new Error(error ?? "the verifier returned nothing");
+      const held = parseJson<CandidateFinding[]>(fc.verdicts_json ?? "[]", []).filter((j) => (j as CandidateFinding & { verdict: string }).verdict !== "REFUTED");
+      const verdict = parseVerifyReply(text, held.map((h) => h.id));
+      const still = held.filter((h) => verdict.verdicts.get(h.id)?.verdict !== "REFUTED");
+      recordJob({ jobId: finalJob(fc, "recheck"), stage: "final_recheck", row, lane: verifierLane, threadId, startedAt: fc.started_at, status: "ok", reply: text, result: { checked: held.length, still: still.length } });
+      emitOutcome(finalJob(fc, "recheck"), "still_present", still.length);
+      saveFinal(fc, { status: "done", finished_at: Date.now() });
+      if (still.length > 0) {
+        const why = `final check: ${still.length} confirmed finding${still.length === 1 ? "" : "s"} still present after the author's agent's fixes (${still.map((h) => h.title).join("; ").slice(0, 200)})`;
+        setStage(row, "human_review", why);
+        await letYouKnow(row, q.fixer.get(reviewId)?.thread_id, "needs_you", why);
+        return;
+      }
+      setStage(row, "babysit", `final check: all ${held.length} confirmed finding${held.length === 1 ? "" : "s"} fixed; CI babysitting`);
+      await letYouKnow(row, q.fixer.get(reviewId)?.thread_id, "ready_for_you", `final check: all ${held.length} confirmed finding${held.length === 1 ? "" : "s"} fixed; moved to Babysit`);
+      void advanceFactory(reviewId).catch(() => undefined);
+    } catch (cause) {
+      recordJob({ jobId: finalJob(fc, "recheck"), stage: "final_recheck", row, lane: verifierLane, threadId, startedAt: fc.started_at, status: "failed", error: errorMessage(cause), reply: text });
+      await failFinal(row, fc, errorMessage(cause));
+    }
+  }
+
+  /** A final check that cannot finish hands the PR to you. */
+  async function failFinal(row: ReviewRow, fc: FinalCheckRow, message: string): Promise<void> {
+    saveFinal(fc, { status: "failed", error: message.slice(0, 2_000), finished_at: Date.now() });
+    const why = `the final check stopped: ${message.slice(0, 300)}`;
+    setStage(row, "human_review", why);
+    await letYouKnow(row, q.finalChecker.get(row.id)?.thread_id ?? q.aiReviewer.get(row.id)?.thread_id, "needs_you", why);
+  }
+
+  /** Stop a final check that is working (you moved the card). */
+  async function stopFinal(row: ReviewRow, why: string): Promise<void> {
+    const fc = q.finalCheck.get(row.id);
+    if (fc === undefined || !["review", "verify", "recheck"].includes(fc.status)) return;
+    saveFinal(fc, { status: "failed", error: why, finished_at: Date.now() });
+    const checker = q.finalChecker.get(row.id);
+    if (checker?.job != null) {
+      q.setFinalCheckerJob.run(null, row.id);
+      await bb.sdk.threads.stop({ threadId: checker.thread_id }).catch(() => undefined);
+    }
+    const reviewer = q.aiReviewer.get(row.id);
+    if (reviewer?.job === "verify" || reviewer?.job === "recheck") {
+      q.setAiReviewerJob.run(null, row.id);
+      await bb.sdk.threads.stop({ threadId: reviewer.thread_id }).catch(() => undefined);
+    }
   }
 
   // -- Slack bridge -------------------------------------------------------------

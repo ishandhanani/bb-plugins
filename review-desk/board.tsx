@@ -106,6 +106,15 @@ function FactoryChips({ card }: { card: ReviewSummary }) {
           {f.fix.kind === "deslop" ? "deslop" : f.fix.kind === "sync" ? "merge base" : "fix"} {f.fix.status === "running" ? "running" : f.fix.status === "failed" ? "failed" : `${f.fix.fix} FIX · ${f.fix.skip} SKIP${f.fix.ask > 0 ? ` · ${f.fix.ask} ASK` : ""}`}
         </Chip>
       ) : null}
+      {f.final !== null ? (
+        <Chip
+          icon={["review", "verify", "recheck"].includes(f.final.status) ? "Clock" : f.final.status === "failed" ? "AlertTriangle" : "Check"}
+          tone={f.final.status === "failed" ? "bad" : ["review", "verify", "recheck"].includes(f.final.status) ? "strong" : "muted"}
+          title={f.final.error ?? "Final check: a fresh-context review, then a verifier with the PR's history tries to refute each finding"}
+        >
+          final {f.final.status === "review" ? "reviewing" : f.final.status === "verify" ? "verifying" : f.final.status === "recheck" ? "rechecking fixes" : f.final.status === "failed" ? "failed" : `${f.final.confirmed} confirmed · ${f.final.refuted} refuted`}
+        </Chip>
+      ) : null}
       {f.babysit !== null && f.babysit !== "needs_human" ? <Chip icon="Repeat" title="Last CI babysit pass">babysit: {f.babysit}</Chip> : null}
       {f.needsYou !== null ? <Chip icon="BellDot" tone="bad" title={f.needsYou}><span className="max-w-[180px] truncate">{f.needsYou}</span></Chip> : null}
     </>
@@ -358,6 +367,7 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
     setMoves((m) => ({ ...m, [card.id]: stage ?? card.autoStage ?? "unreviewed" }));
     try {
       await rpc.call("board_move", { reviewId: card.id, stage: stage === card.autoStage ? null : stage });
+      if (stage === "final_check") toast.success(`Final check started on ${card.owner}/${card.repo}#${card.number}: a fresh reviewer, then a verifier`);
       if (stage === "fixing" || stage === "deslop") toast.success(`The author's agent is ${stage === "deslop" ? "deslopping" : "fixing"} ${card.owner}/${card.repo}#${card.number}; its thread is #${card.number} · ${stage === "deslop" ? "Deslop" : "Fixing"}`);
       refetch();
     } catch (cause) {

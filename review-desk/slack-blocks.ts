@@ -42,6 +42,9 @@ export function nowLine(card: ReviewSummary): string {
   if (f?.needsYou) return `needs you: ${f.needsYou}`;
   if (f?.fix?.status === "running") return `${f.fix.kind === "deslop" ? "deslopping" : f.fix.kind === "sync" ? "merging the base" : "fixing"}`;
   if (f?.roundStatus === "running" || f?.roundStatus === "queued") return `AI round ${f.round} ${f.roundStatus}`;
+  if (f?.final?.status === "review") return "final check: fresh-context review";
+  if (f?.final?.status === "verify") return "final check: verifying each finding";
+  if (f?.final?.status === "recheck") return "final check: checking the fixes";
   if (card.mergeable === "CONFLICTING") return "merge conflicts";
   return "";
 }

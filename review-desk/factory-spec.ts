@@ -92,7 +92,7 @@ const OUTPUT_SHAPE = [
   "title: at most 12 words. body: GitHub Markdown written to the PR author: what is wrong, when it triggers, what it costs, and the fix. suggestion: replacement code for exactly those lines, only when the fix is obvious.",
 ].join("\n");
 
-function howToReview(c: RoundContext): string[] {
+function howToReview(c: Pick<RoundContext, "extraSkills" | "empirical">): string[] {
   return [
     "How to review:",
     "- Use the code review skills available to you, both your own and any the repository provides (project skills, CLAUDE.md, AGENTS.md, CONTRIBUTING, review checklists in the tree). Pick the ones that fit this diff and the languages it touches, and follow their finding bar and validation steps.",
@@ -195,12 +195,12 @@ export function parseAiReply(text: string): ParsedAiReply {
 
 export interface PostedFinding { severity: string; path: string; line: number; startLine: number | null; title: string; body: string; suggestion: string | null }
 
-/** The first line of a finding's inline comment; also how the factory finds its own thread later. */
-export function findingHeader(severity: string, title: string, round: number): string {
-  return `**[${severity}] ${title.trim()}** (AI review, round ${round})`;
+/** The first line of a finding's inline comment; also how the factory finds its own thread later. A null round is the final check. */
+export function findingHeader(severity: string, title: string, round: number | null): string {
+  return `**[${severity}] ${title.trim()}** (${round === null ? "AI final check" : `AI review, round ${round}`})`;
 }
 
-export function findingComment(f: PostedFinding, round: number): string {
+export function findingComment(f: PostedFinding, round: number | null): string {
   const parts = [findingHeader(f.severity, f.title, round), f.body.trim()];
   if (f.suggestion !== null && f.suggestion.trim() !== "") parts.push("```suggestion\n" + f.suggestion.replace(/^```\w*\n?|```$/g, "").replace(/\n$/, "") + "\n```");
   return parts.filter((p) => p !== "").join("\n\n");
@@ -341,9 +341,9 @@ const FIX_REPLY_SHAPE = [
   "}",
 ].join("\n");
 
-export function fixPrompt(c: { owner: string; repo: string; number: number; baseSha: string; headSha: string; round: number; reviewUrl: string | null }): string {
+export function fixPrompt(c: { owner: string; repo: string; number: number; baseSha: string; headSha: string; round: number; reviewUrl: string | null; source?: string }): string {
   return [
-    `Job: triage and fix the feedback on ${c.owner}/${c.repo}#${c.number} after AI review round ${c.round}${c.reviewUrl ? ` (${c.reviewUrl})` : ""}. The PR head is ${c.headSha}; the merge base is ${c.baseSha}.`,
+    `Job: triage and fix the feedback on ${c.owner}/${c.repo}#${c.number} after ${c.source ?? `AI review round ${c.round}`}${c.reviewUrl ? ` (${c.reviewUrl})` : ""}. The PR head is ${c.headSha}; the merge base is ${c.baseSha}.`,
     "",
     "1. Pull every review comment fresh, including AI review threads, human reviewers, and bots: unresolved threads and conversation comments since the last push. If the gh-comment-ledger skill is available, use it to build the ledger.",
     "2. Judge each one on the code at the head, not on the comment's confidence:",
@@ -392,4 +392,144 @@ export type FixReply = z.infer<typeof fixReplySchema>;
 export function parseFixReply(text: string): FixReply {
   const reply = fixReplySchema.parse(replyJson(text, FIX_FENCE));
   return { ...reply, items: reply.items.map((i) => ({ ...i, verdict: (FIX_VERDICTS as readonly string[]).includes(i.verdict.toUpperCase()) ? i.verdict.toUpperCase() : "ASK" })) };
+}
+
+// -- final check ------------------------------------------------------------
+//
+// After the review loop converges, a reviewer that has never seen the PR
+// reviews all of it, and a verifier that knows the PR's whole history tries to
+// refute each of its findings. Only what survives reaches the author.
+
+export const VERIFY_FENCE = "ai-verify";
+export const FINAL_CHECK_MARKER = `${FACTORY_MARKER}final-check`;
+export const VERIFY_VERDICTS = ["CONFIRMED", "REFUTED", "UNSURE"] as const;
+export type VerifyVerdict = (typeof VERIFY_VERDICTS)[number];
+
+/** A final-check finding, with the id the verifier answers by. */
+export interface CandidateFinding { id: string; severity: string; path: string; line: number; endLine: number | null; title: string; body: string; suggestion: string | null }
+
+/** The fresh reviewer: the whole PR, first time seen, nothing from earlier rounds. */
+export function finalCheckPrompt(c: { owner: string; repo: string; number: number; title: string; author: string | null; baseRef: string; baseSha: string; headSha: string; changedPaths: string[]; extraSkills: string[]; empirical: boolean }): string {
+  return [
+    `Final check of ${c.owner}/${c.repo}#${c.number} "${c.title}"${c.author ? ` by ${c.author}` : ""}.`,
+    `You are seeing this PR for the first time. Review all of it, not what changed lately. Merge base with ${c.baseRef}: ${c.baseSha}. Head: ${c.headSha}. Full diff: git diff ${c.baseSha} ${c.headSha}.`,
+    `Changed files (${c.changedPaths.length}): ${c.changedPaths.slice(0, 120).join(", ")}${c.changedPaths.length > 120 ? ", ..." : ""}`,
+    `PR description: gh pr view ${c.number} --repo ${c.owner}/${c.repo}. Do not read the PR's review comments or threads: earlier reviews must not shape what you find.`,
+    "",
+    "This is the last automated check before a person reviews the PR. Report every finding that survives validation; there is no cap on how many. A separate verifier will try to refute each one against the code, so give each a concrete trigger, the exact lines, and the consequence.",
+    "",
+    ...howToReview(c),
+    "",
+    OUTPUT_SHAPE,
+  ].join("\n");
+}
+
+const VERIFY_SHAPE = [
+  `Reply with one fenced block tagged ${VERIFY_FENCE}:`,
+  "{",
+  '  "summary": string,   // 1-3 sentences: what held up and what did not',
+  `  "verdicts": [{ "id": string, "verdict": ${VERIFY_VERDICTS.map((v) => `"${v}"`).join("|")}, "label"?: ${AI_LABELS.map((l) => `"${l}"`).join("|")}, "evidence": string }]`,
+  "}",
+  "One verdict per finding, by id.",
+].join("\n");
+
+const candidateLines = (findings: CandidateFinding[]) =>
+  findings.map((f) => `  [${f.id}] ${f.severity} ${f.path}:${f.line}${f.endLine !== null && f.endLine > f.line ? `-${f.endLine}` : ""}: ${f.title}\n      ${f.body.replace(/\s+/g, " ").slice(0, 1200)}`);
+
+/** The verifier: knows the PR's history and tries to refute each fresh finding. */
+export function verifyPrompt(c: { owner: string; repo: string; number: number; baseSha: string; headSha: string; findings: CandidateFinding[]; history: string[] }): string {
+  return [
+    `Adversarial verification of the final check on ${c.owner}/${c.repo}#${c.number} at head ${c.headSha} (merge base ${c.baseSha}).`,
+    "A reviewer with fresh context, who never saw this PR's earlier review rounds, raised the findings below. Your job is to refute each one. You know this PR's history; use it. Default to doubt: a finding stands only when you can show it at this head.",
+    "",
+    "For each finding:",
+    `- Read the code at ${c.headSha} (git show ${c.headSha}:<path>, git diff ${c.baseSha} ${c.headSha}) and follow callers and callees as far as it takes.`,
+    "- CONFIRMED: you showed it is real at this head. evidence: the code path that triggers it, the input or state, and what goes wrong, with file:line. A test or a small script you ran is the strongest evidence; run one when it is cheap.",
+    "- REFUTED: you showed it is wrong, already handled (cite where), already decided in this PR's history (cite the decision), or worth no more than a NIT (say why). Evidence is required here too; \"looks fine\" is not a refutation.",
+    "- UNSURE: neither could be shown. evidence: what would settle it. It reaches the author as a QUESTION.",
+    "- label: set it only to correct the severity.",
+    "Do not raise new findings. Do not modify files, commit, push, or post anything.",
+    "",
+    "This PR's review history (earlier rounds, what happened to their findings, what the author's agent decided):",
+    ...(c.history.length === 0 ? ["  (none)"] : c.history.map((h) => `  ${h}`)),
+    "",
+    "Findings to verify:",
+    ...candidateLines(c.findings),
+    "",
+    VERIFY_SHAPE,
+  ].join("\n");
+}
+
+/** After the author's agent fixed the confirmed findings: is each one gone? */
+export function recheckPrompt(c: { owner: string; repo: string; number: number; headSha: string; findings: CandidateFinding[] }): string {
+  return [
+    `The author's agent pushed fixes for the confirmed final-check findings on ${c.owner}/${c.repo}#${c.number}; the head is now ${c.headSha}. For each finding below, decide whether it is still present at ${c.headSha}.`,
+    "- CONFIRMED: still present; evidence says where.",
+    "- REFUTED: fixed; evidence cites the change.",
+    "- UNSURE: cannot tell; evidence says what would settle it.",
+    "Read the code at the head; do not take the author's word for it. Do not modify files, commit, push, or post anything.",
+    "",
+    "Findings:",
+    ...candidateLines(c.findings),
+    "",
+    VERIFY_SHAPE,
+  ].join("\n");
+}
+
+const verifyReplySchema = z.object({
+  summary: z.string().default(""),
+  verdicts: z.array(z.object({ id: z.string(), verdict: z.string(), label: z.string().nullable().optional(), evidence: z.string().default("") })).default([]),
+});
+
+/** One verdict per finding id; a finding the verifier skipped counts as UNSURE. */
+export function parseVerifyReply(text: string, ids: string[]): { summary: string; verdicts: Map<string, { verdict: VerifyVerdict; label: string | null; evidence: string }> } {
+  const reply = verifyReplySchema.parse(replyJson(text, VERIFY_FENCE));
+  const verdicts = new Map<string, { verdict: VerifyVerdict; label: string | null; evidence: string }>();
+  for (const v of reply.verdicts) {
+    const verdict = v.verdict.trim().toUpperCase();
+    verdicts.set(v.id.trim(), {
+      verdict: (VERIFY_VERDICTS as readonly string[]).includes(verdict) ? (verdict as VerifyVerdict) : "UNSURE",
+      label: v.label ? normalizeLabel(v.label) : null,
+      evidence: v.evidence.trim(),
+    });
+  }
+  for (const id of ids) if (!verdicts.has(id)) verdicts.set(id, { verdict: "UNSURE", label: null, evidence: "The verifier gave no verdict." });
+  return { summary: reply.summary, verdicts };
+}
+
+/** The final check on GitHub: what held up goes inline; what was refuted is listed, folded, with the verifier's evidence. */
+export function finalCheckBody(args: {
+  summary: string;
+  verifySummary: string;
+  confirmed: number;
+  unsure: number;
+  refuted: { severity: string; path: string; line: number; title: string; evidence: string }[];
+  offDiff: PostedFinding[];
+  next: string;
+}): string {
+  const parts = [
+    args.confirmed > 0 ? `${args.confirmed} confirmed` : "nothing confirmed",
+    args.unsure > 0 ? `${args.unsure} unsettled` : null,
+    args.refuted.length > 0 ? `${args.refuted.length} refuted` : null,
+  ].filter((x) => x !== null);
+  const lines = [
+    `<details><summary><b>Final check</b> · ${parts.join(" · ")}</summary>`,
+    "",
+    "_Automated final check: a reviewer that had not seen this PR's earlier rounds reviewed all of it, and a second model with the PR's full history tried to refute each finding. Only findings it could show at this head are inline; unsettled ones are QUESTIONs._",
+    "",
+  ];
+  if (args.summary.trim() !== "") lines.push(args.summary.trim(), "");
+  if (args.verifySummary.trim() !== "") lines.push(`**Verifier:** ${args.verifySummary.trim()}`, "");
+  if (args.offDiff.length > 0) {
+    lines.push("**Findings outside the diff:**");
+    for (const f of args.offDiff) lines.push(`- \`${f.path}:${f.line}\` **[${f.severity}] ${f.title.trim()}**: ${f.body.trim().replace(/\n+/g, " ")}`);
+    lines.push("");
+  }
+  if (args.refuted.length > 0) {
+    lines.push(`<details><summary>Refuted (${args.refuted.length})</summary>`, "");
+    for (const r of args.refuted) lines.push(`- \`${r.path}:${r.line}\` **[${r.severity}] ${r.title.trim()}**: ${r.evidence.replace(/\n+/g, " ")}`);
+    lines.push("", "</details>", "");
+  }
+  lines.push(`_${args.next}_`, "", "</details>", `${FINAL_CHECK_MARKER} -->`);
+  return lines.join("\n");
 }
