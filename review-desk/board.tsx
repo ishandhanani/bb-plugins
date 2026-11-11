@@ -61,17 +61,6 @@ function Chip({ icon, tone = "muted", title, children }: { icon?: IconName; tone
   );
 }
 
-/** What a babysat PR is waiting on, in one chip. */
-function babysitVerdict(card: ReviewSummary): { label: string; tone: ChipTone; icon: IconName } {
-  const { checks } = card;
-  if (card.mergeable === "CONFLICTING") return { label: "Merge conflicts", tone: "bad", icon: "AlertTriangle" };
-  if (checks.failed > 0) return { label: `CI failing (${checks.failed})`, tone: "bad", icon: "CircleX" };
-  if (checks.pending > 0) return { label: `CI running (${checks.pending})`, tone: "strong", icon: "Clock" };
-  if (card.reviewDecision === "REVIEW_REQUIRED") return { label: "Needs a required review", tone: "strong", icon: "UserRound" };
-  if (card.isDraft) return { label: "Still a draft", tone: "strong", icon: "GitPullRequestDraft" };
-  return { label: "Ready to merge", tone: "ok", icon: "CircleCheck" };
-}
-
 /** A newly added PR's countdown to its first job; drag the card before it ends to send it elsewhere. */
 function StartCountdown({ startsAt }: { startsAt: number }) {
   const [now, setNow] = useState(Date.now());
@@ -83,77 +72,26 @@ function StartCountdown({ startsAt }: { startsAt: number }) {
   return <Chip icon="Clock" tone="strong" title="Drag the card to another column before this ends and the factory does that instead">starts in {left}s</Chip>;
 }
 
-/** Where the PR factory is with this card, in at most three chips. */
-function FactoryChips({ card }: { card: ReviewSummary }) {
+const WORKING = ["review", "verify", "recheck"];
+
+/** The one thing worth knowing about a card: what needs you, what is running, or what CI says. Null when nothing does. */
+function cardStatus(card: ReviewSummary, stage: BoardStage): { label: string; tone: ChipTone; icon: IconName; title?: string } | null {
   const f = card.factory;
-  if (f === null) return null;
-  if (f.startsAt !== null) return <StartCountdown startsAt={f.startsAt} />;
-  const round = f.round > 0 ? (
-    f.roundStatus === "running" ? <Chip icon="Clock" tone="strong" title="The AI reviewer is working on this round">AI round {f.round} running</Chip>
-    : f.roundStatus === "queued" ? <Chip icon="Clock" title="Waiting for a free AI reviewer">AI round {f.round} queued</Chip>
-    : f.roundStatus === "failed" ? <Chip icon="AlertTriangle" tone="bad" title={f.error ?? "The round failed"}>AI round {f.round} failed</Chip>
-    : <Chip icon="Brain" tone={f.openFindings > 0 ? "strong" : "ok"} title={`${f.roundsPosted} AI round${f.roundsPosted === 1 ? "" : "s"} posted to GitHub; ${f.openFindings} finding${f.openFindings === 1 ? "" : "s"} above a nit open`}>AI {f.roundsPosted}× · {f.openFindings} open</Chip>
-  ) : null;
-  return (
-    <>
-      {round}
-      {f.fix !== null ? (
-        <Chip
-          icon={f.fix.status === "running" ? "Clock" : f.fix.status === "failed" ? "AlertTriangle" : "EditFile"}
-          tone={f.fix.status === "failed" ? "bad" : f.fix.status === "running" ? "strong" : "muted"}
-          title={`The author's agent, run ${f.fix.run} (${f.fix.kind})`}
-        >
-          {f.fix.kind === "deslop" ? "deslop" : f.fix.kind === "sync" ? "merge base" : "fix"} {f.fix.status === "running" ? "running" : f.fix.status === "failed" ? "failed" : `${f.fix.fix} FIX · ${f.fix.skip} SKIP${f.fix.ask > 0 ? ` · ${f.fix.ask} ASK` : ""}`}
-        </Chip>
-      ) : null}
-      {f.final !== null ? (
-        <Chip
-          icon={["review", "verify", "recheck"].includes(f.final.status) ? "Clock" : f.final.status === "failed" ? "AlertTriangle" : "Check"}
-          tone={f.final.status === "failed" ? "bad" : ["review", "verify", "recheck"].includes(f.final.status) ? "strong" : "muted"}
-          title={f.final.error ?? "Final check: a fresh-context review, then a verifier with the PR's history tries to refute each finding"}
-        >
-          final {f.final.status === "review" ? "reviewing" : f.final.status === "verify" ? "verifying" : f.final.status === "recheck" ? "rechecking fixes" : f.final.status === "failed" ? "failed" : `${f.final.confirmed} confirmed · ${f.final.refuted} refuted`}
-        </Chip>
-      ) : null}
-      {f.babysit !== null && f.babysit !== "needs_human" ? <Chip icon="Repeat" title="Last CI babysit pass">babysit: {f.babysit}</Chip> : null}
-      {f.needsYou !== null ? <Chip icon="BellDot" tone="bad" title={f.needsYou}><span className="max-w-[180px] truncate">{f.needsYou}</span></Chip> : null}
-    </>
-  );
+  if (f?.needsYou) return { label: "Needs you", tone: "bad", icon: "BellDot", title: f.needsYou };
+  if (f?.final && WORKING.includes(f.final.status)) return { label: "Final check", tone: "strong", icon: "Clock" };
+  if (f?.fix?.status === "running") return { label: f.fix.kind === "deslop" ? "Deslopping" : f.fix.kind === "sync" ? "Merging base" : "Fixing", tone: "strong", icon: "Clock" };
+  if (f?.roundStatus === "running" || f?.roundStatus === "queued") return { label: `AI round ${f.round}`, tone: "strong", icon: "Clock" };
+  if (f?.roundStatus === "failed") return { label: "Round failed", tone: "bad", icon: "AlertTriangle", title: f.error ?? undefined };
+  if (card.mergeable === "CONFLICTING") return { label: "Conflicts", tone: "bad", icon: "AlertTriangle" };
+  if (card.checks.failed > 0) return { label: `CI ${card.checks.failed} failing`, tone: "bad", icon: "CircleX", title: card.failingChecks.map((c) => c.name).join("\n") };
+  if (card.checks.pending > 0) return { label: "CI running", tone: "muted", icon: "Clock" };
+  if (stage === "babysit" && card.checks.total > 0 && !card.isDraft) return { label: "Ready to merge", tone: "ok", icon: "CircleCheck" };
+  return null;
 }
 
-/** Checks as a bar, with the failing ones named. */
-function CiBar({ card }: { card: ReviewSummary }) {
-  const { checks } = card;
-  if (checks.total === 0) return <p className="text-[11px] text-muted-foreground">No checks reported yet</p>;
-  const tone = checks.failed > 0 ? "bg-destructive" : checks.pending > 0 ? "bg-foreground/40" : "bg-primary";
-  return (
-    <div className="space-y-1">
-      <div className="h-1.5 overflow-hidden rounded-full bg-foreground/10" title={`${checks.passed} passed, ${checks.failed} failing, ${checks.pending} running`}>
-        <div className={cn("h-full rounded-full transition-all", tone)} style={{ width: `${Math.round((checks.passed / checks.total) * 100)}%` }} />
-      </div>
-      {card.failingChecks.length > 0 ? (
-        <ul className="space-y-0.5">
-          {card.failingChecks.map((c, i) => (
-            <li key={`${i}-${c.name}`} className="flex items-center gap-1 truncate text-[11px] text-destructive">
-              <Icon name="CircleX" className="size-3 shrink-0" />
-              {c.url ? <UrlLink href={c.url} className="min-w-0 truncate hover:underline">{c.name}</UrlLink> : <span className="min-w-0 truncate">{c.name}</span>}
-            </li>
-          ))}
-          {checks.failed > card.failingChecks.length ? <li className="text-[11px] text-muted-foreground">and {checks.failed - card.failingChecks.length} more</li> : null}
-        </ul>
-      ) : null}
-    </div>
-  );
-}
-
-function PrCard({ card, stage, onOpen, onUnpin, onRemove, onReview }: { card: ReviewSummary; stage: BoardStage; onOpen: () => void; onUnpin: () => void; onRemove: () => void; onReview: () => void }) {
+function PrCard({ card, stage, onOpen, onRemove }: { card: ReviewSummary; stage: BoardStage; onOpen: () => void; onRemove: () => void }) {
   const [confirm, setConfirm] = useState(false);
-  const { checks } = card;
-  const babysit = stage === "babysit";
-  const verdict = babysit ? babysitVerdict(card) : null;
-  const checksTone: ChipTone = checks.failed > 0 ? "bad" : checks.pending > 0 ? "strong" : "ok";
-  const checksIcon: IconName = checks.failed > 0 ? "CircleX" : checks.pending > 0 ? "Clock" : "CircleCheck";
-  const prIcon: IconName = card.isDraft ? "GitPullRequestDraft" : "GitPullRequest";
+  const status = cardStatus(card, stage);
   const onDragStart = (e: DragEvent<HTMLDivElement>) => {
     e.dataTransfer.setData("text/plain", card.id);
     e.dataTransfer.effectAllowed = "move";
@@ -167,65 +105,28 @@ function PrCard({ card, stage, onOpen, onUnpin, onRemove, onReview }: { card: Re
       onClick={onOpen}
       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); } }}
       data-review-id={card.id}
-      className={cn(
-        "group relative cursor-pointer rounded-lg border bg-card p-3 text-left shadow-sm transition-colors hover:bg-state-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-        verdict?.tone === "ok" ? "border-primary/50" : verdict?.tone === "bad" ? "border-destructive/50" : "border-border",
-      )}
+      title={card.title}
+      className="group relative cursor-pointer rounded-md border border-border bg-card px-2.5 py-2 text-left shadow-sm transition-colors hover:bg-state-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
-      <div className="flex items-start gap-2">
-        <Icon name={prIcon} className={cn("mt-0.5 size-4 shrink-0", card.isDraft ? "text-muted-foreground" : "text-primary")} />
-        <span className="min-w-0 flex-1 overflow-hidden text-sm font-medium leading-5 [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]">{card.title}</span>
-        {stage !== "babysit" && card.factory?.roundStatus !== "running" && card.factory?.roundStatus !== "queued" ? (
-          <button
-            type="button"
-            aria-label="Run the next AI review round now"
-            title={card.factory === null ? "Start AI review" : "Run the next AI review round now"}
-            onClick={(e) => { e.stopPropagation(); onReview(); }}
-            className="-mt-1.5 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-state-hover hover:text-foreground focus:opacity-100 group-hover:opacity-100"
-          >
-            <Icon name="Brain" className="size-3.5" />
-          </button>
-        ) : null}
+      <div className="flex items-center gap-1.5">
+        <span className="min-w-0 flex-1 truncate text-sm font-medium">{card.title}</span>
         <button
           type="button"
           aria-label="Remove from the board"
           title="Remove from the board"
           onClick={(e) => { e.stopPropagation(); setConfirm(true); }}
-          className="-mr-1.5 -mt-1.5 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-state-hover hover:text-foreground focus:opacity-100 group-hover:opacity-100"
+          className="-mr-1 shrink-0 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:bg-state-hover hover:text-foreground focus:opacity-100 group-hover:opacity-100"
         >
           <Icon name="X" className="size-3.5" />
         </button>
       </div>
-      <div className="mt-1 truncate text-xs text-muted-foreground">
-        {card.owner}/{card.repo} #{card.number}{card.author ? ` · ${card.author}` : ""} · {timeAgo(cardTime(card))}
+      <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate">#{card.number} · {card.repo}{card.isDraft ? " · draft" : ""} · {timeAgo(cardTime(card))}</span>
+        {card.factory?.startsAt != null ? <StartCountdown startsAt={card.factory.startsAt} /> : status ? <Chip icon={status.icon} tone={status.tone} title={status.title}>{status.label}</Chip> : null}
       </div>
-      {babysit ? <div className="mt-2"><CiBar card={card} /></div> : null}
-      <div className="mt-2 flex flex-wrap items-center gap-1">
-        {verdict ? <Chip icon={verdict.icon} tone={verdict.tone}>{verdict.label}</Chip> : null}
-        <FactoryChips card={card} />
-        {!babysit && card.isDraft ? <Chip>Draft</Chip> : null}
-        {!babysit && checks.total > 0 ? <Chip icon={checksIcon} tone={checksTone} title={`Checks: ${checks.passed} passed, ${checks.failed} failing, ${checks.pending} running`}>{checks.passed}/{checks.total}</Chip> : null}
-        {card.unresolvedThreads > 0 ? <Chip icon="MessageSquare" tone="strong" title="Unresolved review threads">{card.unresolvedThreads}</Chip> : null}
-        {card.approvals > 0 ? <Chip icon="Check" tone="ok" title="Approvals">{card.approvals}</Chip> : null}
-        {card.changesRequested > 0 ? <Chip icon="CircleX" tone="bad" title="Reviewers asking for changes">{card.changesRequested}</Chip> : null}
-        {!babysit && card.mergeable === "CONFLICTING" ? <Chip icon="AlertTriangle" tone="bad" title="Merge conflicts with the base branch">conflicts</Chip> : null}
-        {card.pendingCount > 0 ? <Chip title="Your comments not yet submitted to GitHub">{card.pendingCount} pending</Chip> : null}
-        {babysit && card.lastCommitAt !== null ? <Chip icon="GitBranch" title={`Last commit ${card.lastCommitAt}`}>pushed {timeAgo(card.lastCommitAt)}</Chip> : null}
-        <span className="ml-auto text-[11px] tabular-nums text-muted-foreground"><span className="text-primary">+{card.additions}</span> <span className="text-destructive">−{card.deletions}</span></span>
-      </div>
-      {card.pinned && card.autoStage !== null ? (
-        <button
-          type="button"
-          onClick={(e) => { e.stopPropagation(); onUnpin(); }}
-          title={`You dragged this card here. It would be in ${BOARD_STAGE_LABEL[card.autoStage]}; click to put it back.`}
-          className="mt-2 inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
-        >
-          <Icon name="Pin" className="size-3" />Dragged here · would be in {BOARD_STAGE_LABEL[card.autoStage]}
-        </button>
-      ) : null}
       {confirm ? (
         <div className="mt-2 flex items-center gap-2 rounded-md border border-destructive/40 bg-background px-2 py-1 text-xs" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
-          <span className="min-w-0 flex-1">Remove from the board? Your notes and pending comments on it go too.</span>
+          <span className="min-w-0 flex-1">Remove from the board?</span>
           <Button variant="destructive" size="sm" className="h-6 px-2 text-xs" onClick={() => { setConfirm(false); onRemove(); }}>Remove</Button>
           <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => setConfirm(false)}>Keep</Button>
         </div>
@@ -376,16 +277,6 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
     }
   };
 
-  const review = async (card: ReviewSummary) => {
-    try {
-      await rpc.call("factory_start", { reviewId: card.id });
-      toast.success(`AI review queued for ${card.owner}/${card.repo}#${card.number}`);
-      refetch();
-    } catch (cause) {
-      toast.error(describeError(cause));
-    }
-  };
-
   const remove = async (card: ReviewSummary, quiet = false) => {
     try {
       await rpc.call("reviews_remove", { reviewId: card.id });
@@ -461,7 +352,7 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
                           }}
                         >
                           {cards[stage].map((card) => (
-                            <PrCard key={card.id} card={card} stage={stage} onOpen={() => onOpen(card.id)} onUnpin={() => void move(card, null)} onRemove={() => void remove(card)} onReview={() => void review(card)} />
+                            <PrCard key={card.id} card={card} stage={stage} onOpen={() => onOpen(card.id)} onRemove={() => void remove(card)} />
                           ))}
                         </BoardColumn>
                       );

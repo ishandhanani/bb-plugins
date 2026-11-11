@@ -702,6 +702,8 @@ const MIGRATIONS = [
    )`,
   // Checks the babysitter judged expected at a head (opt-in gates, summary jobs): {"head": sha, "names": [...]}.
   `ALTER TABLE pipeline ADD COLUMN babysit_expected TEXT`,
+  // The thread the factory last surfaced to you; it stays in the sidebar while the PR waits on you.
+  `ALTER TABLE pipeline ADD COLUMN surfaced_thread TEXT`,
 ];
 
 interface ReviewRow {
@@ -734,6 +736,7 @@ interface PipelineRow {
   review_id: string; stage: string; entered_at: number; head_seen_at: number | null; needs_you: string | null;
   babysit_head: string | null; babysit_key: string | null; babysit_passes: number; babysit_outcome: string | null; updated_at: number;
   babysit_expected: string | null;
+  surfaced_thread: string | null;
 }
 interface RoundRow {
   review_id: string; round: number; base_sha: string; head_sha: string; status: string; summary: string | null; high_value: number | null;
@@ -891,6 +894,7 @@ function createStore(db: Database.Database) {
     setHeadSeen: db.prepare<[number, string]>(`UPDATE pipeline SET head_seen_at = ? WHERE review_id = ?`),
     setNeedsYou: db.prepare<[string | null, number, string]>(`UPDATE pipeline SET needs_you = ?, updated_at = ? WHERE review_id = ?`),
     setBabysitExpected: db.prepare<[string, string]>(`UPDATE pipeline SET babysit_expected = ? WHERE review_id = ?`),
+    setSurfaced: db.prepare<[string, string]>(`UPDATE pipeline SET surfaced_thread = ? WHERE review_id = ?`),
     setBabysit: db.prepare<[string | null, string | null, number, string | null, number, string]>(
       `UPDATE pipeline SET babysit_head = ?, babysit_key = ?, babysit_passes = ?, babysit_outcome = ?, updated_at = ? WHERE review_id = ?`,
     ),
@@ -1159,7 +1163,10 @@ export default async function plugin(bb: BbPluginApi) {
   const publish = (reviewId: string, what: string) => {
     bb.realtime.publish(REVIEW_CHANGED, { reviewId, what });
     // The PR's Slack card and the board follow every change (debounced; no-op without Slack).
-    if (what !== "simple" && what !== "viewed" && what !== "map") slackDirty(reviewId);
+    if (what !== "simple" && what !== "viewed" && what !== "map") {
+      slackDirty(reviewId);
+      tidySoon(reviewId);
+    }
   };
 
   function requireReview(reviewId: string): ReviewRow {
@@ -2147,8 +2154,10 @@ export default async function plugin(bb: BbPluginApi) {
         const thread = await bb.sdk.threads.get({ threadId: existing.thread_id });
         const sameIntro = !lane.replaceOnIntroChange || existing.intro_hash === introHash;
         // A thread from before the shared environment moves there on its next job.
+        // A thread from the old shared per-repository environment moves to the PR's own worktree.
+        const inGroup = ownWorkspace !== null && ownEnvironment === null && existing.environment_id !== null && existing.environment_id === (await sharedWorkspace(row, projectId)).environmentId;
         const sameEnvironment = ownWorkspace !== null
-          ? ownEnvironment === null || existing.environment_id === ownEnvironment
+          ? ownEnvironment === null ? !inGroup : existing.environment_id === ownEnvironment
           : shared === null || shared.environmentId === null || existing.environment_id === shared.environmentId;
         const reusable = existing.provider_id === wantedProvider && sameIntro && sameEnvironment;
         // A visible thread being replaced is archived, so it does not linger in the sidebar.
@@ -3074,12 +3083,14 @@ export default async function plugin(bb: BbPluginApi) {
       return skill && (scope === null || scope.toLowerCase() === `${row.owner}/${row.repo}`.toLowerCase()) ? [skill] : [];
     });
 
+  /** Every thread of a PR works in one worktree (on your PR the branch's; on others' the review worktree), so they fold into one folder. */
+  const prWorkspace = (row: ReviewRow) => (isMine(row) ? fixerTargets.get(row.id)?.worktree ?? null : row.worktree);
   const reviewerLane: Lane = {
     title: "AI review",
     intro: reviewerIntro,
     shared: true,
     // On your own PR every thread works in the branch's worktree, so they fold into one folder per PR.
-    workspace: (row) => (isMine(row) ? fixerTargets.get(row.id)?.worktree ?? null : null),
+    workspace: prWorkspace,
     // bb folds two or more visible threads, so on your own PR this one shows from the start.
     visible: (row) => isMine(row),
     providerId: aiReviewProvider.trim(),
@@ -3094,7 +3105,7 @@ export default async function plugin(bb: BbPluginApi) {
     title: "CI babysit",
     intro: babysitIntro,
     shared: true,
-    workspace: (row) => (isMine(row) ? fixerTargets.get(row.id)?.worktree ?? null : null),
+    workspace: prWorkspace,
     visible: (row) => isMine(row),
     providerId: babysitProvider.trim(),
     model: babysitModel,
@@ -3122,6 +3133,7 @@ export default async function plugin(bb: BbPluginApi) {
     await ping(row, event, why);
     void slackReply(row.id, handoffReply(EVENT_HEADLINE[event], why, sc.me || null));
     if (threadId === undefined) return;
+    q.setSurfaced.run(threadId, row.id);
     try {
       await bb.sdk.threads.update({ threadId, visibility: "visible", title: `#${row.number} · ${EVENT_HEADLINE[event]}`, ...((await sectionId()) === null ? {} : { sectionId: await sectionId() }) });
       await bb.sdk.threads.markUnread({ threadId });
@@ -4128,6 +4140,44 @@ export default async function plugin(bb: BbPluginApi) {
     await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "ready_for_you", `${why}; moved to Babysit`);
     void advanceFactory(row.id).catch(() => undefined);
   }
+
+  // -- the sidebar: one folder per PR -------------------------------------------
+  //
+  // A PR's threads share its worktree, so bb folds them into one folder per
+  // PR inside the project. The folder shows the `#N · PR` thread, the factory
+  // threads that are working, and the one waiting on you; the rest are hidden,
+  // not archived, because their lanes reuse them and they keep their context.
+
+  const tidyTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  function tidySoon(reviewId: string): void {
+    if (tidyTimers.has(reviewId)) return;
+    tidyTimers.set(reviewId, setTimeout(() => {
+      tidyTimers.delete(reviewId);
+      void tidyThreads(reviewId).catch((cause: unknown) => bb.log.warn(`tidying ${reviewId}'s threads: ${errorMessage(cause)}`));
+    }, 2_000));
+  }
+
+  async function tidyThreads(reviewId: string): Promise<void> {
+    const row = q.review.get(reviewId);
+    const p = q.pipeline.get(reviewId);
+    if (row === undefined || p === undefined) return;
+    const waiting = row.state === "OPEN" && (p.needs_you !== null || p.stage === "human_review");
+    const lanes = [q.aiReviewer.get(reviewId), q.fixer.get(reviewId), q.babysitter.get(reviewId), q.finalChecker.get(reviewId)];
+    for (const h of lanes) {
+      if (h === undefined) continue;
+      const want = h.job !== null || (waiting && p.surfaced_thread === h.thread_id) ? "visible" : "hidden";
+      const thread = await bb.sdk.threads.get({ threadId: h.thread_id }).catch(() => null);
+      if (thread === null || thread.archivedAt !== null || thread.deletedAt !== null || thread.visibility === want) continue;
+      await bb.sdk.threads.update({ threadId: h.thread_id, visibility: want }).catch(() => undefined);
+    }
+    // The folder's own thread, so every PR in the factory has one row to open.
+    const worktree = prWorkspace(row);
+    const environmentId = worktree === null ? undefined : q.sharedEnv.get(`path:${worktree}`)?.environment_id;
+    if (row.state === "OPEN" && worktree !== null && environmentId !== undefined) await ensurePrAnchor(row, environmentId, worktree);
+  }
+
+  // Once after a load: every PR in the factory gets tidied.
+  setTimeout(() => { for (const r of q.reviews.all()) if (q.pipeline.get(r.id) !== undefined) tidySoon(r.id); }, 15_000);
 
   // -- final check --------------------------------------------------------------
   //
