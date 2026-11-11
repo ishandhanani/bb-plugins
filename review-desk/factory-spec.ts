@@ -259,7 +259,7 @@ export function deslopReportBody(args: { run: number; summary: string; items: { 
 
 // -- babysitter -------------------------------------------------------------
 
-export const BABYSIT_OUTCOMES = ["rerun", "merge_base", "waiting", "needs_human", "ok"] as const;
+export const BABYSIT_OUTCOMES = ["rerun", "merge_base", "fix", "waiting", "needs_human", "ok"] as const;
 export type BabysitOutcome = (typeof BABYSIT_OUTCOMES)[number];
 
 export function babysitIntro(c: { owner: string; repo: string; number: number; title: string; worktree: string }): string {
@@ -267,11 +267,11 @@ export function babysitIntro(c: { owner: string; repo: string; number: number; t
     `You babysit CI for pull request #${c.number} of ${c.owner}/${c.repo}: "${c.title}" until it merges. Each message is one pass. Answer each pass with exactly one fenced block tagged ${BABYSIT_FENCE} containing JSON, and nothing after it.`,
     worktreeLine(c.worktree),
     "Hard rules: never edit files, never commit, never push, never merge, never close, never comment on the PR or its threads. The only GitHub write you may make is re-running failed jobs (gh run rerun <run-id> --failed). Review Desk posts what you did on the PR.",
-    "Anything that needs a code change or a decision goes back to the human: report needs_human and stop.",
+    "You never change code yourself. On the author's own PR a failure its code causes goes to the author's agent (outcome fix); anything else that needs a code change or a decision goes back to the human: report needs_human and stop.",
   ].join("\n");
 }
 
-export function babysitPrompt(c: { owner: string; repo: string; number: number; headSha: string; baseRef: string; pass: number; maxPasses: number; failing: { name: string; url: string | null }[]; conflicting: boolean; canMergeBase: boolean }): string {
+export function babysitPrompt(c: { owner: string; repo: string; number: number; headSha: string; baseRef: string; pass: number; maxPasses: number; failing: { name: string; url: string | null }[]; conflicting: boolean; canMergeBase: boolean; canFix: boolean }): string {
   return [
     `Pass ${c.pass} of at most ${c.maxPasses} at head ${c.headSha} of ${c.owner}/${c.repo}#${c.number}.`,
     c.conflicting ? "GitHub reports merge conflicts with the base branch." : "",
@@ -284,18 +284,22 @@ export function babysitPrompt(c: { owner: string; repo: string; number: number; 
       ? `- A failure the branch would not have with the latest ${c.baseRef}: a fix that has landed on ${c.baseRef} since the merge base (check git log <merge-base>..origin/${c.baseRef} for it), or a test that only fails against an old base. Answer merge_base; the author's agent merges ${c.baseRef} into the branch and pushes. Do not merge yourself. Only when ${c.baseRef} actually has what fixes it: merging a base with the same failure does not help.`
       : "",
     c.canMergeBase ? `- Merge conflicts with ${c.baseRef}, failing checks or not: merge_base; the author's agent merges ${c.baseRef} in and resolves them. A conflict is never a reason for needs_human here.` : "",
-    "- A failure the PR causes, or one nothing above fixes: needs_human, saying what is wrong and what would fix it.",
+    c.canFix
+      ? "- A failure the PR's own code causes (a test it breaks, a type, build, or lint error in what it changed): fix. The author's agent fixes it on the branch and pushes. In detail name the check, the failing test or error, and the cause you found, with file:line; list the failing job URLs in jobs."
+      : "",
+    "- A check that only gates opt-in workflows (it fails because the PR lacks the label or approval that turns them on), or a summary job that fails only because another listed check failed: list its exact name in expected. Expected checks are not treated as failing at this head. When every failure is expected, answer ok.",
+    `- ${c.canFix ? "A failure nothing above fixes" : "A failure the PR causes, or one nothing above fixes"}: needs_human, saying what is wrong and what would fix it.`,
     "",
     `Reply with one fenced block tagged ${BABYSIT_FENCE}:`,
-    `{ "outcome": "rerun"${c.canMergeBase ? ' | "merge_base"' : ""} | "waiting" | "needs_human" | "ok", "detail": string, "jobs": string[] }`,
-    "rerun: you re-ran failed jobs; list them in jobs. waiting: checks are still running and nothing needs doing. ok: nothing is failing. needs_human: as above.",
+    `{ "outcome": "rerun"${c.canMergeBase ? ' | "merge_base"' : ""}${c.canFix ? ' | "fix"' : ""} | "waiting" | "needs_human" | "ok", "detail": string, "jobs": string[], "expected": string[] }`,
+    "rerun: you re-ran failed jobs; list them in jobs. waiting: checks are still running and nothing needs doing. ok: nothing is failing, or only expected checks are. needs_human: as above.",
     "detail: one or two sentences: which check, why it failed, and why your choice will fix it (or what the human must do).",
   ].filter((l) => l !== "").join("\n");
 }
 
-const babysitReplySchema = z.object({ outcome: z.enum(BABYSIT_OUTCOMES), detail: z.string().default(""), jobs: z.array(z.string()).default([]) });
+const babysitReplySchema = z.object({ outcome: z.enum(BABYSIT_OUTCOMES), detail: z.string().default(""), jobs: z.array(z.string()).default([]), expected: z.array(z.string()).default([]) });
 
-export function parseBabysitReply(text: string): { outcome: BabysitOutcome; detail: string; jobs: string[] } {
+export function parseBabysitReply(text: string): { outcome: BabysitOutcome; detail: string; jobs: string[]; expected: string[] } {
   return babysitReplySchema.parse(replyJson(text, BABYSIT_FENCE));
 }
 
@@ -365,6 +369,23 @@ export function deslopPrompt(c: { owner: string; repo: string; number: number; b
     "If nothing is worth removing, change nothing and say so.",
     "",
     `Reply with one fenced block tagged ${FIX_FENCE}: { "summary": string, "items": [{ "url": "", "author": "deslop", "verdict": "FIX", "reason": string, "commit": string }], "pushed": boolean, "head": string }, one item per cleanup commit.`,
+  ].join("\n");
+}
+
+/** Your own PR: CI fails because of the PR's code, as the babysitter diagnosed it. */
+export function ciFixPrompt(c: { owner: string; repo: string; number: number; headSha: string; baseSha: string; diagnosis: string; failing: { name: string; url: string | null }[] }): string {
+  return [
+    `Job: CI on ${c.owner}/${c.repo}#${c.number} fails at head ${c.headSha} (merge base ${c.baseSha}) because of the PR's own code. The CI babysitter's diagnosis: ${c.diagnosis}`,
+    "Failing checks:",
+    ...c.failing.map((f) => `  ${f.name}${f.url ? ` ${f.url}` : ""}`),
+    "",
+    "1. Read the failing jobs' logs (gh run view <run-id> --log-failed, or the job URL) and confirm the cause; the diagnosis may be wrong.",
+    "2. Reproduce it with the narrowest local command: the one test file, the type check, the linter. Do not run GPU or load tests; when only a GPU run reproduces it, fix from the log and say so.",
+    "3. Fix the cause with the smallest change: the PR's code, or the test when the test is what is wrong. One commit per cause. Leave failures the PR does not cause alone.",
+    "4. Re-run the narrow command until it passes, then push once.",
+    "Report one item per failing check: FIX (with the commit), SKIP (not the PR's to fix; say why), or ASK.",
+    "",
+    FIX_REPLY_SHAPE,
   ].join("\n");
 }
 

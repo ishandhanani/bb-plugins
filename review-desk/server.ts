@@ -18,6 +18,7 @@ import { agentReply, babysitReply, fixRunReply, handoffReply, prCard, roundReply
 import { runSocketMode, slackApi, SlackApiError, type SlackEnvelope } from "./slack-client";
 import {
   FACTORY_MARKER,
+  ciFixPrompt,
   finalCheckBody,
   finalCheckPrompt,
   parseVerifyReply,
@@ -699,6 +700,8 @@ const MIGRATIONS = [
      started_at INTEGER NOT NULL,
      finished_at INTEGER
    )`,
+  // Checks the babysitter judged expected at a head (opt-in gates, summary jobs): {"head": sha, "names": [...]}.
+  `ALTER TABLE pipeline ADD COLUMN babysit_expected TEXT`,
 ];
 
 interface ReviewRow {
@@ -730,6 +733,7 @@ interface FixRunRow {
 interface PipelineRow {
   review_id: string; stage: string; entered_at: number; head_seen_at: number | null; needs_you: string | null;
   babysit_head: string | null; babysit_key: string | null; babysit_passes: number; babysit_outcome: string | null; updated_at: number;
+  babysit_expected: string | null;
 }
 interface RoundRow {
   review_id: string; round: number; base_sha: string; head_sha: string; status: string; summary: string | null; high_value: number | null;
@@ -886,6 +890,7 @@ function createStore(db: Database.Database) {
     ),
     setHeadSeen: db.prepare<[number, string]>(`UPDATE pipeline SET head_seen_at = ? WHERE review_id = ?`),
     setNeedsYou: db.prepare<[string | null, number, string]>(`UPDATE pipeline SET needs_you = ?, updated_at = ? WHERE review_id = ?`),
+    setBabysitExpected: db.prepare<[string, string]>(`UPDATE pipeline SET babysit_expected = ? WHERE review_id = ?`),
     setBabysit: db.prepare<[string | null, string | null, number, string | null, number, string]>(
       `UPDATE pipeline SET babysit_head = ?, babysit_key = ?, babysit_passes = ?, babysit_outcome = ?, updated_at = ? WHERE review_id = ?`,
     ),
@@ -2912,6 +2917,7 @@ export default async function plugin(bb: BbPluginApi) {
     map: promptVersion(mapPrompt),
     babysit: promptVersion(babysitPrompt, babysitIntro),
     sync: promptVersion(syncPrompt, fixerIntro),
+    ci_fix: promptVersion(ciFixPrompt, fixerIntro),
     final_review: promptVersion(finalCheckPrompt, reviewerIntro),
     final_verify: promptVersion(verifyPrompt, reviewerIntro),
     final_recheck: promptVersion(recheckPrompt, reviewerIntro),
@@ -3584,7 +3590,11 @@ export default async function plugin(bb: BbPluginApi) {
     const passes = fresh ? 0 : p.babysit_passes;
     const outcome = fresh ? null : p.babysit_outcome;
     const now = Date.now();
-    if (!conflicting && card.checks.failed === 0) {
+    // Checks the babysitter judged expected at this head (opt-in gates) do not count as failing.
+    const expected = parseJson<{ head: string; names: string[] } | null>(p.babysit_expected ?? "null", null);
+    const skip = new Set(expected !== null && expected.head === row.head_sha ? expected.names : []);
+    const failing = card.failingChecks.filter((c) => !skip.has(c.name));
+    if (!conflicting && failing.length === 0) {
       // Nothing failing: forget the last failure, so the same check failing again after a re-run gets a pass.
       if (fresh || p.babysit_key !== null) q.setBabysit.run(row.head_sha, null, passes, outcome, now, row.id);
       if (p.needs_you !== null) q.setNeedsYou.run(null, now, row.id);
@@ -3600,11 +3610,13 @@ export default async function plugin(bb: BbPluginApi) {
         return;
       }
     }
-    if (outcome === "needs_human" || (q.babysitter.get(row.id)?.job ?? null) !== null) return;
-    const key = `${conflicting ? "conflict|" : ""}${card.failingChecks.map((c) => c.name).sort().join("|")}#${card.checks.failed}`;
+    if ((q.babysitter.get(row.id)?.job ?? null) !== null) return;
+    // One pass per set of failures at a head: a new failure gets a fresh look, even after one went to you.
+    const key = `${conflicting ? "conflict|" : ""}${failing.map((c) => c.name).sort().join("|")}#${failing.length}`;
     if (!fresh && key === p.babysit_key) return;
+    if (outcome === "needs_human") q.setNeedsYou.run(null, now, row.id);
     if (passes >= maxPasses) {
-      const why = `CI still failing after ${passes} babysit passes: ${card.failingChecks.map((c) => c.name).join(", ")}`;
+      const why = `CI still failing after ${passes} babysit passes: ${failing.map((c) => c.name).join(", ")}`;
       q.setBabysit.run(row.head_sha, key, passes, "needs_human", now, row.id);
       q.setNeedsYou.run(why, now, row.id);
       publish(row.id, "board");
@@ -3615,7 +3627,7 @@ export default async function plugin(bb: BbPluginApi) {
     publish(row.id, "board");
     try {
       if (isMine(row)) await ensureBranchWorktree(row).catch(() => undefined);
-      const sitPrompt = babysitPrompt({ owner: row.owner, repo: row.repo, number: row.number, headSha: row.head_sha, baseRef: row.base_ref, pass: passes + 1, maxPasses, failing: card.failingChecks, conflicting, canMergeBase: isMine(row) });
+      const sitPrompt = babysitPrompt({ owner: row.owner, repo: row.repo, number: row.number, headSha: row.head_sha, baseRef: row.base_ref, pass: passes + 1, maxPasses, failing, conflicting, canMergeBase: isMine(row), canFix: isMine(row) });
       noteJobPrompt(`${row.id}:babysit:${row.head_sha}:${passes + 1}`, sitPrompt, babysitterLane.intro(row));
       await laneSend(babysitterLane, row, "babysit", sitPrompt);
     } catch (cause) {
@@ -3631,15 +3643,29 @@ export default async function plugin(bb: BbPluginApi) {
     let outcome: string;
     let detail: string;
     let jobs: string[] = [];
+    let expected: string[] = [];
     try {
       if (error !== null || text === null) throw new Error(error ?? "no reply");
-      ({ outcome, detail, jobs } = parseBabysitReply(text));
+      ({ outcome, detail, jobs, expected } = parseBabysitReply(text));
     } catch (cause) {
       outcome = "needs_human";
       detail = `the babysitter failed: ${errorMessage(cause)}`;
     }
-    // merge_base is only offered on your own PR; anywhere else it reads as a call for you.
-    if (outcome === "merge_base" && !isMine(row)) outcome = "needs_human";
+    // merge_base and fix are only offered on your own PR; anywhere else they read as a call for you.
+    if ((outcome === "merge_base" || outcome === "fix") && !isMine(row)) outcome = "needs_human";
+    // The author's agent gets two tries at CI in a row; then it is yours.
+    const ciTries = [...q.fixRuns.all(reviewId)].reverse().findIndex((r) => !r.trigger.startsWith("ci:"));
+    const triedCi = ciTries === -1 ? q.fixRuns.all(reviewId).length : ciTries;
+    if (outcome === "fix" && triedCi >= 2) {
+      outcome = "needs_human";
+      detail = `CI still fails after ${triedCi} fixes by the author's agent: ${detail}`;
+    }
+    if (expected.length > 0 && p.babysit_head !== null) {
+      const known = parseJson<{ head: string; names: string[] } | null>(p.babysit_expected ?? "null", null);
+      const names = [...new Set([...(known?.head === p.babysit_head ? known.names : []), ...expected])];
+      q.setBabysitExpected.run(JSON.stringify({ head: p.babysit_head, names }), reviewId);
+      await postBabysitComment(row, `treating ${expected.length} check${expected.length === 1 ? "" : "s"} as expected, not failing`, "Opt-in gates or summary jobs; they need a label or another check, not a code change.", expected.map((n) => `- ${n}`));
+    }
     // On your PR a conflict is the author's agent's to resolve, whatever the babysitter answered.
     if (outcome === "needs_human" && isMine(row) && row.mergeable === "CONFLICTING") {
       outcome = "merge_base";
@@ -3655,6 +3681,10 @@ export default async function plugin(bb: BbPluginApi) {
       await postBabysitComment(row, `re-ran ${named.length} failed job${named.length === 1 ? "" : "s"}`, detail, named.map((j) => `- ${j}`));
     }
     if (outcome === "merge_base") void startFixRun(row, "sync", `sync:${detail.replace(/\.$/, "") || `CI needs the latest ${row.base_ref}`}`).catch(() => undefined);
+    if (outcome === "fix") {
+      await postBabysitComment(row, "the author's agent is fixing a CI failure the PR causes", detail, jobs.map((j) => `- ${j}`));
+      void startFixRun(row, "fix", `ci:${detail}`).catch(() => undefined);
+    }
     if (outcome === "needs_human") {
       q.setNeedsYou.run(detail, now, reviewId);
       await letYouKnow(row, q.babysitter.get(reviewId)?.thread_id, "needs_you", detail);
@@ -3768,6 +3798,14 @@ export default async function plugin(bb: BbPluginApi) {
     setJob: (job, id) => { q.setFixerJob.run(job, id); },
     remove: (id) => { q.deleteFixer.run(id); },
   };
+  /** Which prompt a run of the author's agent was, for telemetry. */
+  const fixStage = (r: FixRunRow | undefined) => (r?.kind === "deslop" ? "deslop" : r?.kind === "sync" ? "sync" : r?.trigger.startsWith("ci:") ? "ci_fix" : "fix");
+  /** The checks failing now, less the ones the babysitter judged expected at this head. */
+  function ciFailing(row: ReviewRow): { name: string; url: string | null }[] {
+    const expected = parseJson<{ head: string; names: string[] } | null>(q.pipeline.get(row.id)?.babysit_expected ?? "null", null);
+    const skip = new Set(expected?.head === row.head_sha ? expected.names : []);
+    return summarize(row).failingChecks.filter((c) => !skip.has(c.name));
+  }
   /** Deslop turns run in the author's agent's thread, on their own model. */
   const deslopLane: Lane = { ...fixerLane, model: deslopModel.trim() || fixerModel };
   const fixRunLane = (kind: string | undefined) => (kind === "deslop" ? deslopLane : fixerLane);
@@ -3894,6 +3932,8 @@ export default async function plugin(bb: BbPluginApi) {
         ? syncPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseRef: row.base_ref, baseRemote: target.baseRemote, reason: trigger.replace(/^sync:/, "") })
         : kind === "deslop"
         ? deslopPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha })
+        : trigger.startsWith("ci:")
+        ? ciFixPrompt({ owner: row.owner, repo: row.repo, number: row.number, headSha: row.head_sha, baseSha: row.base_sha, diagnosis: trigger.slice(3), failing: ciFailing(row) })
         : trigger === "final"
         ? fixPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha, round: last?.round ?? 0, reviewUrl: q.finalCheck.get(row.id)?.review_url ?? null, source: "the final check" })
         : fixPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha, round: last?.round ?? 0, reviewUrl: trigger === "human" ? null : last?.review_url ?? null });
@@ -3926,7 +3966,7 @@ export default async function plugin(bb: BbPluginApi) {
     q.setFixRunFailed.run(message, Date.now(), row.id, run);
     slackFixRun(row, run);
     const failed = q.fixRun.get(row.id, run);
-    recordJob({ jobId: `${row.id}:fix:${run}`, stage: failed?.kind === "deslop" ? "deslop" : failed?.kind === "sync" ? "sync" : "fix", row, lane: fixRunLane(failed?.kind), threadId: q.fixer.get(row.id)?.thread_id ?? null, startedAt: failed?.started_at, status: "failed", error: message, run });
+    recordJob({ jobId: `${row.id}:fix:${run}`, stage: fixStage(failed), row, lane: fixRunLane(failed?.kind), threadId: q.fixer.get(row.id)?.thread_id ?? null, startedAt: failed?.started_at, status: "failed", error: message, run });
     const why = `the author's agent stopped: ${message.slice(0, 300)}`;
     setStage(row, "human_review", why);
     await letYouKnow(row, q.fixer.get(row.id)?.thread_id, "needs_you", why);
@@ -3950,7 +3990,7 @@ export default async function plugin(bb: BbPluginApi) {
       const count = (v: string) => reply.items.filter((i) => i.verdict === v).length;
       const fixJob = `${reviewId}:fix:${run}`;
       recordJob({
-        jobId: fixJob, stage: r.kind === "deslop" ? "deslop" : r.kind === "sync" ? "sync" : "fix", row, lane: fixRunLane(r.kind), threadId: q.fixer.get(reviewId)?.thread_id ?? null, startedAt: r.started_at,
+        jobId: fixJob, stage: fixStage(r), row, lane: fixRunLane(r.kind), threadId: q.fixer.get(reviewId)?.thread_id ?? null, startedAt: r.started_at,
         status: "ok", reply: text, run, result: { trigger: r.trigger, pushed: reply.pushed, headBefore: r.head_before, headAfter: reply.head || null, fix: count("FIX"), skip: count("SKIP"), ask: count("ASK"), items: reply.items },
       });
       emitOutcome(fixJob, "pushed", reply.pushed);
@@ -3984,6 +4024,7 @@ export default async function plugin(bb: BbPluginApi) {
     };
     if (r.kind === "sync") return afterSync(fresh, r, reply, asks);
     if (r.trigger === "final") return recheckFinal(fresh);
+    if (r.trigger.startsWith("ci:")) return afterCiFix(fresh, r, reply, asks);
     if (r.kind === "deslop") {
       await postDeslopReport(fresh, run).catch((cause: unknown) => bb.log.warn(`deslop report on ${prLabel(fresh)}: ${errorMessage(cause)}`));
       return toYou("AI review, fixes, and deslop are done", true);
@@ -4017,6 +4058,20 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (cause) {
       bb.log.warn(`babysit comment on ${prLabel(row)}: ${errorMessage(cause)}`);
     }
+  }
+
+  /** After the author's agent fixed a CI failure: say so on the PR and babysit the new head, or hand the PR to you. */
+  async function afterCiFix(row: ReviewRow, r: FixRunRow, reply: ReturnType<typeof parseFixReply>, asks: number): Promise<void> {
+    const moved = reply.pushed && row.head_sha !== r.head_before;
+    if (moved && asks === 0) {
+      await postBabysitComment(row, `the author's agent fixed a CI failure the PR caused (\`${row.head_sha.slice(0, 7)}\`)`, reply.summary, reply.items.map((i) => `- ${i.verdict}: ${i.reason.trim().replace(/\n+/g, " ")}`));
+      setStage(row, "babysit", null);
+      void advanceFactory(row.id).catch(() => undefined);
+      return;
+    }
+    const why = moved ? `the author's agent pushed a CI fix and has ${asks} question${asks === 1 ? "" : "s"} for you` : `the author's agent did not fix the CI failure: ${reply.summary.slice(0, 300)}`;
+    setStage(row, "human_review", why);
+    await letYouKnow(row, q.fixer.get(row.id)?.thread_id, "needs_you", why);
   }
 
   /** After the author's agent merged the base in: say so on the PR, and babysit the new head, or hand the PR to you. */
