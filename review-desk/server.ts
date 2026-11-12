@@ -702,7 +702,7 @@ const MIGRATIONS = [
    )`,
   // Checks the babysitter judged expected at a head (opt-in gates, summary jobs): {"head": sha, "names": [...]}.
   `ALTER TABLE pipeline ADD COLUMN babysit_expected TEXT`,
-  // The thread the factory last surfaced to you; it stays in the sidebar while the PR waits on you.
+  // Unused: the thread the factory last surfaced to you (kept so the migration list is unchanged).
   `ALTER TABLE pipeline ADD COLUMN surfaced_thread TEXT`,
 ];
 
@@ -894,7 +894,6 @@ function createStore(db: Database.Database) {
     setHeadSeen: db.prepare<[number, string]>(`UPDATE pipeline SET head_seen_at = ? WHERE review_id = ?`),
     setNeedsYou: db.prepare<[string | null, number, string]>(`UPDATE pipeline SET needs_you = ?, updated_at = ? WHERE review_id = ?`),
     setBabysitExpected: db.prepare<[string, string]>(`UPDATE pipeline SET babysit_expected = ? WHERE review_id = ?`),
-    setSurfaced: db.prepare<[string, string]>(`UPDATE pipeline SET surfaced_thread = ? WHERE review_id = ?`),
     setBabysit: db.prepare<[string | null, string | null, number, string | null, number, string]>(
       `UPDATE pipeline SET babysit_head = ?, babysit_key = ?, babysit_passes = ?, babysit_outcome = ?, updated_at = ? WHERE review_id = ?`,
     ),
@@ -3091,8 +3090,8 @@ export default async function plugin(bb: BbPluginApi) {
     shared: true,
     // On your own PR every thread works in the branch's worktree, so they fold into one folder per PR.
     workspace: prWorkspace,
-    // bb folds two or more visible threads, so on your own PR this one shows from the start.
-    visible: (row) => isMine(row),
+    // Every PR's threads show in its folder.
+    visible: true,
     providerId: aiReviewProvider.trim(),
     model: aiReviewModel,
     replaceOnIntroChange: false,
@@ -3106,7 +3105,7 @@ export default async function plugin(bb: BbPluginApi) {
     intro: babysitIntro,
     shared: true,
     workspace: prWorkspace,
-    visible: (row) => isMine(row),
+    visible: true,
     providerId: babysitProvider.trim(),
     model: babysitModel,
     reasoningLevel: "low",
@@ -3133,7 +3132,6 @@ export default async function plugin(bb: BbPluginApi) {
     await ping(row, event, why);
     void slackReply(row.id, handoffReply(EVENT_HEADLINE[event], why, sc.me || null));
     if (threadId === undefined) return;
-    q.setSurfaced.run(threadId, row.id);
     try {
       await bb.sdk.threads.update({ threadId, visibility: "visible", title: `#${row.number} · ${EVENT_HEADLINE[event]}`, ...((await sectionId()) === null ? {} : { sectionId: await sectionId() }) });
       await bb.sdk.threads.markUnread({ threadId });
@@ -4144,9 +4142,9 @@ export default async function plugin(bb: BbPluginApi) {
   // -- the sidebar: one folder per PR -------------------------------------------
   //
   // A PR's threads share its worktree, so bb folds them into one folder per
-  // PR inside the project. The folder shows the `#N · PR` thread, the factory
-  // threads that are working, and the one waiting on you; the rest are hidden,
-  // not archived, because their lanes reuse them and they keep their context.
+  // PR inside the project: the `#N · PR` thread and the PR's current factory
+  // threads (one per lane: AI review, the author's agent, CI babysit, final
+  // check). Threads a lane replaced are archived when it replaces them.
 
   const tidyTimers = new Map<string, ReturnType<typeof setTimeout>>();
   function tidySoon(reviewId: string): void {
@@ -4161,14 +4159,12 @@ export default async function plugin(bb: BbPluginApi) {
     const row = q.review.get(reviewId);
     const p = q.pipeline.get(reviewId);
     if (row === undefined || p === undefined) return;
-    const waiting = row.state === "OPEN" && (p.needs_you !== null || p.stage === "human_review");
     const lanes = [q.aiReviewer.get(reviewId), q.fixer.get(reviewId), q.babysitter.get(reviewId), q.finalChecker.get(reviewId)];
     for (const h of lanes) {
       if (h === undefined) continue;
-      const want = h.job !== null || (waiting && p.surfaced_thread === h.thread_id) ? "visible" : "hidden";
       const thread = await bb.sdk.threads.get({ threadId: h.thread_id }).catch(() => null);
-      if (thread === null || thread.archivedAt !== null || thread.deletedAt !== null || thread.visibility === want) continue;
-      await bb.sdk.threads.update({ threadId: h.thread_id, visibility: want }).catch(() => undefined);
+      if (thread === null || thread.archivedAt !== null || thread.deletedAt !== null || thread.visibility === "visible") continue;
+      await bb.sdk.threads.update({ threadId: h.thread_id, visibility: "visible", ...((await sectionId()) === null ? {} : { sectionId: await sectionId() }) }).catch(() => undefined);
     }
     // The folder's own thread, so every PR in the factory has one row to open.
     const worktree = prWorkspace(row);
