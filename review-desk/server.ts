@@ -292,6 +292,19 @@ const fixRunSchema = z.object({
 });
 export type FixRun = z.infer<typeof fixRunSchema>;
 
+const prThreadsSchema = z.object({
+  reviewId: z.string(),
+  owner: z.string(),
+  repo: z.string(),
+  number: z.number(),
+  title: z.string(),
+  mine: z.boolean(),
+  stage: z.string().nullable(),
+  needsYou: z.string().nullable(),
+  threads: z.array(z.object({ id: z.string(), kind: z.string(), label: z.string(), status: z.string(), unread: z.boolean(), updatedAt: z.number() })),
+});
+export type PrThreads = z.infer<typeof prThreadsSchema>;
+
 export const rpcContract = defineRpcContract({
   reviews_list: { input: z.null(), output: z.object({ reviews: z.array(reviewSummarySchema) }) },
   reviews_open: { input: z.object({ ref: z.string().trim().min(1) }), output: z.object({ review: reviewSchema }) },
@@ -317,6 +330,8 @@ export const rpcContract = defineRpcContract({
       slack: z.object({ ready: z.boolean(), on: z.boolean(), url: z.string().nullable() }),
     }),
   },
+  /** The factory's threads, one folder per open PR: its `#N · PR` thread and one per lane. */
+  pr_threads: { input: z.null(), output: z.object({ prs: z.array(prThreadsSchema) }) },
   /** Post a PR to the Slack bridge's channel, or stop posting it. */
   slack_post: { input: z.object({ reviewId: z.string(), on: z.boolean() }), output: z.object({ on: z.boolean(), url: z.string().nullable() }) },
   reviews_sync: { input: reviewIdSchema, output: z.object({ review: reviewSchema, headChanged: z.boolean() }) },
@@ -878,6 +893,7 @@ function createStore(db: Database.Database) {
     slackKv: db.prepare<[string], { key: string; value: string }>(`SELECT * FROM slack_kv WHERE key = ?`),
     setSlackKv: db.prepare<[string, string]>(`INSERT INTO slack_kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`),
     deleteSlackKv: db.prepare<[string]>(`DELETE FROM slack_kv WHERE key = ?`),
+    allSharedEnvs: db.prepare<[], { key: string; environment_id: string }>(`SELECT * FROM shared_envs`),
     sharedEnv: db.prepare<[string], { key: string; environment_id: string }>(`SELECT * FROM shared_envs WHERE key = ?`),
     setSharedEnv: db.prepare<[string, string]>(`INSERT INTO shared_envs (key, environment_id) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET environment_id = excluded.environment_id`),
     deleteSharedEnv: db.prepare<[string]>(`DELETE FROM shared_envs WHERE key = ?`),
@@ -3090,8 +3106,8 @@ export default async function plugin(bb: BbPluginApi) {
     shared: true,
     // On your own PR every thread works in the branch's worktree, so they fold into one folder per PR.
     workspace: prWorkspace,
-    // Every PR's threads show in its folder.
-    visible: true,
+    // The factory's threads live in the PR threads panel, not the main sidebar.
+    visible: false,
     providerId: aiReviewProvider.trim(),
     model: aiReviewModel,
     replaceOnIntroChange: false,
@@ -3105,7 +3121,7 @@ export default async function plugin(bb: BbPluginApi) {
     intro: babysitIntro,
     shared: true,
     workspace: prWorkspace,
-    visible: true,
+    visible: false,
     providerId: babysitProvider.trim(),
     model: babysitModel,
     reasoningLevel: "low",
@@ -3133,7 +3149,7 @@ export default async function plugin(bb: BbPluginApi) {
     void slackReply(row.id, handoffReply(EVENT_HEADLINE[event], why, sc.me || null));
     if (threadId === undefined) return;
     try {
-      await bb.sdk.threads.update({ threadId, visibility: "visible", title: `#${row.number} · ${EVENT_HEADLINE[event]}`, ...((await sectionId()) === null ? {} : { sectionId: await sectionId() }) });
+      await bb.sdk.threads.update({ threadId, title: `#${row.number} · ${EVENT_HEADLINE[event]}` });
       await bb.sdk.threads.markUnread({ threadId });
     } catch (cause) {
       bb.log.warn(`surface ${threadId}: ${errorMessage(cause)}`);
@@ -3801,7 +3817,7 @@ export default async function plugin(bb: BbPluginApi) {
     model: fixerModel,
     // Its rules are in the intro; a changed rule replaces the thread so it takes effect.
     replaceOnIntroChange: true,
-    visible: true,
+    visible: false,
     workspace: (row) => fixerTargets.get(row.id)?.worktree ?? null,
     get: (id) => q.fixer.get(id),
     upsert: (id, threadId, providerId, environmentId, createdAt, introHash) => { q.upsertFixer.run(id, threadId, providerId, environmentId, createdAt, introHash); },
@@ -3903,7 +3919,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...(fixerModel.trim() !== "" ? { model: fixerModel.trim() } : {}),
       title: `#${row.number} · PR`,
       sectionId: await sectionId(),
-      visibility: "visible",
+      visibility: "hidden",
       input: [{ type: "text", text: `This thread holds the Review Desk folder for ${prLabel(row)}: "${row.title}" (${row.url}). Its worktree is ${worktree}, on the PR's branch; ask here about the PR. Reply with only: ok`, mentions: [] }],
     });
     q.setSharedEnv.run(key, thread.id);
@@ -4141,10 +4157,57 @@ export default async function plugin(bb: BbPluginApi) {
 
   // -- the sidebar: one folder per PR -------------------------------------------
   //
-  // A PR's threads share its worktree, so bb folds them into one folder per
-  // PR inside the project: the `#N · PR` thread and the PR's current factory
-  // threads (one per lane: AI review, the author's agent, CI babysit, final
-  // check). Threads a lane replaced are archived when it replaces them.
+  // A PR's threads share its worktree: the `#N · PR` thread and one current
+  // thread per lane (AI review, the author's agent, CI babysit, final check).
+  // They are hidden from the main sidebar and listed in the PR threads panel,
+  // one folder per PR under its repository. Threads a lane replaced are
+  // archived when it replaces them.
+
+  /** The PR's `#N · PR` thread: the anchor of the worktree its lanes work in. */
+  function prAnchor(row: ReviewRow): string | null {
+    const known = prWorkspace(row);
+    if (known !== null) return q.sharedEnv.get(`anchor:${known}`)?.environment_id ?? null;
+    // Before the branch worktree is resolved after a load: find it through a lane's environment.
+    const envs = [q.aiReviewer.get(row.id), q.fixer.get(row.id), q.babysitter.get(row.id)].map((h) => h?.environment_id).filter((e): e is string => e != null);
+    const path = q.allSharedEnvs.all().find((e) => e.key.startsWith("path:") && envs.includes(e.environment_id))?.key.slice("path:".length);
+    return path === undefined ? null : q.sharedEnv.get(`anchor:${path}`)?.environment_id ?? null;
+  }
+
+  const THREAD_KINDS = [
+    ["pr", "PR"],
+    ["review", "AI review"],
+    ["final", "Final check"],
+    ["author", "Author's agent"],
+    ["babysit", "CI babysit"],
+  ] as const;
+
+  /** Every open PR the factory works on, with its live threads, for the PR threads panel. */
+  async function prThreads(): Promise<PrThreads[]> {
+    const out: PrThreads[] = [];
+    for (const row of q.reviews.all()) {
+      const p = q.pipeline.get(row.id);
+      if (row.state !== "OPEN" || p === undefined) continue;
+      const ids: Record<(typeof THREAD_KINDS)[number][0], string | undefined> = {
+        pr: prAnchor(row) ?? undefined,
+        review: q.aiReviewer.get(row.id)?.thread_id,
+        final: q.finalChecker.get(row.id)?.thread_id,
+        author: q.fixer.get(row.id)?.thread_id,
+        babysit: q.babysitter.get(row.id)?.thread_id,
+      };
+      const threads: PrThreads["threads"] = [];
+      for (const [kind, label] of THREAD_KINDS) {
+        const id = ids[kind];
+        if (id === undefined) continue;
+        const t = await bb.sdk.threads.get({ threadId: id }).catch(() => null);
+        if (t === null || t.archivedAt !== null || t.deletedAt !== null) continue;
+        threads.push({ id, kind, label, status: t.status, unread: t.latestAttentionAt > (t.lastReadAt ?? 0), updatedAt: t.updatedAt });
+      }
+      if (threads.length === 0) continue;
+      const card = summarize(row);
+      out.push({ reviewId: row.id, owner: row.owner, repo: row.repo, number: row.number, title: row.title, mine: isMine(row), stage: card.stage, needsYou: p.needs_you, threads });
+    }
+    return out;
+  }
 
   const tidyTimers = new Map<string, ReturnType<typeof setTimeout>>();
   function tidySoon(reviewId: string): void {
@@ -4159,12 +4222,13 @@ export default async function plugin(bb: BbPluginApi) {
     const row = q.review.get(reviewId);
     const p = q.pipeline.get(reviewId);
     if (row === undefined || p === undefined) return;
-    const lanes = [q.aiReviewer.get(reviewId), q.fixer.get(reviewId), q.babysitter.get(reviewId), q.finalChecker.get(reviewId)];
+    const anchor = prAnchor(row);
+    const lanes = [q.aiReviewer.get(reviewId), q.fixer.get(reviewId), q.babysitter.get(reviewId), q.finalChecker.get(reviewId), ...(anchor === null ? [] : [{ thread_id: anchor }])];
     for (const h of lanes) {
       if (h === undefined) continue;
       const thread = await bb.sdk.threads.get({ threadId: h.thread_id }).catch(() => null);
-      if (thread === null || thread.archivedAt !== null || thread.deletedAt !== null || thread.visibility === "visible") continue;
-      await bb.sdk.threads.update({ threadId: h.thread_id, visibility: "visible", ...((await sectionId()) === null ? {} : { sectionId: await sectionId() }) }).catch(() => undefined);
+      if (thread === null || thread.archivedAt !== null || thread.deletedAt !== null || thread.visibility === "hidden") continue;
+      await bb.sdk.threads.update({ threadId: h.thread_id, visibility: "hidden" }).catch(() => undefined);
     }
     // The folder's own thread, so every PR in the factory has one row to open.
     const worktree = prWorkspace(row);
@@ -4846,6 +4910,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     fix_runs: ({ reviewId }) => ({ runs: q.fixRuns.all(requireReview(reviewId).id).map(toFixRun) }),
     slack_post: ({ reviewId, on }) => setOnSlack(reviewId, on),
+    pr_threads: async () => ({ prs: await prThreads() }),
     fix_start: async ({ reviewId, kind }) => {
       const row = requireReview(reviewId);
       if (q.pipeline.get(row.id) === undefined) setStage(row, kind === "deslop" ? "deslop" : "fixing");

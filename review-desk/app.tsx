@@ -34,6 +34,7 @@ import type { CommitInfo, FileEntry, FixRun, MapState, Note, NoteKind, PendingCo
 import type { ChangedFile, GhThread } from "./host-contract";
 import { MENTION_PROVIDER_ID, encodeMentionRef, mentionLabel, type MentionRef } from "./mention-ref";
 import { BoardPage } from "./board";
+import { PrThreadsPage } from "./pr-threads";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
@@ -2041,6 +2042,12 @@ function ReviewsPage({ subPath }: { subPath: string }) {
   return <BoardPage onOpen={(reviewId) => navigate.toPluginPanel(PANEL_PATH, { subPath: reviewId })} />;
 }
 
+/** The factory's threads, one folder per PR, out of the main sidebar. */
+function PrThreadsPanel() {
+  const navigate = useBbNavigate();
+  return <PrThreadsPage onOpenPr={(reviewId) => navigate.toPluginPanel(PANEL_PATH, { subPath: reviewId })} />;
+}
+
 export default definePluginApp((app) => {
   app.slots.navPanel({
     id: PANEL_ID,
@@ -2053,6 +2060,7 @@ export default definePluginApp((app) => {
       { ...CHAT_TAB, title: "Chat", icon: "Brain", layout: "flush", component: ChatTab },
     ],
   });
+  app.slots.navPanel({ id: "pr-threads", title: "PR threads", icon: "FolderOpen", path: "pr-threads", component: PrThreadsPanel });
   app.composer.customize({
     id: "code-pills",
     scopes: ["thread", "new-thread"],
