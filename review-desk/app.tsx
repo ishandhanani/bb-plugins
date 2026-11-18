@@ -1667,7 +1667,13 @@ function ReviewView({ reviewId, commit }: { reviewId: string; commit: CommitTarg
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-5xl px-6 pb-16 pt-8">
           <div className="space-y-3">
-            <StatePill state={review.state} isDraft={review.isDraft} />
+            <div className="flex items-center gap-2">
+              <StatePill state={review.state} isDraft={review.isDraft} />
+              {/* window.open goes to the system browser (the desktop app hands new windows to the OS). */}
+              <Button variant="outline" size="sm" className="ml-auto h-7 gap-1.5 text-xs" onClick={() => window.open(review.url, "_blank", "noopener,noreferrer")}>
+                <Icon name="ExternalLink" className="size-3.5" />Open on GitHub
+              </Button>
+            </div>
             <div className="text-xs text-muted-foreground"><UrlLink href={repoUrl} className="hover:underline">{review.owner}/{review.repo}</UrlLink> #{review.number}</div>
             <h1 className="text-2xl font-semibold leading-tight tracking-tight">
               <UrlLink href={review.url} className="hover:underline">{review.title}</UrlLink>
