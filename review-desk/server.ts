@@ -4659,6 +4659,97 @@ export default async function plugin(bb: BbPluginApi) {
   const react = (channel: string, ts: string, name: string, add = true) =>
     slack(add ? "reactions.add" : "reactions.remove", { channel, timestamp: ts, name }).catch(() => undefined);
 
+  // While a Slack-started turn runs, the thread shows Slack's animated status line naming the agent's current step.
+  // There is no item event to listen to, so each turn polls its thread's newest step.
+  const WORKING_POLL_MS = 15_000;
+  // Slack drops a status after two minutes without a message; resend an unchanged one before that.
+  const WORKING_REFRESH_MS = 90_000;
+  const IDLE_STEPS = ["Reading the thread...", "Thinking...", "Working on it..."];
+  const working = new Map<string, { timer: ReturnType<typeof setInterval>; channel: string; threadTs: string; since: number; shown: string; at: number }>();
+
+  /** A short, channel-safe label for a step: tool and program names and file basenames, never full commands or arguments. */
+  function stepLabel(item: Record<string, unknown>): string | null {
+    const base = (p: unknown) => (typeof p === "string" && p !== "" ? p.split("/").pop() : null);
+    switch (item.type) {
+      case "reasoning":
+        return "Thinking...";
+      case "agentMessage":
+        return "Writing the reply...";
+      case "plan":
+      case "planSteps":
+        return "Planning...";
+      case "contextCompaction":
+        return "Compacting its context...";
+      case "webSearch":
+        return "Searching the web...";
+      case "fileChange": {
+        const changes = Array.isArray(item.changes) ? (item.changes as { path?: string }[]) : [];
+        const name = base(changes[0]?.path);
+        return name ? `Editing ${name}...` : "Editing code...";
+      }
+      case "commandExecution": {
+        const segment = String(item.command ?? "").split(/&&|\|\||;|\||\n/).map((s) => s.trim()).find((s) => s !== "" && !/^(cd|export|set|source)\b/.test(s));
+        // The program, plus a subcommand only when the next word is a plain one (cargo clippy, git push); never arguments.
+        const tokens = (segment ?? "").split(/\s+/).filter((t) => t !== "");
+        while (tokens.length > 0 && /^\w+=/.test(tokens[0])) tokens.shift();
+        const program = (tokens[0] ?? "").split("/").pop() ?? "";
+        if (!/^[a-z][\w.+-]*$/i.test(program)) return "Running a command...";
+        const sub = tokens[1] !== undefined && /^[a-z][\w-]*$/.test(tokens[1]) ? ` ${tokens[1]}` : "";
+        return `Running \`${`${program}${sub}`.slice(0, 40)}\`...`;
+      }
+      case "toolCall": {
+        const tool = String(item.tool ?? "").split("__").pop() ?? "";
+        const args = (item.arguments ?? {}) as Record<string, unknown>;
+        if (tool === "Read") return `Reading ${base(args.file_path) ?? "a file"}...`;
+        if (tool === "Edit" || tool === "Write") return `Editing ${base(args.file_path) ?? "a file"}...`;
+        if (tool === "Grep" || tool === "Glob") return "Searching the code...";
+        if (tool === "WebSearch" || tool === "WebFetch") return "Searching the web...";
+        if (tool === "Agent" || tool === "Task") return "Running a subagent...";
+        return tool === "" ? null : `Using ${tool.slice(0, 40)}...`;
+      }
+      default:
+        return null;
+    }
+  }
+
+  async function paintWorking(threadId: string): Promise<void> {
+    const w = working.get(threadId);
+    if (w === undefined) return;
+    const rows = await bb.sdk.threads.events.list({ threadId, types: ["item/started"], order: "desc", limit: "5" }).catch(() => []);
+    let label: string | null = null;
+    for (const row of rows) {
+      // A reused thread's newest steps may be from its previous turn.
+      if (Number((row as { createdAt?: number }).createdAt ?? 0) < w.since) break;
+      label = stepLabel(((row as { data?: { item?: Record<string, unknown> } }).data?.item ?? {}) as Record<string, unknown>);
+      if (label !== null) break;
+    }
+    const messages = label === null ? IDLE_STEPS : [label];
+    const shown = messages.join("\n");
+    if (working.get(threadId) !== w) return;
+    if (shown === w.shown && Date.now() - w.at < WORKING_REFRESH_MS) return;
+    w.shown = shown;
+    w.at = Date.now();
+    await slack("assistant.threads.setStatus", { channel_id: w.channel, thread_ts: w.threadTs, status: "is working on it...", loading_messages: messages }).catch((cause: unknown) => bb.log.warn(`slack status: ${errorMessage(cause)}`));
+  }
+
+  /** Show the animated status in the Slack thread until the turn ends. */
+  function startWorking(threadId: string, channel: string, threadTs: string): void {
+    stopWorking(threadId, false);
+    if (slackStopped) return;
+    const timer = setInterval(() => void paintWorking(threadId), WORKING_POLL_MS);
+    working.set(threadId, { timer, channel, threadTs, since: Date.now() - 2_000, shown: "", at: 0 });
+    void paintWorking(threadId);
+  }
+
+  function stopWorking(threadId: string, clear = true): void {
+    const w = working.get(threadId);
+    if (w === undefined) return;
+    clearInterval(w.timer);
+    working.delete(threadId);
+    // A posted reply clears the status by itself; a silent or failed turn needs it cleared.
+    if (clear) void slack("assistant.threads.setStatus", { channel_id: w.channel, thread_ts: w.threadTs, status: "" }).catch(() => undefined);
+  }
+
   /** The bb thread that answers in a PR's Slack thread: on your PR its folder thread on the branch; on others' the analyst. */
   async function prAgentThread(row: ReviewRow): Promise<string | null> {
     if (!isMine(row)) return null;
@@ -4685,7 +4776,10 @@ export default async function plugin(bb: BbPluginApi) {
     await bb.sdk.threads.send({ threadId, mode: "auto", ...slackModelArg(), input: [{ type: "text", text: note, mentions: [], visibility: "agent-only" }, { type: "text", text: `${who}: ${text}`, mentions: [] }] });
     kvSet(`turn:${threadId}`, { channel: ev.channel, threadTs, ts: ev.ts } satisfies SlackTurn);
     // Only a message for the agent is acknowledged; side talk it may stay silent on shows nothing.
-    if (addressed) await react(ev.channel, ev.ts, "eyes");
+    if (addressed) {
+      startWorking(threadId, ev.channel, threadTs);
+      await react(ev.channel, ev.ts, "eyes");
+    }
   }
 
   /** An @mention or DM outside the factory's PR threads starts a bb thread with the Slack thread so far. */
@@ -4713,11 +4807,13 @@ export default async function plugin(bb: BbPluginApi) {
     });
     kvSet(`thread:${ev.channel}:${threadTs}`, { threadId: thread.id } satisfies SlackThread);
     kvSet(`turn:${thread.id}`, { channel: ev.channel, threadTs, ts: ev.ts } satisfies SlackTurn);
+    startWorking(thread.id, ev.channel, threadTs);
     await react(ev.channel, ev.ts, "eyes");
   }
 
   /** A Slack-started turn ended: answer in Slack (unless the agent chose silence), and swap 👀 for ✅. */
   async function slackTurnDone(threadId: string, text: string | null, error: string | null): Promise<void> {
+    stopWorking(threadId);
     const turn = kvGet<SlackTurn>(`turn:${threadId}`);
     if (turn === null) return;
     kvDel(`turn:${threadId}`);
@@ -4797,7 +4893,10 @@ export default async function plugin(bb: BbPluginApi) {
     const row = map?.reviewId === undefined ? undefined : q.review.get(map.reviewId);
     const target = row !== undefined ? await prAgentThread(row) : map?.threadId ?? null;
     if (word === "stop") {
-      if (target !== null) await bb.sdk.threads.stop({ threadId: target }).catch(() => undefined);
+      if (target !== null) {
+        stopWorking(target);
+        await bb.sdk.threads.stop({ threadId: target }).catch(() => undefined);
+      }
       await react(ev.channel, ev.ts, "octagonal_sign");
       return;
     }
@@ -4805,6 +4904,7 @@ export default async function plugin(bb: BbPluginApi) {
       // Someone else's PR: the read-only analyst answers.
       const seat = await chatSend(row.id, defaultProvider, sc.model || null, `${await slackName(ev.user)} (Slack): ${text}\n\n${SLACK_NOTE}`, null);
       kvSet(`turn:${seat.threadId}`, { channel: ev.channel, threadTs, ts: ev.ts } satisfies SlackTurn);
+      startWorking(seat.threadId, ev.channel, threadTs);
       await react(ev.channel, ev.ts, "eyes");
       return;
     }
@@ -4829,6 +4929,8 @@ export default async function plugin(bb: BbPluginApi) {
       signal.addEventListener("abort", () => {
         slackStopped = true;
         if (paintTimer !== null) clearTimeout(paintTimer);
+        for (const w of working.values()) clearInterval(w.timer);
+        working.clear();
       }, { once: true });
       while (!signal.aborted) {
         slackReconnect = new AbortController();
