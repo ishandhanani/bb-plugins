@@ -1,0 +1,30 @@
+{
+  "personal": {
+    "review": ["rust-code-review", "deep-code-review", "general-review"],
+    "perf": [],
+    "fix": ["gh-comment-ledger"],
+    "check": ["deep-code-review"]
+  },
+  "repos": {
+    "ai-dynamo/dynamo": {
+      "review": ["graham-code-review", "pr-checklist"],
+      "perf": ["dynamo-perf-best-practices", "dynamo-clone-hotpath-audit"],
+      "measure": ["dynamo-frontend-benchmark"],
+      "fix": [],
+      "check": [],
+      "reviewByTopic": false,
+      "perfPaths": ["lib/llm/", "lib/runtime/"]
+    },
+    "ishandhanani/dynamo": { "sameAs": "ai-dynamo/dynamo" },
+    "sgl-project/sglang": {
+      "review": [],
+      "perf": ["generate-profile", "llm-torch-profiler-analysis"],
+      "measure": [],
+      "fix": [],
+      "check": ["mechanical-refactor-verify"],
+      "reviewByTopic": true,
+      "perfPaths": ["python/sglang/srt/managers/", "python/sglang/srt/model_executor/", "python/sglang/srt/layers/", "python/sglang/srt/mem_cache/", "python/sglang/srt/sampling/", "rust/", "sgl-model-gateway/"]
+    },
+    "ishandhanani/sglang": { "sameAs": "sgl-project/sglang" }
+  }
+}

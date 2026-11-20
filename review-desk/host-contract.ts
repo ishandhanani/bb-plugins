@@ -193,6 +193,28 @@ export const hostContract = defineRpcContract({
     /** remote pushes the branch; baseRemote fetches the base branch (the same remote unless the PR comes from a fork). */
     output: z.object({ worktree: z.string(), remote: z.string(), baseRemote: z.string(), created: z.boolean() }),
   },
+  /**
+   * The skills a factory job must read: the author's own (by name, from this
+   * machine), and the repository's skills and AGENTS.md files exported from the
+   * latest default branch of owner/repo (fetched now), not from the PR branch.
+   */
+  factory_skills: {
+    input: z.object({ repoPath: z.string(), owner: z.string(), repo: z.string(), personal: z.array(z.string()), changedPaths: z.array(z.string()) }),
+    output: z.object({
+      ref: z.string().nullable(),
+      sha: z.string().nullable(),
+      root: z.string().nullable(),
+      personal: z.array(z.object({ name: z.string(), path: z.string(), digest: z.string() })),
+      repo: z.array(z.object({ name: z.string(), path: z.string(), description: z.string(), digest: z.string() })),
+      agents: z.array(z.object({ dir: z.string(), path: z.string(), performance: z.boolean(), digest: z.string() })),
+      perfDirs: z.array(z.string()),
+    }),
+  },
+  /** The commits in a range, oldest first, as the author's agent left them locally. */
+  git_range: {
+    input: z.object({ worktree: z.string(), from: z.string(), to: z.string() }),
+    output: z.object({ head: z.string(), commits: z.array(z.object({ sha: z.string(), title: z.string() })) }),
+  },
   /** A folder per repository that links each PR worktree as pr-<number>: the workspace Review Desk's visible threads share. */
   review_group_dir: {
     input: z.object({ worktree: z.string(), group: z.string(), number: z.number() }),
