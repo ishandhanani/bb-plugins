@@ -3,7 +3,7 @@
 // branch (not the PR branch) into a per-commit cache the agents read.
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -91,16 +91,30 @@ export async function factorySkills(input: FactorySkillsInput): Promise<FactoryS
   const agentsFiles = tree.filter((f) => f === "AGENTS.md" || f.endsWith("/AGENTS.md"));
   const skillsDir = [".agents/skills", ".claude/skills"].find((d) => tree.some((f) => f.startsWith(`${d}/`)));
   if (!existsSync(path.join(root, ".ready"))) {
-    rmSync(root, { recursive: true, force: true });
-    mkdirSync(root, { recursive: true });
+    // Two jobs may want the same new commit at once: each extracts into its own folder, and the first to finish becomes the export.
+    mkdirSync(base, { recursive: true });
+    const scratch = `${root}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    mkdirSync(scratch, { recursive: true });
     const paths = [...(skillsDir === undefined ? [] : [skillsDir]), ...agentsFiles];
     if (paths.length > 0) {
-      await execFileAsync("bash", ["-c", 'set -o pipefail; git -C "$1" archive "$2" -- "${@:4}" | tar -x -C "$3"', "bash", input.repoPath, sha, root, ...paths], { maxBuffer: 64 * 1024 * 1024 });
+      await execFileAsync("bash", ["-c", 'set -o pipefail; git -C "$1" archive "$2" -- "${@:4}" | tar -x -C "$3"', "bash", input.repoPath, sha, scratch, ...paths], { maxBuffer: 64 * 1024 * 1024 });
     }
-    writeFileSync(path.join(root, ".ready"), `${remote}/${branch} ${sha}\n`);
-    // Keep the three newest exports of this repository.
-    const old = readdirSync(base).map((d) => path.join(base, d)).filter((d) => d !== root && statSync(d).isDirectory()).sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
-    for (const dir of old.slice(2)) rmSync(dir, { recursive: true, force: true });
+    writeFileSync(path.join(scratch, ".ready"), `${remote}/${branch} ${sha}\n`);
+    if (existsSync(path.join(root, ".ready"))) rmSync(scratch, { recursive: true, force: true });
+    else {
+      rmSync(root, { recursive: true, force: true });
+      try {
+        renameSync(scratch, root);
+      } catch {
+        rmSync(scratch, { recursive: true, force: true });
+      }
+    }
+    // Keep the three newest exports and anything from the last two days (a long job may still be reading it); clear scratch folders a crash left.
+    const now = Date.now();
+    const dirs = readdirSync(base).map((d) => path.join(base, d)).filter((d) => d !== root && statSync(d).isDirectory());
+    const exportsByAge = dirs.filter((d) => !d.includes(".tmp-")).sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+    for (const dir of exportsByAge.slice(2)) if (now - statSync(dir).mtimeMs > 2 * 24 * 3_600_000) rmSync(dir, { recursive: true, force: true });
+    for (const dir of dirs.filter((d) => d.includes(".tmp-"))) if (now - statSync(dir).mtimeMs > 3_600_000) rmSync(dir, { recursive: true, force: true });
   }
 
   const repo: FactorySkillsOutput["repo"] = [];
@@ -125,6 +139,6 @@ export async function factorySkills(input: FactorySkillsInput): Promise<FactoryS
       dir = dirOf(dir);
     }
   }
-  const agents = [...wanted].sort((a, b) => b.length - a.length).slice(0, 16).map((f) => ({ dir: dirOf(f), path: path.join(root, f), performance: withPerf.has(f), digest: digest(path.join(root, f)) }));
+  const agents = [...wanted].sort((a, b) => b.length - a.length).slice(0, 40).map((f) => ({ dir: dirOf(f), path: path.join(root, f), performance: withPerf.has(f), digest: digest(path.join(root, f)) }));
   return { ref: `${remote}/${branch}`, sha, root, personal, repo, agents, perfDirs: [...withPerf].map(dirOf).filter((d) => d !== "") };
 }
