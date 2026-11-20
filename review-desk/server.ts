@@ -762,7 +762,10 @@ const MIGRATIONS = [
   `ALTER TABLE pipeline ADD COLUMN was_ready INTEGER NOT NULL DEFAULT 0`,
   // The deslop and final-check columns are gone: deslop is a run of the author's agent, and the final check is a full round.
   `UPDATE pipeline SET stage = 'fixing' WHERE stage = 'deslop'`,
-  `UPDATE pipeline SET stage = 'ai_review' WHERE stage = 'final_check'`,
+  `UPDATE pipeline SET stage = 'ai_review', want_full = 1 WHERE stage = 'final_check'`,
+  // Jobs of the old final check (final, verify, recheck) have nothing left to complete them.
+  `UPDATE ai_reviewers SET job = NULL WHERE job IS NOT NULL AND job NOT LIKE 'round:%'`,
+  `UPDATE final_checkers SET job = NULL`,
   // After a merge: what human reviewers said against what the AI review found. status: running, done, failed.
   `CREATE TABLE IF NOT EXISTS learn_jobs (review_id TEXT PRIMARY KEY, thread_id TEXT, status TEXT NOT NULL, result_json TEXT, error TEXT, started_at INTEGER NOT NULL, finished_at INTEGER)`,
 ];
@@ -3374,9 +3377,16 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   const advancing = new Set<string>();
+  /** Advances asked for while one was running (true when any of them was forced); they run when it ends. */
+  const advanceAgain = new Map<string, boolean>();
+  /** Reviews whose round has just been posted and whose next step is being decided; the catch-up leaves them alone. */
+  const settlingRounds = new Set<string>();
   /** One step of the factory for a PR; runs after each sync, on open, when a round ends, and when you move the card. */
   async function advanceFactory(reviewId: string, force = false): Promise<void> {
-    if (advancing.has(reviewId)) return;
+    if (advancing.has(reviewId)) {
+      advanceAgain.set(reviewId, (advanceAgain.get(reviewId) ?? false) || force);
+      return;
+    }
     advancing.add(reviewId);
     try {
       const row = q.review.get(reviewId);
@@ -3392,16 +3402,22 @@ export default async function plugin(bb: BbPluginApi) {
         p = q.pipeline.get(reviewId) ?? p;
       }
       if (p.stage === "ai_review" && (mine || !approved)) {
-        if (mine && !force && (await myRoundCatchUp(row))) return;
+        if (!force && (await roundCatchUp(row, p))) return;
         aiReviewTick(row, p, force);
       } else if (approved || p.stage === "babysit") await babysitTick(row, p);
       else if (p.stage === "human_review" && !mine) await humanReviewTick(row, p);
-      else if (p.stage === "changes_requested" && p.head_seen_at !== null && p.head_seen_at > p.entered_at) {
+      // A PR from before re-review existed comes back to you on a push; newer ones go through a round first (needsReview).
+      else if (p.stage === "changes_requested" && p.reviewed_head === null && p.head_seen_at !== null && p.head_seen_at > p.entered_at) {
         setStage(row, "human_review", "New commits since your review");
         await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "ready_again", "new commits since your review");
       }
     } finally {
       advancing.delete(reviewId);
+      const again = advanceAgain.get(reviewId);
+      if (again !== undefined) {
+        advanceAgain.delete(reviewId);
+        void advanceFactory(reviewId, again).catch((cause: unknown) => bb.log.warn(`factory ${reviewId}: ${errorMessage(cause)}`));
+      }
     }
   }
 
@@ -3414,6 +3430,8 @@ export default async function plugin(bb: BbPluginApi) {
     if (p.reviewed_head === null || p.reviewed_head === row.head_sha) return false;
     const waiting = mine ? p.stage === "babysit" || p.stage === "human_review" : !approved && (p.stage === "human_review" || p.stage === "changes_requested");
     if (!waiting || q.fixRuns.all(row.id).at(-1)?.status === "running") return false;
+    // A loop that hit its cap, or a round that already ran (or failed) at this head, waits for you: sending it back would only bounce it.
+    if (p.loop_rounds >= maxRounds || q.lastRound.get(row.id)?.head_sha === row.head_sha) return false;
     return Date.now() - (p.head_seen_at ?? 0) >= settleMs;
   }
 
@@ -3646,12 +3664,15 @@ export default async function plugin(bb: BbPluginApi) {
     }
     publish(reviewId, "board");
     if (posted) {
+      settlingRounds.add(reviewId);
       try {
         // A card you moved out of AI review stays where you put it; the round still counts as a review of this head.
         if (q.pipeline.get(reviewId)?.stage !== "ai_review") q.setReviewedHead.run(r.head_sha, reviewId);
         else if (!(await startPerf(row, requireRound(reviewId, round), files))) await afterRound(row, round);
       } catch (cause) {
         bb.log.warn(`after round ${round} of ${prLabel(row)}: ${errorMessage(cause)}`);
+      } finally {
+        settlingRounds.delete(reviewId);
       }
     }
     pumpRounds();
@@ -3725,8 +3746,15 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`perf review, round ${round} of ${prLabel(row)}: ${errorMessage(cause)}`);
     }
     publish(reviewId, "board");
-    if (q.pipeline.get(reviewId)?.stage === "ai_review") await afterRound(row, round).catch((cause: unknown) => bb.log.warn(`after round ${round} of ${prLabel(row)}: ${errorMessage(cause)}`));
-    else q.setReviewedHead.run(r.head_sha, reviewId);
+    settlingRounds.add(reviewId);
+    try {
+      if (q.pipeline.get(reviewId)?.stage === "ai_review") await afterRound(row, round);
+      else q.setReviewedHead.run(r.head_sha, reviewId);
+    } catch (cause) {
+      bb.log.warn(`after round ${round} of ${prLabel(row)}: ${errorMessage(cause)}`);
+    } finally {
+      settlingRounds.delete(reviewId);
+    }
     pumpRounds();
   }
 
@@ -3796,7 +3824,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // Questions the author's agent asked since you last answered still wait on you.
     const runs = q.fixRuns.all(row.id);
-    const since = runs.slice(runs.map((r) => r.trigger).lastIndexOf("human") + 1);
+    const since = runs.slice(Math.max(0, runs.map((r) => r.trigger).lastIndexOf("human")));
     const asks = since.flatMap((r) => toFixRun(r).items).filter((i) => i.verdict === "ASK").length;
     if (asks > 0) {
       const withAsks = `${why}; ${asks} question${asks === 1 ? "" : "s"} for you from the author's agent`;
@@ -3890,7 +3918,11 @@ export default async function plugin(bb: BbPluginApi) {
     q.setConversationCache.run(row.id, JSON.stringify(conversation), Date.now());
     const runs = q.fixRuns.all(row.id);
     if (runs.at(-1)?.status === "running") return false;
-    const windows = runs.map((r) => [r.started_at, (r.finished_at ?? Date.now()) + 2 * 60_000] as const);
+    // What the factory posts under your login: the agent's replies during its runs, and the replies that close findings when a round ends.
+    const windows = [
+      ...runs.map((r) => [r.started_at, (r.finished_at ?? Date.now()) + 2 * 60_000] as const),
+      ...q.rounds.all(row.id).map((r) => [r.started_at, (r.finished_at ?? Date.now()) + 2 * 60_000] as const),
+    ];
     // New to the author's agent: anything since it last read the comments (a fix run's start), whatever stage the PR was in then.
     const lastRead = runs.filter((r) => r.kind === "fix").at(-1)?.started_at ?? p.entered_at;
     const fresh = conversation.reviews.filter((r) => {
@@ -4325,6 +4357,11 @@ export default async function plugin(bb: BbPluginApi) {
       const jobId = `${row.id}:fix:${run}`;
       const pr = { owner: row.owner, repo: row.repo, number: row.number, baseSha: row.base_sha, headSha: row.head_sha };
       let prompt: string;
+      if (kind === "sync") {
+        // A run that failed (rejected by the check, stopped, lost to a reload) may have left commits in the worktree. A merge on top would push them unchecked.
+        const local = await host.call("git_range", { worktree: target.worktree, from: row.head_sha, to: "HEAD" }, hostOptions(row));
+        if (local.commits.length > 0) throw new Error(`${local.commits.length} unpushed commit${local.commits.length === 1 ? "" : "s"} in ${target.worktree} (${local.commits.map((c) => c.sha.slice(0, 10)).join(", ")}); push or drop them before the base is merged`);
+      }
       if (kind === "sync") prompt = syncPrompt({ owner: row.owner, repo: row.repo, number: row.number, baseRef: row.base_ref, baseRemote: target.baseRemote, reason: trigger.replace(/^sync:/, "") });
       else {
         const skills = (await stageSkills(row, "fix", [], jobId)).block;
@@ -4396,6 +4433,8 @@ export default async function plugin(bb: BbPluginApi) {
       commits = (await host.call("git_range", { worktree: target.worktree, from: r.head_before, to: "HEAD" }, hostOptions(row))).commits;
     } catch (cause) {
       bb.log.warn(`commits of run ${run} on ${prLabel(row)}: ${errorMessage(cause)}`);
+      // The range could not be read: go by the head the agent reported, so its commits are still checked.
+      if (reply.head !== "" && !r.head_before.startsWith(reply.head) && !reply.head.startsWith(r.head_before)) commits = [{ sha: reply.head, title: "" }];
     }
     const current = q.fixRun.get(reviewId, run) ?? r;
     if (commits.length === 0) {
@@ -4515,17 +4554,22 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // Its push moved the head: read it before deciding what runs next.
     await syncReview(reviewId).catch((cause: unknown) => bb.log.warn(`sync after the author's agent on ${prLabel(row)}: ${errorMessage(cause)}`));
+    // It says it pushed and GitHub still shows the old head: GitHub can lag a push by a few seconds.
+    if (reply.pushed && requireReview(reviewId).head_sha === r.head_before && r.kind !== "sync") {
+      await new Promise((resolve) => setTimeout(resolve, 8_000));
+      await syncReview(reviewId).catch(() => undefined);
+    }
     const fresh = requireReview(reviewId);
     const asks = count("ASK");
     const done = { ...reply, items };
     // The check passed commits that never reached GitHub: the PR must not be called ready with them still local.
-    if (r.phase === "publish" && r.kind !== "sync" && r.head_after !== null && r.head_after !== r.head_before && !reply.pushed && fresh.head_sha === r.head_before) {
+    if (r.phase === "publish" && r.kind !== "sync" && r.head_after !== null && r.head_after !== r.head_before && fresh.head_sha === r.head_before) {
       return failFixRun(fresh, run, `it did not push its commits (they are local in ${fixerTargets.get(reviewId)?.worktree ?? "the PR branch's worktree"})`);
     }
     if (r.kind === "sync") return afterSync(fresh, r, done, asks);
     if (r.trigger.startsWith("ci:")) return afterCiFix(fresh, r, done, asks);
     if (r.kind === "deslop") await postDeslopReport(fresh, run).catch((cause: unknown) => bb.log.warn(`deslop report on ${prLabel(fresh)}: ${errorMessage(cause)}`));
-    if (reply.pushed && fresh.head_sha !== r.head_before) {
+    if (fresh.head_sha !== r.head_before) {
       // Its own push, so no settling: the next round reviews these commits now. After the deslop that round is the whole-PR pass.
       if (r.kind === "deslop" && needsFullLook(fresh)) q.setWantFull.run(1, reviewId);
       setStage(fresh, "ai_review");
@@ -4542,12 +4586,18 @@ export default async function plugin(bb: BbPluginApi) {
     return converged(fresh, r.kind === "deslop" ? "AI review, fixes, and deslop are done" : r.trigger === "human" ? "the author's agent worked through the review comments" : "AI review and fixes are done");
   }
 
-  /** A round on your own PR at this head that the author's agent never picked up (posted before it existed, or lost to a reload) is handed over now. */
-  async function myRoundCatchUp(row: ReviewRow): Promise<boolean> {
+  /**
+   * A round is posted at this head, and what follows it never ran: the plugin
+   * reloaded between the two, its perf turn was lost, or (a round from before
+   * the author's agent existed) nobody picked it up. Run that step now.
+   */
+  async function roundCatchUp(row: ReviewRow, p: PipelineRow): Promise<boolean> {
     const last = q.lastRound.get(row.id);
     if (last === undefined || last.status !== "posted" || last.perf === "running" || last.head_sha !== row.head_sha) return false;
+    // The step ran (this head is recorded as reviewed), a whole-PR pass is already due, or the step is running right now.
+    if (p.reviewed_head === last.head_sha || p.want_full === 1 || settlingRounds.has(row.id)) return false;
     if (q.fixRuns.all(row.id).some((r) => r.trigger === `round:${last.round}`)) return false;
-    await afterMyRound(row, last.round, last.high_value ?? 0, last.high_value ?? 0, null);
+    await afterRound(row, last.round);
     return true;
   }
 
