@@ -17,12 +17,9 @@ export const AI_LABEL_MEANING: Record<AiLabel, string> = {
   NIT: "style, naming, comments, small cleanups, small costs; never holds up a merge on its own, and is still posted",
 };
 
-/** Findings stored before labels (blocker, major, minor, nit) keep working. */
-const LEGACY_LABELS: Record<string, AiLabel> = { blocker: "BLOCKER", major: "BUG", minor: "DESIGN", nit: "NIT" };
-
 export function normalizeLabel(value: string): AiLabel {
   const upper = value.trim().toUpperCase();
-  return (AI_LABELS as readonly string[]).includes(upper) ? (upper as AiLabel) : LEGACY_LABELS[value.trim().toLowerCase()] ?? "BUG";
+  return (AI_LABELS as readonly string[]).includes(upper) ? (upper as AiLabel) : "BUG";
 }
 export const AI_FINDING_STATUSES = ["open", "fixed", "obsolete"] as const;
 export type AiFindingStatus = (typeof AI_FINDING_STATUSES)[number];
@@ -128,14 +125,14 @@ export function parseAiReply(text: string): ParsedAiReply {
 export interface PostedFinding { severity: string; path: string; line: number; startLine: number | null; title: string; body: string; suggestion: string | null }
 
 /** The first line of a finding's inline comment; also how the factory finds its own thread later. */
-export function findingHeader(severity: string, title: string, round: number | null, perf = false): string {
-  return `**[${severity}] ${title.trim()}** (${round === null ? "AI final check" : perf ? `AI perf review, round ${round}` : `AI review, round ${round}`})`;
+export function findingHeader(severity: string, title: string, round: number, perf = false): string {
+  return `**[${severity}] ${title.trim()}** (${perf ? `AI perf review, round ${round}` : `AI review, round ${round}`})`;
 }
 
-/** Matches the first line of any thread the factory opened, old final checks included. */
-export const FACTORY_THREAD = /\((AI (perf )?review, round \d+|AI final check)\)/;
+/** Matches the first line of any thread the factory opened. */
+export const FACTORY_THREAD = /\(AI (perf )?review, round \d+\)/;
 
-export function findingComment(f: PostedFinding, round: number | null, perf = false): string {
+export function findingComment(f: PostedFinding, round: number, perf = false): string {
   const parts = [findingHeader(f.severity, f.title, round, perf), f.body.trim()];
   if (f.suggestion !== null && f.suggestion.trim() !== "") parts.push("```suggestion\n" + f.suggestion.replace(/^```\w*\n?|```$/g, "").replace(/\n$/, "") + "\n```");
   return parts.filter((p) => p !== "").join("\n\n");

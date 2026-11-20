@@ -722,8 +722,7 @@ const MIGRATIONS = [
    )`,
   // The Slack bridge's small state: PR threads, posted messages to edit, Slack threads mapped to bb threads, pending turns.
   `CREATE TABLE IF NOT EXISTS slack_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
-  // final_checkers now holds the thread of the check on the author's agent's commits (a new one per check). final_checks
-  // belonged to the old final check and stays declared so existing databases still match.
+  // The old final check's tables; both are dropped further down.
   `CREATE TABLE IF NOT EXISTS final_checkers (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL, intro_hash TEXT)`,
   `CREATE TABLE IF NOT EXISTS final_checks (
      review_id TEXT PRIMARY KEY,
@@ -763,9 +762,15 @@ const MIGRATIONS = [
   // The deslop and final-check columns are gone: deslop is a run of the author's agent, and the final check is a full round.
   `UPDATE pipeline SET stage = 'fixing' WHERE stage = 'deslop'`,
   `UPDATE pipeline SET stage = 'ai_review', want_full = 1 WHERE stage = 'final_check'`,
-  // Jobs of the old final check (final, verify, recheck) have nothing left to complete them.
   `UPDATE ai_reviewers SET job = NULL WHERE job IS NOT NULL AND job NOT LIKE 'round:%'`,
-  `UPDATE final_checkers SET job = NULL`,
+  `DROP TABLE IF EXISTS final_checkers`,
+  `DROP TABLE IF EXISTS final_checks`,
+  // The thread of the check on the author's agent's commits (a new one per check); same shape as the other lanes.
+  `CREATE TABLE IF NOT EXISTS checkers (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, provider_id TEXT NOT NULL, environment_id TEXT, job TEXT, created_at INTEGER NOT NULL, intro_hash TEXT)`,
+  // Cards already on the board start the new loop from where they are: their rounds get a kind, and a card that was
+  // waiting counts as reviewed at its current head and as handed over once, so only a later push sends it back to review.
+  `UPDATE ai_rounds SET kind = CASE WHEN round = 1 THEN 'full' ELSE 'delta' END WHERE kind IS NULL`,
+  `UPDATE pipeline SET was_ready = 1, reviewed_head = (SELECT head_sha FROM reviews WHERE reviews.id = pipeline.review_id) WHERE reviewed_head IS NULL AND stage IN ('human_review', 'changes_requested', 'babysit')`,
   // After a merge: what human reviewers said against what the AI review found. status: running, done, failed.
   `CREATE TABLE IF NOT EXISTS learn_jobs (review_id TEXT PRIMARY KEY, thread_id TEXT, status TEXT NOT NULL, result_json TEXT, error TEXT, started_at INTEGER NOT NULL, finished_at INTEGER)`,
 ];
@@ -790,7 +795,7 @@ interface BoardStageRow { review_id: string; stage: string; auto_stage: string; 
 interface FixRunRow {
   review_id: string; run: number; kind: string; trigger: string; head_before: string; head_after: string | null; status: string; summary: string | null;
   items_json: string | null; error: string | null; started_at: number; finished_at: number | null;
-  /** work, check, revise, publish; null on a sync and on runs from before the check existed. */
+  /** work, check, revise, publish; null on a sync, which pushes its merge itself. */
   phase: string | null; checks: number; check_json: string | null;
 }
 interface LearnJobRow { review_id: string; thread_id: string | null; status: string; result_json: string | null; error: string | null; started_at: number; finished_at: number | null }
@@ -804,7 +809,7 @@ interface PipelineRow {
 interface RoundRow {
   review_id: string; round: number; base_sha: string; head_sha: string; status: string; summary: string | null; high_value: number | null;
   review_url: string | null; raw: string | null; error: string | null; started_at: number; finished_at: number | null;
-  /** full or delta; null on rounds from before the rework (round 1 was full). perf: null, running, posted, failed. */
+  /** kind: full or delta. perf: null, running, posted, failed. */
   kind: string | null; perf: string | null; perf_url: string | null; skills_json: string | null;
 }
 interface FindingRow {
@@ -1005,13 +1010,13 @@ function createStore(db: Database.Database) {
     ),
     setAiReviewerJob: db.prepare<[string | null, string]>(`UPDATE ai_reviewers SET job = ? WHERE review_id = ?`),
     deleteAiReviewer: db.prepare<[string]>(`DELETE FROM ai_reviewers WHERE review_id = ?`),
-    finalChecker: db.prepare<[string], HelperRow>(`SELECT * FROM final_checkers WHERE review_id = ?`),
-    finalCheckerByThread: db.prepare<[string], HelperRow>(`SELECT * FROM final_checkers WHERE thread_id = ?`),
-    upsertFinalChecker: db.prepare<[string, string, string, string | null, number, string | null]>(
-      `INSERT INTO final_checkers (review_id, thread_id, provider_id, environment_id, created_at, intro_hash) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id, intro_hash = excluded.intro_hash`,
+    checker: db.prepare<[string], HelperRow>(`SELECT * FROM checkers WHERE review_id = ?`),
+    checkerByThread: db.prepare<[string], HelperRow>(`SELECT * FROM checkers WHERE thread_id = ?`),
+    upsertChecker: db.prepare<[string, string, string, string | null, number, string | null]>(
+      `INSERT INTO checkers (review_id, thread_id, provider_id, environment_id, created_at, intro_hash) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET thread_id = excluded.thread_id, provider_id = excluded.provider_id, environment_id = excluded.environment_id, intro_hash = excluded.intro_hash`,
     ),
-    setFinalCheckerJob: db.prepare<[string | null, string]>(`UPDATE final_checkers SET job = ? WHERE review_id = ?`),
-    deleteFinalChecker: db.prepare<[string]>(`DELETE FROM final_checkers WHERE review_id = ?`),
+    setCheckerJob: db.prepare<[string | null, string]>(`UPDATE checkers SET job = ? WHERE review_id = ?`),
+    deleteChecker: db.prepare<[string]>(`DELETE FROM checkers WHERE review_id = ?`),
     babysitter: db.prepare<[string], HelperRow>(`SELECT * FROM babysitters WHERE review_id = ?`),
     babysitterByThread: db.prepare<[string], HelperRow>(`SELECT * FROM babysitters WHERE thread_id = ?`),
     upsertBabysitter: db.prepare<[string, string, string, string | null, number, string | null]>(
@@ -3306,8 +3311,7 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  /** A round from before the rework has no kind: its first round covered the whole PR. */
-  const roundKind = (r: RoundRow): "full" | "delta" => (r.kind === "full" || (r.kind === null && r.round === 1) ? "full" : "delta");
+  const roundKind = (r: RoundRow): "full" | "delta" => (r.kind === "full" ? "full" : "delta");
 
   /** Someone else's PR that is already approved only needs its CI watched; your own PR is reviewed whatever its approvals. */
   const skipsReview = (row: ReviewRow) => githubStage(row) === "babysit" && !isMine(row);
@@ -3368,7 +3372,7 @@ export default async function plugin(bb: BbPluginApi) {
     const keeps = run?.kind === "sync" ? to === "babysit" : to === "fixing";
     if (run?.status === "running" && !keeps) {
       q.setFixRunFailed.run(`stopped: you moved the card to ${BOARD_STAGE_LABEL[to]}`, Date.now(), row.id, run.run);
-      for (const lane of [{ row: q.fixer.get(row.id), clear: q.setFixerJob }, { row: q.finalChecker.get(row.id), clear: q.setFinalCheckerJob }]) {
+      for (const lane of [{ row: q.fixer.get(row.id), clear: q.setFixerJob }, { row: q.checker.get(row.id), clear: q.setCheckerJob }]) {
         if (lane.row === undefined || lane.row.job === null) continue;
         lane.clear.run(null, row.id);
         await bb.sdk.threads.stop({ threadId: lane.row.thread_id }).catch(() => undefined);
@@ -3406,11 +3410,7 @@ export default async function plugin(bb: BbPluginApi) {
         aiReviewTick(row, p, force);
       } else if (approved || p.stage === "babysit") await babysitTick(row, p);
       else if (p.stage === "human_review" && !mine) await humanReviewTick(row, p);
-      // A PR from before re-review existed comes back to you on a push; newer ones go through a round first (needsReview).
-      else if (p.stage === "changes_requested" && p.reviewed_head === null && p.head_seen_at !== null && p.head_seen_at > p.entered_at) {
-        setStage(row, "human_review", "New commits since your review");
-        await letYouKnow(row, q.aiReviewer.get(row.id)?.thread_id, "ready_again", "new commits since your review");
-      }
+      // Changes requested waits for the author's push; needsReview then sends it through a round and back to you.
     } finally {
       advancing.delete(reviewId);
       const again = advanceAgain.get(reviewId);
@@ -3423,8 +3423,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   /**
    * The PR waits (ready, or on you) at a head no round has reviewed: someone
-   * pushed. It goes back to review once the head has settled. A PR from before
-   * this rule has no reviewed head and is left alone until its next round.
+   * pushed. It goes back to review once the head has settled. A PR no round has
+   * ever reviewed (you dragged it straight to Babysit) is left alone.
    */
   function needsReview(row: ReviewRow, p: PipelineRow, mine: boolean, approved: boolean): boolean {
     if (p.reviewed_head === null || p.reviewed_head === row.head_sha) return false;
@@ -3559,7 +3559,7 @@ export default async function plugin(bb: BbPluginApi) {
    * lines, the rest listed in the body (`body` gets those). GitHub refuses the
    * whole review when one comment does not anchor; then they all go in the body.
    */
-  async function submitFindings(row: ReviewRow, baseSha: string, headSha: string, files: ChangedFile[], findings: PostedFinding[], round: number | null, body: (offDiff: PostedFinding[]) => string, perf = false): Promise<{ url: string | null; inline: PostedFinding[] }> {
+  async function submitFindings(row: ReviewRow, baseSha: string, headSha: string, files: ChangedFile[], findings: PostedFinding[], round: number, body: (offDiff: PostedFinding[]) => string, perf = false): Promise<{ url: string | null; inline: PostedFinding[] }> {
     const wanted = new Set(findings.filter((f) => isHighValue(f.severity)).map((f) => f.path));
     const shown = await rightLines(row, baseSha, headSha, files.filter((f) => wanted.has(f.path)));
     const anchors = (f: PostedFinding) => {
@@ -3587,7 +3587,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { url: (await submit(inline)).url, inline };
     } catch (cause) {
       if (inline.length === 0) throw cause;
-      bb.log.warn(`round ${round ?? "?"} of ${prLabel(row)}: inline comments refused (${errorMessage(cause)}); posting them in the review body`);
+      bb.log.warn(`round ${round} of ${prLabel(row)}: inline comments refused (${errorMessage(cause)}); posting them in the review body`);
       inline = [];
       return { url: (await submit(inline)).url, inline };
     }
@@ -3901,17 +3901,6 @@ export default async function plugin(bb: BbPluginApi) {
    * to the next round, and a bare approval asks for nothing. Reviews under your
    * login made while the agent was working are its own replies and are skipped.
    */
-  /**
-   * Other people's reviews reach the author's agent from the time this rule first ran. Reviews that were already on
-   * your open PRs then are left to you (Fix now sends them), so turning the rule on starts nothing by itself.
-   */
-  const othersFeedbackFrom = (() => {
-    const known = Number(q.slackKv.get("factory:others-feedback-from")?.value ?? "");
-    if (Number.isFinite(known) && known > 0) return known;
-    q.setSlackKv.run("factory:others-feedback-from", String(Date.now()));
-    return Date.now();
-  })();
-
   async function myFeedbackTick(row: ReviewRow, p: PipelineRow): Promise<boolean> {
     const login = await viewerLogin(row);
     const conversation = await host.call("gh_conversation", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
@@ -3930,7 +3919,7 @@ export default async function plugin(bb: BbPluginApi) {
       const at = Date.parse(r.submittedAt);
       if (at <= lastRead) return false;
       if (r.author === login) return !windows.some(([from, to]) => at >= from && at <= to);
-      return at > othersFeedbackFrom && !isBot(r.author) && !(r.state === "APPROVED" && r.body.trim() === "");
+      return !isBot(r.author) && !(r.state === "APPROVED" && r.body.trim() === "");
     });
     if (fresh.length === 0) return false;
     await startFixRun(row, "fix", "human");
@@ -4094,11 +4083,11 @@ export default async function plugin(bb: BbPluginApi) {
       else pumpRounds();
       return true;
     }
-    const checker = q.finalCheckerByThread.get(threadId);
+    const checker = q.checkerByThread.get(threadId);
     if (checker !== undefined) {
       const job = checker.job;
-      if (job !== null && stillWorking(threadId, job, CHECK_FENCE, text, error, () => q.finalChecker.get(checker.review_id)?.job)) return true;
-      q.setFinalCheckerJob.run(null, checker.review_id);
+      if (job !== null && stillWorking(threadId, job, CHECK_FENCE, text, error, () => q.checker.get(checker.review_id)?.job)) return true;
+      q.setCheckerJob.run(null, checker.review_id);
       if (job !== null && job.startsWith("check:")) void completeCheck(checker.review_id, Number(job.slice("check:".length)), text, error);
       return true;
     }
@@ -4155,9 +4144,9 @@ export default async function plugin(bb: BbPluginApi) {
     // A run of the author's agent whose thread (the agent's, or the check's) stopped without a reply goes back to you.
     for (const r of q.runningFixRuns.all()) {
       const checking = r.phase === "check";
-      const lane = checking ? q.finalChecker.get(r.review_id) : q.fixer.get(r.review_id);
+      const lane = checking ? q.checker.get(r.review_id) : q.fixer.get(r.review_id);
       if (lane?.job === `${checking ? "check" : "fix"}:${r.run}` && (await working(lane.thread_id))) continue;
-      if (checking) q.setFinalCheckerJob.run(null, r.review_id);
+      if (checking) q.setCheckerJob.run(null, r.review_id);
       else q.setFixerJob.run(null, r.review_id);
       const row = q.review.get(r.review_id);
       if (row !== undefined) await failFixRun(row, r.run, "its thread stopped before it replied (plugin reload?)");
@@ -4215,10 +4204,10 @@ export default async function plugin(bb: BbPluginApi) {
     replaceOnIntroChange: false,
     visible: false,
     workspace: (row) => fixerTargets.get(row.id)?.worktree ?? null,
-    get: (id) => q.finalChecker.get(id),
-    upsert: (id, threadId, providerId, environmentId, createdAt, introHash) => { q.upsertFinalChecker.run(id, threadId, providerId, environmentId, createdAt, introHash); },
-    setJob: (job, id) => { q.setFinalCheckerJob.run(job, id); },
-    remove: (id) => { q.deleteFinalChecker.run(id); },
+    get: (id) => q.checker.get(id),
+    upsert: (id, threadId, providerId, environmentId, createdAt, introHash) => { q.upsertChecker.run(id, threadId, providerId, environmentId, createdAt, introHash); },
+    setJob: (job, id) => { q.setCheckerJob.run(job, id); },
+    remove: (id) => { q.deleteChecker.run(id); },
   };
   /** Which prompt a run of the author's agent was, for telemetry. */
   const fixStage = (r: FixRunRow | undefined) => (r?.kind === "deslop" ? "deslop" : r?.kind === "sync" ? "sync" : r?.trigger.startsWith("ci:") ? "ci_fix" : "fix");
@@ -4423,7 +4412,7 @@ export default async function plugin(bb: BbPluginApi) {
       await failFixRun(row, run, errorMessage(cause));
       return;
     }
-    // A sync, the publish step, and runs from before the check existed end here.
+    // A sync and the publish step end here.
     if (r.phase !== "work" && r.phase !== "revise") return finishFixRun(row, r, reply, text);
     // The commits are local. Nothing is pushed until the check has read them.
     q.setFixRunWork.run(reply.head || null, reply.summary, JSON.stringify(reply.items), reviewId, run);
@@ -4459,14 +4448,14 @@ export default async function plugin(bb: BbPluginApi) {
         items: parseJson<FixRun["items"]>(r.items_json, []), skills: skills.block,
       });
       // Fresh context means a new thread every time.
-      const old = q.finalChecker.get(row.id);
+      const old = q.checker.get(row.id);
       if (old !== undefined) {
-        q.deleteFinalChecker.run(row.id);
+        q.deleteChecker.run(row.id);
         await bb.sdk.threads.archive({ threadId: old.thread_id }).catch(() => undefined);
       }
       noteJobPrompt(jobId, prompt, checkerLane.intro(row));
       await laneSend(checkerLane, row, `check:${r.run}`, prompt);
-      const threadId = q.finalChecker.get(row.id)?.thread_id;
+      const threadId = q.checker.get(row.id)?.thread_id;
       if (threadId !== undefined) await bb.sdk.threads.update({ threadId, title: `#${row.number} · Check` }).catch(() => undefined);
     } catch (cause) {
       bb.log.warn(`check of run ${r.run} on ${prLabel(row)} could not start: ${errorMessage(cause)}`);
@@ -4479,7 +4468,7 @@ export default async function plugin(bb: BbPluginApi) {
     const r = q.fixRun.get(reviewId, run);
     if (row === undefined || r === undefined || r.status !== "running" || r.phase !== "check") return;
     const jobId = `${reviewId}:check:${run}:${r.checks + 1}`;
-    const threadId = q.finalChecker.get(reviewId)?.thread_id ?? null;
+    const threadId = q.checker.get(reviewId)?.thread_id ?? null;
     let verdict: { summary: string; verdicts: CheckVerdict[] };
     try {
       if (error !== null || text === null) throw new Error(error ?? "the check returned nothing");
@@ -4588,8 +4577,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   /**
    * A round is posted at this head, and what follows it never ran: the plugin
-   * reloaded between the two, its perf turn was lost, or (a round from before
-   * the author's agent existed) nobody picked it up. Run that step now.
+   * reloaded between the two, or its perf turn was lost. Run that step now.
    */
   async function roundCatchUp(row: ReviewRow, p: PipelineRow): Promise<boolean> {
     const last = q.lastRound.get(row.id);
@@ -4718,7 +4706,7 @@ export default async function plugin(bb: BbPluginApi) {
         pr: prAnchor(row) ?? undefined,
         review: q.aiReviewer.get(row.id)?.thread_id,
         author: q.fixer.get(row.id)?.thread_id,
-        check: q.finalChecker.get(row.id)?.thread_id,
+        check: q.checker.get(row.id)?.thread_id,
         babysit: q.babysitter.get(row.id)?.thread_id,
       };
       const threads: PrThreads["threads"] = [];
@@ -4750,7 +4738,7 @@ export default async function plugin(bb: BbPluginApi) {
     const p = q.pipeline.get(reviewId);
     if (row === undefined || p === undefined) return;
     const anchor = prAnchor(row);
-    const lanes = [q.aiReviewer.get(reviewId), q.fixer.get(reviewId), q.babysitter.get(reviewId), q.finalChecker.get(reviewId), ...(anchor === null ? [] : [{ thread_id: anchor }])];
+    const lanes = [q.aiReviewer.get(reviewId), q.fixer.get(reviewId), q.babysitter.get(reviewId), q.checker.get(reviewId), ...(anchor === null ? [] : [{ thread_id: anchor }])];
     for (const h of lanes) {
       if (h === undefined) continue;
       const thread = await bb.sdk.threads.get({ threadId: h.thread_id }).catch(() => null);
@@ -5452,7 +5440,7 @@ export default async function plugin(bb: BbPluginApi) {
       q.deleteSimplifier.run(reviewId);
       q.deleteSimple.run(reviewId);
       q.deleteBoardStage.run(reviewId);
-      for (const stmt of [q.deletePipeline, q.deleteRounds, q.deleteFindings, q.deleteAiReviewer, q.deleteBabysitter, q.deleteMap, q.deleteFixRuns, q.deleteFixer, q.deleteFinalChecker]) stmt.run(reviewId);
+      for (const stmt of [q.deletePipeline, q.deleteRounds, q.deleteFindings, q.deleteAiReviewer, q.deleteBabysitter, q.deleteMap, q.deleteFixRuns, q.deleteFixer, q.deleteChecker]) stmt.run(reviewId);
       q.deleteReview.run(reviewId);
       publish(reviewId, "removed");
       // The worktree goes with the card, unless it has local changes.
