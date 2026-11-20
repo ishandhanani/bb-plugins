@@ -40,16 +40,14 @@ export function ciLine(card: ReviewSummary): string {
 export function nowLine(card: ReviewSummary): string {
   const f = card.factory;
   if (f?.needsYou) return `needs you: ${f.needsYou}`;
-  if (f?.fix?.status === "running") return `${f.fix.kind === "deslop" ? "deslopping" : f.fix.kind === "sync" ? "merging the base" : "fixing"}`;
+  if (f?.fix?.status === "running") return `${f.fix.kind === "deslop" ? "deslopping" : f.fix.kind === "sync" ? "merging the base" : "fixing"}${f.fix.phase === "check" ? ": commits being checked" : f.fix.phase === "revise" ? ": revising what the check rejected" : f.fix.phase === "publish" ? ": pushing" : ""}`;
   if (f?.roundStatus === "running" || f?.roundStatus === "queued") return `AI round ${f.round} ${f.roundStatus}`;
-  if (f?.final?.status === "review") return "final check: fresh-context review";
-  if (f?.final?.status === "verify") return "final check: verifying each finding";
-  if (f?.final?.status === "recheck") return "final check: checking the fixes";
+  if (f?.perf === "running") return `AI round ${f.round}: perf review`;
   if (card.mergeable === "CONFLICTING") return "merge conflicts";
   return "";
 }
 
-/** The PR's path through its lane, the current stage in bold: AI review › Fixing › *Deslop* › Babysit. */
+/** The PR's path through its lane, the current stage in bold: Review › *Fix and check* › Needs you › Ready. */
 export function stagePath(card: ReviewSummary): string {
   if (card.stage === null) return `*${prStage(card)}*`;
   const lane = BOARD_LANES.find((l) => l.id === (card.mine ? "mine" : "reviewing"));

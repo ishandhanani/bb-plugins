@@ -4,8 +4,8 @@ Review GitHub pull requests inside bb: a document-style PR page with the diff, t
 
 ## What it does
 
-- **PR factory**: a PR you add goes to **AI review**. A hidden reviewer thread runs round 1 with the code review skills it has, both your own and the repository's (project skills, CLAUDE.md, AGENTS.md), and the server posts the result to GitHub as a COMMENT review headed "Round N AI review": each finding labeled BLOCKER, BUG, PERF, TEST, DESIGN, QUESTION, or NIT, inline on its line, with NITs folded into the body. Each push after that, once the head has sat still for `aiReviewSettleMinutes`, runs a targeted round over what the PR changed since then that also marks earlier findings fixed, open, or obsolete; the factory replies on and resolves its own threads for the ones it closes. The rounds stop when they converge, not after a fixed count: as soon as a round leaves only NITs, or when a push resolves none of the open findings and the round finds nothing new (on your own PR, when the author's agent makes no more progress); `aiReviewMaxRounds` is only a safety cap. Then comes the **Final check**: a reviewer that has never seen the PR (a new thread on `finalCheckModel`, told not to read earlier reviews) reviews all of it, and the reviewer thread, which has the PR's whole history, tries to refute each finding on `verifyModel`, with evidence either way. Only what holds up is posted inline (unsettled ones as QUESTIONs); the refuted ones are folded in the review body with the verifier's evidence. On your own PR the author's agent fixes what held up and the verifier checks each fix, then Babysit; on anyone else's the PR moves to **Human review** and the reviewer thread shows up unread in the sidebar. MLflow gets how many of the fresh reviewer's findings were confirmed, refuted, and unsettled. Your own review moves it on: anything but an approval to **Changes requested** (back to Human review when the author pushes), an approval to **Babysit**, where a small model re-runs flaky CI and hands anything that needs a push or a decision back to you (unread thread, chip on the card). It never edits, pushes, merges, or comments. The brain button on a card starts or retries the next round now; dragging a card into a factory column moves it there, and dragging it to Unreviewed takes it out.
-- **Slack bridge**: one channel you pick is the factory's room. **Post to Slack** on a PR page (next to the head sha) gives that PR a thread whose root is its card: title, the stages of its lane with the current one in bold (`AI review › Fixing › *Deslop* › Your review › Babysit`), CI, open threads, and what is happening now, repainted as it moves. Nothing is posted until you ask; **Stop** ends the updates and leaves what is there. The factory's events are replies in the PR's thread: each AI round with a table of its findings, each run of the author's agent as a plan that goes from working to one task per verdict, each babysit action, and hand-offs, which are the only replies that mention you. Talk in a PR's thread and the PR's agent answers there: on your PR the `#N · PR` thread on its branch, on others' the read-only analyst. An @mention or DM anywhere else starts a bb thread in `slackProject` with the Slack thread so far. Every turn from Slack runs on `slackModel`. Several people can be in a thread: each message reaches the agent with its sender's name, side talk not addressed to it is passed with "answer only if it is for you", and the agent may answer `<silent/>`, which posts nothing. Plain words are handled before any model: `(aside) …` is ignored, `mute` / `unmute` silence a thread except for @mentions, `stop` stops the agent, and in a PR thread `babysit`, `fix`, `deslop`, and `review` act on the PR. It uses Socket Mode, so bb needs no public URL; `slack-app-manifest.yaml` creates the app.
+- **PR factory**: you add a PR to the board, and that starts one loop: AI review of every pushed head, fixes by the author's agent on your own PRs, a check of each fix before it is pushed, and review again, until the reviewed head is the current head. Then it is ready for you. See [The PR factory](#the-pr-factory).
+- **Slack bridge**: one channel you pick is the factory's room. **Post to Slack** on a PR page (next to the head sha) gives that PR a thread whose root is its card: title, the stages of its lane with the current one in bold (`Review › *Fix and check* › Needs you › Ready`), CI, open threads, and what is happening now, repainted as it moves. Nothing is posted until you ask; **Stop** ends the updates and leaves what is there. The factory's events are replies in the PR's thread: each AI round with a table of its findings, each run of the author's agent as a plan that goes from working to one task per verdict, each babysit action, and hand-offs, which are the only replies that mention you. Talk in a PR's thread and the PR's agent answers there: on your PR the `#N · PR` thread on its branch, on others' the read-only analyst. An @mention or DM anywhere else starts a bb thread in `slackProject` with the Slack thread so far. Every turn from Slack runs on `slackModel`. Several people can be in a thread: each message reaches the agent with its sender's name, side talk not addressed to it is passed with "answer only if it is for you", and the agent may answer `<silent/>`, which posts nothing. Plain words are handled before any model: `(aside) …` is ignored, `mute` / `unmute` silence a thread except for @mentions, `stop` stops the agent, and in a PR thread `babysit`, `fix`, `deslop`, and `review` act on the PR. It uses Socket Mode, so bb needs no public URL; `slack-app-manifest.yaml` creates the app.
 - **The board** is the landing page: paste a PR link and it becomes a card under **Unreviewed** (no review has started), **AI review**, **Human review**, **Changes requested** (a reviewer asked for changes), or **Babysit** (approved by you or others: the decision, or any reviewer's latest review; now you watch CI until it merges). Drag a card to hold it elsewhere until GitHub's state changes, then it follows GitHub again. A card shows the title, `owner/repo #N`, the author, when GitHub last saw activity, and chips for what is in the way: checks passed/total (red when one fails), unresolved threads, approvals, reviewers asking for changes, merge conflicts, and your pending comments. A Babysit card leads with CI: a bar of passed checks, the failing checks by name linking to their runs, one verdict chip (merge conflicts, CI failing, CI running, needs a required review, still a draft, or ready to merge) and when the last commit was pushed. Merged and closed PRs leave the columns and fold into a strip under them until you remove them. Click a card for the PR page below. Open PRs are synced with GitHub when the board opens if they are more than ten minutes stale, on **Refresh**, and in the background on the `boardRefresh` cron; a sync skips the git fetch when the head did not move.
 - **Open a PR** by URL or `owner/repo#123`. The host entry finds the local checkout among your bb projects (or clones it), fetches the PR head, and keeps a detached worktree under `~/.review-desk/worktrees` on that machine (or `worktreesDir`), outside bb's data dir so the chat and helper threads can run in it.
 - **PR page**: state, title, author, base and head branches, then three tabs: **Map** (first and default), **Diff**, and **Comments**. Diff holds the commits and the changed files as cards; files load lazily as you scroll, and viewed marks and a "lines left" counter track progress. Comments holds the description and the discussion (reviews, comments, open threads).
@@ -20,6 +20,77 @@ Review GitHub pull requests inside bb: a document-style PR page with the diff, t
 - **Code pills**: code goes into the chat as @-mention pills that resolve to text when you send, so the transcript stays short and the analyst gets the excerpt. Three ways in: select lines in the diff and press `a` or **Add to chat**; type `@` in the composer to search changed files, commits, GitHub review threads, the PR description, or an explicit `path:10-20`; or pick **Summarize in chat** on a file card. A banner above the composer shows the current diff selection with its own **Add to chat**.
 - **Info** tab: checks with a progress bar, reviewers with their state, assignees, labels, and the pending review.
 
+## The PR factory
+
+Nothing reaches the board on its own: you add a PR (paste its link, or `bb review-desk open`), and adding it starts the loop. The factory never marks a PR ready and never requests reviewers; it stops at "ready for you".
+
+```mermaid
+flowchart TD
+    A["You add the PR to the board"] --> R["REVIEW<br/>reads your skills from this machine and the repo's skills from its latest default branch<br/>whole PR on the first and last pass, new commits in between"]
+    R --> Q{"Diff touches a request path?"}
+    Q -- no --> POST["Every finding is posted, NITs included, each with a label"]
+    Q -- yes --> PF["PERF REVIEW<br/>the repo's perf skills and the AGENTS.md of the touched directories"]
+    PF --> M{"Does the cost argument settle it?"}
+    M -- yes --> POST
+    M -- no --> B["MEASURE<br/>the named benchmark, base against head"]
+    B --> POST
+    POST --> N{"Anything to fix?"}
+    N -- yes --> F["FIX<br/>the author's agent commits, and does not push"]
+    F --> C{"CHECK<br/>fresh context, argues against each commit"}
+    C -- "rejects, once" --> F
+    C -- "rejects twice" --> YOU["Needs you, nothing pushed"]
+    C -- passes --> PUSH["Push, reply on the threads"]
+    PUSH --> R
+    N -- no --> G{"Reviewed head is the current head?"}
+    G -- no --> R
+    G -- yes --> RDY["READY FOR YOU<br/>CI is babysat; you request reviewers"]
+    RDY -- "a reviewer comments" --> F
+    RDY -- "someone pushes" --> R
+    RDY -- "merged" --> L["LEARN<br/>human comments against AI findings: recall for the PR"]
+    L --> W["Weekly automation<br/>cluster the misses, propose skill and prompt patches, replay them on frozen heads, report"]
+```
+
+The stages:
+
+| Stage | When | What it does | Prompt | Thread |
+|---|---|---|---|---|
+| REVIEW | every head, once it has sat still for `aiReviewSettleMinutes` (at once after the author's agent pushes) | Round 1 covers the whole PR. Later rounds cover what the PR changed since the last round and decide which earlier findings are fixed, open, or obsolete. Before the PR is first called ready, one more whole-PR pass runs on a new thread with fresh eyes, if commits landed since round 1. The server posts a COMMENT review per round: findings inline, labeled BLOCKER, BUG, PERF, TEST, DESIGN, QUESTION, or NIT; NITs and findings outside the diff in the body. Nothing is filtered or refuted before it is posted. | `prompts/review.md` | AI review |
+| PERF REVIEW | after a round's review, when the files that round covers touch a request path: a prefix listed under `perfPaths`, or a directory whose `AGENTS.md` has a `## Performance` section | The reviewer argues the cost per request, token, event, or connection against the base branch, at the repository's default limits. It measures only when the code does not settle it, and reports the finding either way. Posted as its own review. | `prompts/perf.md` | AI review (same thread) |
+| FIX | your own PRs: after a round with something to fix, after a reviewer's or your comments, and for a CI failure the PR causes | The author's agent pulls every comment fresh, judges each (FIX, SKIP, ASK), and commits fixes without pushing. When the rounds first converge it also deslops the diff once. | `prompts/fix.md` | Author's agent |
+| CHECK | before every push by the author's agent | A reviewer that has never seen the PR argues against each commit: does it fix what was asked, does it add work on a request path, does it add something unused, does its test fail without the fix, was the comment worth applying. A rejected commit goes back to the agent once; a second rejection comes to you and nothing is pushed. | `prompts/check.md` | Check (new each time) |
+| Babysit | once the PR is ready, or approved | Re-runs flaky CI, has the author's agent merge the base or fix a failure the PR causes, and hands the rest to you. | built in `factory-spec.ts` | CI babysit |
+| LEARN | after a merge | Writes every human comment and every AI finding to telemetry, and matches them: found, demoted (seen and lost), or missed, with the cause of each miss. | `prompts/learn.md` | Learn |
+
+On someone else's PR there is no FIX: rounds run on each push until nothing above a NIT is open or a push changes nothing, then the PR comes to you in **Your review**. Your review moves it on: an approval to **Babysit**, anything else to **Changes requested** until the author pushes, which sends it through a round and back to you.
+
+### The board
+
+| Column | My PRs | Reviewing |
+|---|---|---|
+| Review | a round is queued or running, or the PR waits for a push | the same |
+| Fix and check | the author's agent is working; the card says which step (working, commits being checked, revising, pushing) | not used |
+| Needs you / Your review | only you can unblock it: a question from the agent, a commit the check rejected twice, a job that stopped | AI review is done at the current head; your turn |
+| Changes requested | not used | you asked for changes; waiting on the author |
+| Ready / Babysit | reviewed at the current head; CI is babysat; you request reviewers when you want | approved; CI is watched until it merges |
+
+A new push to a PR that is waiting, or a reviewer's comments on your own PR, sends it back through the loop. Dragging a card into Review starts a round now; into Fix and check starts the author's agent; to Not started takes the PR out of the factory. A card dragged elsewhere in the first `startDelaySeconds` after you add it follows the column you chose instead.
+
+### Where prompts and skills live
+
+- **Prompts** are plain files in `prompts/`, one per stage, and hold process only: what the stage does, in what order, and what it must output. Sections inside a file start at a `<!-- @name -->` line. A prompt's version in telemetry is the hash of its file.
+- **The skills map** is `factory-skills.json`. For each stage it names the skills to read: `personal` (your own, by name) and, per repository, `review`, `perf`, `measure`, `fix`, and `check`, plus `perfPaths`. A fork says `sameAs` and reads its upstream's.
+- **Your skills** are read from this machine as they are now (`~/.claude/skills/<name>/SKILL.md`).
+- **The repository's skills and `AGENTS.md` files** are read from its latest default branch, fetched before every job and exported to `~/.review-desk/skills/<owner>__<repo>/<sha>/`, so a job never reads a stale copy from the PR branch. A repository with `reviewByTopic` has topic skills instead of one review skill: the reviewer gets every skill's description and reads the ones that fit the diff.
+- Each prompt starts with a "Read first" list of those files, built by the server, and the reply names the ones that were read. Telemetry records the list with each file's digest.
+
+Where a lesson goes: a rule for one repository belongs in that repository's `AGENTS.md` or skills; a rule that holds anywhere belongs in your own skills; when or what to review belongs in a prompt.
+
+### Learning
+
+Every job goes to `~/.review-desk/telemetry/events.jsonl` (and from there to MLflow) with its prompt, prompt version, skills, and trajectory. After a merge, a `pr_closed` record holds the humans' comments and the AI findings, and a `recall` record holds the match. The weekly automation follows `skills/factory-learn/SKILL.md`: it clusters the misses, writes proposed changes as patch files, replays each on frozen PR heads (`~/.review-desk/learn/replay-set.json`), and reports to `~/.review-desk/learn/<date>/report.md`. It lands nothing; you approve.
+
+A turn that ends without its reply block (the agent stopped to wait on a background build or test) no longer fails the job: the job stays open, the thread is told to wait in the foreground if it is still idle a few minutes later, and only two such turns in a row fail it.
+
 ## Layout
 
 - `host-contract.ts` — RPC contract between server and host.
@@ -27,7 +98,11 @@ Review GitHub pull requests inside bb: a document-style PR page with the diff, t
 - `server.ts` — SQLite store (reviews, viewed files, GitHub caches, pending comments, notes, chat seats, maps), RPC for the UI, `bb review-desk` CLI.
 - `app.tsx` — the **Reviews** nav panel; fixed tabs **Info** and **Chat**; the composer banner that receives pills.
 - `board-spec.ts` — the board's columns and their labels, shared by server and app.
-- `factory-spec.ts` — the PR factory's prompts, reply parsing, and the GitHub review body, shared by server and app.
+- `factory-spec.ts` — the PR factory's labels, reply parsing, thread intros, and the GitHub review body, shared by server and app.
+- `prompts/*.md` — the factory's stage prompts: `review`, `perf`, `fix` (with its revise, publish, deslop, and CI sections), `check`, `learn`.
+- `factory-skills.json` — which skills each stage reads, per repository, and the request paths that trigger a perf review.
+- `factory-prompts.ts` — loads the prompt files and the skills map, and builds each stage's prompt (server only).
+- `factory-skills-host.ts` — on the repository's machine: finds your skills, and exports the repository's skills and `AGENTS.md` files from its latest default branch.
 - `slack-client.ts` — Slack Web API calls and the Socket Mode connection, with no SDK.
 - `slack-blocks.ts` — the Slack bridge's Block Kit: PR cards and the factory's replies.
 - `slack-app-manifest.yaml` — the Slack app the bridge needs.
@@ -35,6 +110,7 @@ Review GitHub pull requests inside bb: a document-style PR page with the diff, t
 - `lib/format.ts` — `timeAgo` and `describeError`, shared by the review page and the board.
 - `mention-ref.ts` — pill identity shared by server and app (what a pill points at, how its id is encoded, its label).
 - `skills/review-desk/SKILL.md` — instructions the analyst threads receive.
+- `skills/factory-learn/SKILL.md` — the weekly procedure that turns recall records into proposed skill and prompt changes.
 
 ## Develop
 
@@ -54,9 +130,9 @@ Requires `gh` authenticated on the machine that holds the repository.
 bb review-desk open <url | owner/repo#N>
 bb review-desk list
 bb review-desk board
-bb review-desk move <reviewId> <unreviewed|ai_review|human_review|changes_requested|babysit|auto>
+bb review-desk move <reviewId> <unreviewed|ai_review|fixing|human_review|changes_requested|babysit|auto>
 bb review-desk refresh
-bb review-desk factory <start|stop|show|ping|resolve> <reviewId>
+bb review-desk factory <start|stop|show|ping|resolve|fix|deslop|report|learn|prompt> <reviewId>
 bb review-desk ask <reviewId> <text...> [--provider <id>]
 bb review-desk map <reviewId> [--rewrite]
 ```
@@ -72,16 +148,18 @@ bb review-desk map <reviewId> [--rewrite]
 - `simpleEnglishModel` (default empty): model for the Simple English thread; empty uses `helperModel`, then the project's default. A small, fast model is enough, for example `acp-devin` with `swe-1-7-lightning`.
 - `simpleEnglishSkill` (default empty): optional file appended to the rewrite prompt as vocabulary help, for example a `simple-english` SKILL.md. Empty uses a short built-in word list. A long rule set makes a fast model paraphrase instead of shorten, so the default is the short list.
 - `boardRefresh` (default `*/15 * * * *`): cron (5 fields, server-local time) for syncing the board's open PRs with GitHub in the background; empty turns it off.
-- `autoAiReview` (default true): put a PR in the factory when it is added to the board. Rounds post COMMENT reviews under your `gh` login.
+- `autoAiReview` (default true): adding a PR to the board starts the factory. Rounds post COMMENT reviews under your `gh` login. Nothing is added to the board for you.
 - `aiReviewProvider` / `aiReviewModel` (default `claude-code` / `claude-fable-5-1`): the AI reviewer.
-- `aiReviewMaxRounds` (default 4): safety cap on AI rounds; the loop normally ends sooner, when a round leaves only nits or makes no progress.
-- `finalCheck` (default true): run the final check after the rounds. `finalCheckModel` (default `claude-fable-5-1`): its fresh-context reviewer. `verifyModel` (default `claude-opus-5-5`): its verifier; a different model than the reviewer's catches more of its mistakes. Drag a card into Final check to run one at the current head.
+- `aiReviewMaxRounds` (default 6): safety cap on AI rounds in one loop (from a new head until the PR is ready again); the loop normally ends sooner, when a round leaves only nits or makes no progress.
+- `perfReview` (default true): run the perf review when a round's files touch a request path.
+- `checkCommits` (default true): check the author's agent's commits before they are pushed. `checkModel` (default `claude-fable-5-1`): the check's model; a different model than the agent's catches more.
+- `reviewBots` (default `coderabbitai,dynamo-review-agent,copilot-pull-request-reviewer,github-actions,codecov`): logins that are bots. A review from anyone else on your own PR goes to the author's agent; bots' comments are read on the next fix run.
 - `aiReviewConcurrency` (default 2): rounds running at once across the board.
 - `aiReviewSettleMinutes` (default 10): how long a new head must sit unchanged before the next round. Pushes are noticed on the `boardRefresh` cron.
-- `aiReviewSkills` (default empty): skills the reviewer must use on top of the ones it picks; comma separated, `owner/repo=skill` for one repository.
+- `aiReviewSkills` (default empty): extra skills the reviewer must read on top of `factory-skills.json`; comma separated, `owner/repo=skill` for one repository.
 - `aiReviewEmpirical` (default false): let the reviewer run skills that build, launch servers, or run GPU or load tests. Off, it applies them by reading the code.
-- `fixerProvider` / `fixerModel` (default `claude-code` / `claude-opus-5-5`): the author's agent on your own PRs, which fixes feedback and merges the base.
-- `deslopModel` (default `claude-fable-5-1`; empty uses `fixerModel`): the author's agent's deslop turns, in the same thread.
+- `authorPipeline` (default true): on your own PRs, run FIX and CHECK. `fixerProvider` / `fixerModel` (default `claude-code` / `claude-opus-5-5`): the author's agent, which fixes feedback and merges the base.
+- `deslopStage` (default true): deslop your PR once, when the rounds first converge; its commits are checked and reviewed like any fix. `deslopModel` (default `claude-fable-5-1`; empty uses `fixerModel`): the model for those turns, in the same thread.
 - `babysitProvider` / `babysitModel` (default `claude-code` / `claude-opus-5-5`): the CI babysitter.
 - `babysitMaxPasses` (default 3): babysit passes per head before CI failures are handed to you.
 - `slackBotToken` / `slackAppToken` (secrets, default empty): the Slack bridge's bot token (`xoxb-…`) and app-level token (`xapp-…`, `connections:write`). Create the app from `slack-app-manifest.yaml`. The bridge's settings apply live: it connects when both tokens are set and reconnects when any of them change.

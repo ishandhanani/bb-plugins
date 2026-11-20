@@ -1319,7 +1319,7 @@ function AuthorAgentPanel({ reviewId }: { reviewId: string }) {
     <section className="rounded-lg border border-border bg-card p-4">
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-sm font-semibold">Author's agent</span>
-        <span className="text-xs text-muted-foreground">triages and fixes the feedback on your PR, then deslops it</span>
+        <span className="text-xs text-muted-foreground">fixes the feedback on your PR; a fresh-context check reads each commit before it is pushed</span>
         <span className="ml-auto flex items-center gap-1">
           {runs?.at(-1)?.threadId ? (
             <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs" onClick={() => navigate.toThread(runs.at(-1)?.threadId ?? "")}><Icon name="ExternalLink" className="size-3.5" />Thread</Button>
@@ -1328,18 +1328,26 @@ function AuthorAgentPanel({ reviewId }: { reviewId: string }) {
           <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs" disabled={running} onClick={() => void start("deslop")}>Deslop now</Button>
         </span>
       </div>
-      {runs === null ? <p className="mt-2 text-xs text-muted-foreground">Loading…</p> : runs.length === 0 ? <p className="mt-2 text-xs text-muted-foreground">Not run yet. It starts after the first AI round.</p> : (
+      {runs === null ? <p className="mt-2 text-xs text-muted-foreground">Loading…</p> : runs.length === 0 ? <p className="mt-2 text-xs text-muted-foreground">Not run yet. It starts after the first AI round. Nothing it writes is pushed until the check has read it.</p> : (
         <ol className="mt-3 space-y-3">
           {[...runs].reverse().map((r) => (
             <li key={r.run} className="space-y-1.5">
               <div className="flex flex-wrap items-center gap-2 text-xs">
                 <span className="font-medium">{r.kind === "deslop" ? "Deslop" : r.kind === "sync" ? "Merge base" : "Fix"} · run {r.run}</span>
-                <span className="text-muted-foreground">{r.trigger === "human" ? "after your comments" : r.trigger.startsWith("round:") ? `after AI round ${r.trigger.slice(6)}` : r.trigger.startsWith("sync:") ? `CI babysit: ${r.trigger.slice(5)}` : r.trigger === "manual" ? "started by you" : "after the fixes"}</span>
-                <span className={cn("rounded-full border px-1.5 text-[10px]", r.status === "failed" ? "border-destructive/50 text-destructive" : "border-border text-muted-foreground")}>{r.status}</span>
+                <span className="text-muted-foreground">{r.trigger === "human" ? "after a reviewer's comments" : r.trigger.startsWith("round:") ? `after AI round ${r.trigger.slice(6)}` : r.trigger.startsWith("sync:") ? `CI babysit: ${r.trigger.slice(5)}` : r.trigger.startsWith("ci:") ? "CI failure" : r.trigger === "manual" ? "started by you" : "when the rounds converged"}</span>
+                <span className={cn("rounded-full border px-1.5 text-[10px]", r.status === "failed" ? "border-destructive/50 text-destructive" : "border-border text-muted-foreground")}>{r.status === "running" && r.phase ? ({ work: "working", check: "commits being checked", revise: "revising", publish: "pushing" } as Record<string, string>)[r.phase] ?? r.status : r.status}</span>
+                {r.check ? <span className={cn("rounded-full border px-1.5 text-[10px]", r.check.verdicts.some((v) => v.verdict === "REJECT") ? "border-amber-500/50 text-amber-700 dark:text-amber-300" : "border-border text-muted-foreground")} title={r.check.summary}>check: {r.check.verdicts.filter((v) => v.verdict !== "REJECT").length} passed{r.check.verdicts.some((v) => v.verdict === "REJECT") ? `, ${r.check.verdicts.filter((v) => v.verdict === "REJECT").length} rejected` : ""}</span> : null}
                 {r.headAfter && r.headAfter !== r.headBefore ? <span className="font-mono text-muted-foreground">{shortSha(r.headBefore)} → {shortSha(r.headAfter)}</span> : null}
               </div>
               {r.error ? <p className="text-xs text-destructive">{r.error}</p> : null}
               {r.summary ? <p className="text-xs">{r.summary}</p> : null}
+              {r.check?.verdicts.some((v) => v.verdict === "REJECT") ? (
+                <ul className="space-y-0.5 rounded-md border border-amber-500/40 px-2.5 py-1.5 text-xs">
+                  {r.check.verdicts.filter((v) => v.verdict === "REJECT").map((v, n) => (
+                    <li key={`${r.run}-check-${n}`}><span className="font-mono text-muted-foreground">{v.commit.slice(0, 7)}</span> rejected by the check: {v.reason}</li>
+                  ))}
+                </ul>
+              ) : null}
               {r.items.length > 0 ? (
                 <ul className="divide-y divide-border/60 rounded-md border border-border/60 text-xs">
                   {r.items.map((i, n) => (

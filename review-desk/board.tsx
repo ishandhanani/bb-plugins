@@ -7,7 +7,7 @@ import type { DragEvent, FormEvent, ReactNode } from "react";
 import { toast } from "sonner";
 import { UrlLink, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { ReviewSummary, rpcContract } from "./server";
-import { BOARD_LANES, BOARD_STAGES, BOARD_STAGE_HINT, BOARD_STAGE_LABEL, stageLabel, type BoardLane, type BoardStage } from "./board-spec";
+import { BOARD_LANES, BOARD_STAGES, stageHint, stageLabel, type BoardLane, type BoardStage } from "./board-spec";
 import { Button } from "@/components/ui/button";
 import { Icon, type IconName } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
@@ -72,15 +72,27 @@ function StartCountdown({ startsAt }: { startsAt: number }) {
   return <Chip icon="Clock" tone="strong" title="Drag the card to another column before this ends and the factory does that instead">starts in {left}s</Chip>;
 }
 
-const WORKING = ["review", "verify", "recheck"];
+/** What the author's agent is doing now: its job, and the step of it. */
+function fixLabel(fix: NonNullable<NonNullable<ReviewSummary["factory"]>["fix"]>): string {
+  if (fix.kind === "sync") return "Merging base";
+  const job = fix.kind === "deslop" ? "Deslop" : "Fix";
+  if (fix.phase === "check") return `${job}: checking commits`;
+  if (fix.phase === "revise") return `${job}: revising ${fix.rejected} rejected`;
+  if (fix.phase === "publish") return `${job}: pushing`;
+  return fix.kind === "deslop" ? "Deslopping" : "Fixing";
+}
 
 /** The one thing worth knowing about a card: what needs you, what is running, or what CI says. Null when nothing does. */
 function cardStatus(card: ReviewSummary, stage: BoardStage): { label: string; tone: ChipTone; icon: IconName; title?: string } | null {
   const f = card.factory;
   if (f?.needsYou) return { label: "Needs you", tone: "bad", icon: "BellDot", title: f.needsYou };
-  if (f?.final && WORKING.includes(f.final.status)) return { label: "Final check", tone: "strong", icon: "Clock" };
-  if (f?.fix?.status === "running") return { label: f.fix.kind === "deslop" ? "Deslopping" : f.fix.kind === "sync" ? "Merging base" : "Fixing", tone: "strong", icon: "Clock" };
-  if (f?.roundStatus === "running" || f?.roundStatus === "queued") return { label: `AI round ${f.round}`, tone: "strong", icon: "Clock" };
+  if (f?.fix?.status === "running") return { label: fixLabel(f.fix), tone: "strong", icon: "Clock", title: "The author's agent commits, a fresh-context check reads each commit, and only then is anything pushed" };
+  if (f?.roundStatus === "running" || f?.roundStatus === "queued") {
+    const whole = f.roundKind === "full";
+    return { label: `Round ${f.round}${whole && f.round > 1 ? " · whole PR" : ""}`, tone: "strong", icon: "Clock", title: whole ? "A review of the whole PR" : "A review of what changed since the last round" };
+  }
+  if (f?.perf === "running") return { label: `Round ${f.round} · perf`, tone: "strong", icon: "Clock", title: "The diff touches a request path: a performance review with the repository's perf skills" };
+  if (f?.reviewedHead != null && f.reviewedHead !== card.headSha && (stage === "babysit" || stage === "human_review")) return { label: "New commits", tone: "muted", icon: "Clock", title: "The head moved since the last review round; a round runs once it settles" };
   if (f?.roundStatus === "failed") return { label: "Round failed", tone: "bad", icon: "AlertTriangle", title: f.error ?? undefined };
   if (card.mergeable === "CONFLICTING") return { label: "Conflicts", tone: "bad", icon: "AlertTriangle" };
   if (card.checks.failed > 0) return { label: `CI ${card.checks.failed} failing`, tone: "bad", icon: "CircleX", title: card.failingChecks.map((c) => c.name).join("\n") };
@@ -135,7 +147,7 @@ function PrCard({ card, stage, onOpen, onRemove }: { card: ReviewSummary; stage:
   );
 }
 
-function BoardColumn({ stage, label, count, over, onOver, onLeave, onDrop, children }: { stage: BoardStage; label: string; count: number; over: boolean; onOver: () => void; onLeave: () => void; onDrop: (reviewId: string) => void; children: ReactNode }) {
+function BoardColumn({ stage, label, hint, count, over, onOver, onLeave, onDrop, children }: { stage: BoardStage; label: string; hint: string; count: number; over: boolean; onOver: () => void; onLeave: () => void; onDrop: (reviewId: string) => void; children: ReactNode }) {
   return (
     <section
       aria-label={label}
@@ -145,12 +157,12 @@ function BoardColumn({ stage, label, count, over, onOver, onLeave, onDrop, child
       onDrop={(e) => { e.preventDefault(); const id = e.dataTransfer.getData("text/plain"); if (id !== "") onDrop(id); }}
       className={cn("flex min-h-[180px] flex-col rounded-lg border border-transparent bg-foreground/5 transition-colors", over && "border-primary/50 bg-primary/10")}
     >
-      <header className="flex items-center gap-2 px-3 pb-1.5 pt-2.5" title={BOARD_STAGE_HINT[stage]}>
+      <header className="flex items-center gap-2 px-3 pb-1.5 pt-2.5" title={hint}>
         <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{label}</span>
         <span className="rounded-full bg-foreground/10 px-1.5 text-[11px] tabular-nums text-muted-foreground">{count}</span>
       </header>
       <div className="flex-1 space-y-2 px-2 pb-2">
-        {count === 0 ? <p className="px-1 py-8 text-center text-xs text-muted-foreground">{over ? "Drop here" : BOARD_STAGE_HINT[stage]}</p> : children}
+        {count === 0 ? <p className="px-1 py-8 text-center text-xs text-muted-foreground">{over ? "Drop here" : hint.split(/[.:;] /)[0]}</p> : children}
       </div>
     </section>
   );
@@ -268,8 +280,8 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
     setMoves((m) => ({ ...m, [card.id]: stage ?? card.autoStage ?? "unreviewed" }));
     try {
       await rpc.call("board_move", { reviewId: card.id, stage: stage === card.autoStage ? null : stage });
-      if (stage === "final_check") toast.success(`Final check started on ${card.owner}/${card.repo}#${card.number}: a fresh reviewer, then a verifier`);
-      if (stage === "fixing" || stage === "deslop") toast.success(`The author's agent is ${stage === "deslop" ? "deslopping" : "fixing"} ${card.owner}/${card.repo}#${card.number}; its thread is #${card.number} · ${stage === "deslop" ? "Deslop" : "Fixing"}`);
+      if (stage === "ai_review") toast.success(`Review round queued for ${card.owner}/${card.repo}#${card.number}`);
+      if (stage === "fixing") toast.success(`The author's agent is fixing ${card.owner}/${card.repo}#${card.number}; its commits are checked before they are pushed`);
       refetch();
     } catch (cause) {
       setMoves((m) => { const next = { ...m }; delete next[card.id]; return next; });
@@ -341,6 +353,7 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
                           key={key}
                           stage={stage}
                           label={stageLabel(stage, lane.id)}
+                          hint={stageHint(stage, lane.id)}
                           count={cards[stage].length}
                           over={over === key}
                           onOver={() => setOver(key)}
