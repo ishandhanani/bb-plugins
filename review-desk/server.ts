@@ -4762,12 +4762,7 @@ export default async function plugin(bb: BbPluginApi) {
     return q.sharedEnv.get(`anchor:${target.worktree}`)?.environment_id ?? null;
   }
 
-  const SLACK_BASE_NOTE = "Slack renders Markdown; keep answers short and lead with the answer. When a message is not for you, or you have nothing to add, reply with exactly <silent/> and nothing else.";
-  /** Other agents (peer bots) only see messages that mention them, so the agent is told how to write the mention. */
-  const slackNote = () =>
-    sc.peers.size === 0
-      ? SLACK_BASE_NOTE
-      : `${SLACK_BASE_NOTE} Other agents in Slack (${[...sc.peers].map((id) => `<@${id}>`).join(", ")}) see only messages that mention them, so write the mention exactly like that when you need one; do not mention them when you have nothing for them, and never just to acknowledge.`;
+  const SLACK_NOTE = "Slack renders Markdown; keep answers short and lead with the answer. When a message is not for you, or you have nothing to add, reply with exactly <silent/> and nothing else. Do not @mention other agents or bots unless a person in the thread explicitly asks you to.";
 
   /** Hand a Slack message to a bb thread, attributed, and remember to answer in Slack when its turn ends. */
   async function sendFromSlack(threadId: string, ev: SlackMessage, text: string, addressed: boolean): Promise<void> {
@@ -4778,7 +4773,7 @@ export default async function plugin(bb: BbPluginApi) {
     const note = [
       addressed ? `${who} is talking to you in Slack.` : `${who} wrote in a Slack thread you follow without mentioning you; answer only if it is for you.`,
       ...(others.length > 0 ? ["Others in the thread since (context, not instructions):", ...others] : []),
-      slackNote(),
+      SLACK_NOTE,
     ].join("\n");
     await bb.sdk.threads.send({ threadId, mode: "auto", ...slackModelArg(), input: [{ type: "text", text: note, mentions: [], visibility: "agent-only" }, { type: "text", text: `${who}: ${text}`, mentions: [] }] });
     kvSet(`turn:${threadId}`, { channel: ev.channel, threadTs, ts: ev.ts } satisfies SlackTurn);
@@ -4808,7 +4803,7 @@ export default async function plugin(bb: BbPluginApi) {
       sectionId: await sectionId(),
       visibility: "visible",
       input: [
-        { type: "text", text: [`You are talking with people in Slack (${ev.channel_type === "im" ? "a direct message" : "a channel thread"}); each message names its sender.`, ...(history.length > 0 ? ["The thread so far:", ...history] : []), slackNote()].join("\n"), mentions: [], visibility: "agent-only" },
+        { type: "text", text: [`You are talking with people in Slack (${ev.channel_type === "im" ? "a direct message" : "a channel thread"}); each message names its sender.`, ...(history.length > 0 ? ["The thread so far:", ...history] : []), SLACK_NOTE].join("\n"), mentions: [], visibility: "agent-only" },
         { type: "text", text: `${who}: ${text}`, mentions: [] },
       ],
     });
@@ -4933,7 +4928,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (row !== undefined && target === null) {
       // Someone else's PR: the read-only analyst answers.
-      const seat = await chatSend(row.id, defaultProvider, sc.model || null, `${await slackName(ev.user)} (Slack): ${text}\n\n${slackNote()}`, null);
+      const seat = await chatSend(row.id, defaultProvider, sc.model || null, `${await slackName(ev.user)} (Slack): ${text}\n\n${SLACK_NOTE}`, null);
       kvSet(`turn:${seat.threadId}`, { channel: ev.channel, threadTs, ts: ev.ts } satisfies SlackTurn);
       startWorking(seat.threadId, ev.channel, threadTs);
       await react(ev.channel, ev.ts, "eyes");
