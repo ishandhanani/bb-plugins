@@ -5666,6 +5666,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "map", summary: "Write or print the PR's diffmap spec", usage: "bb review-desk map <reviewId> [--rewrite] [--json]" },
       { name: "simple", summary: "Queue Simple English rewrites of all the comments, redo them all, or request one comment by key", usage: "bb review-desk simple <reviewId> [--redo | --key <t:...|c:...|r:...>] [--json]" },
+      { name: "slack", summary: "Post the PR to the Slack bridge's channel (the PR page's Post to Slack button), stop posting it, or show whether it is posted", usage: "bb review-desk slack <reviewId> [on|off|show] [--json]" },
     ],
     async run(argv) {
       const json = argv.includes("--json");
@@ -5801,8 +5802,14 @@ export default async function plugin(bb: BbPluginApi) {
             const status = `Map ${state.status}${state.stale ? ` (on file: ${state.headSha?.slice(0, 10)}, an older head)` : ""}${state.error ? `: ${state.error}` : ""}`;
             return ok(state, markdown === null ? `${status}. Run again in a moment.` : `${status}\n\n${markdown}`);
           }
+          case "slack": {
+            const [reviewId, action = "on"] = rest;
+            if (!reviewId || !["on", "off", "show"].includes(action)) return { exitCode: 1, stderr: "usage: bb review-desk slack <reviewId> [on|off|show]" };
+            const state = action === "show" ? slackState(requireReview(reviewId).id) : await setOnSlack(reviewId, action === "on");
+            return ok(state, state.on ? `On Slack${state.url ? `: ${state.url}` : ""}` : "Not on Slack");
+          }
           default:
-            return { exitCode: 1, stderr: "usage: bb review-desk open|list|board|move|refresh|factory|ask|map|simple" };
+            return { exitCode: 1, stderr: "usage: bb review-desk open|list|board|move|refresh|factory|ask|map|simple|slack" };
         }
       } catch (cause) {
         return { exitCode: 1, stderr: errorMessage(cause) };

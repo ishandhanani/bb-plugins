@@ -135,6 +135,7 @@ bb review-desk refresh
 bb review-desk factory <start|stop|show|ping|resolve|fix|deslop|report|learn|prompt> <reviewId>
 bb review-desk ask <reviewId> <text...> [--provider <id>]
 bb review-desk map <reviewId> [--rewrite]
+bb review-desk slack <reviewId> [on|off|show]
 ```
 
 ## Settings
