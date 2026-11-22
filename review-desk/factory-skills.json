@@ -1,30 +1,86 @@
 {
   "personal": {
-    "review": ["rust-code-review", "deep-code-review", "general-review"],
+    "review": [
+      "rust-code-review",
+      "deep-code-review",
+      "general-review"
+    ],
     "perf": [],
-    "fix": ["gh-comment-ledger"],
-    "check": ["deep-code-review"]
+    "fix": [
+      "gh-comment-ledger"
+    ],
+    "check": [
+      "deep-code-review"
+    ],
+    "babysit": [
+      "pr-babysitter"
+    ]
   },
   "repos": {
     "ai-dynamo/dynamo": {
-      "review": ["graham-code-review", "pr-checklist"],
-      "perf": ["dynamo-perf-best-practices", "dynamo-clone-hotpath-audit"],
-      "measure": ["dynamo-frontend-benchmark"],
+      "review": [
+        "graham-code-review",
+        "pr-checklist"
+      ],
+      "perf": [
+        "dynamo-perf-best-practices",
+        "dynamo-clone-hotpath-audit"
+      ],
+      "measure": [
+        "dynamo-frontend-benchmark"
+      ],
       "fix": [],
       "check": [],
       "reviewByTopic": false,
-      "perfPaths": ["lib/llm/", "lib/runtime/"]
+      "perfPaths": [
+        "lib/llm/",
+        "lib/runtime/"
+      ],
+      "babysit": [
+        "pr-monitor"
+      ],
+      "ci": {
+        "guide": "ci/ai-dynamo__dynamo.md",
+        "act": "mine"
+      }
     },
-    "ishandhanani/dynamo": { "sameAs": "ai-dynamo/dynamo" },
+    "ishandhanani/dynamo": {
+      "sameAs": "ai-dynamo/dynamo"
+    },
     "sgl-project/sglang": {
       "review": [],
-      "perf": ["generate-profile", "llm-torch-profiler-analysis"],
+      "perf": [
+        "generate-profile",
+        "llm-torch-profiler-analysis"
+      ],
       "measure": [],
       "fix": [],
-      "check": ["mechanical-refactor-verify"],
+      "check": [
+        "mechanical-refactor-verify"
+      ],
       "reviewByTopic": true,
-      "perfPaths": ["python/sglang/srt/managers/", "python/sglang/srt/model_executor/", "python/sglang/srt/layers/", "python/sglang/srt/mem_cache/", "python/sglang/srt/sampling/", "rust/", "sgl-model-gateway/"]
+      "perfPaths": [
+        "python/sglang/srt/managers/",
+        "python/sglang/srt/model_executor/",
+        "python/sglang/srt/layers/",
+        "python/sglang/srt/mem_cache/",
+        "python/sglang/srt/sampling/",
+        "rust/",
+        "sgl-model-gateway/"
+      ],
+      "babysit": [
+        "babysit-pr-to-pass-ci",
+        "ci-workflow-guide",
+        "rerun-test",
+        "sglang-bisect-ci-regression"
+      ],
+      "ci": {
+        "guide": "ci/sgl-project__sglang.md",
+        "act": "any"
+      }
     },
-    "ishandhanani/sglang": { "sameAs": "sgl-project/sglang" }
+    "ishandhanani/sglang": {
+      "sameAs": "sgl-project/sglang"
+    }
   }
 }

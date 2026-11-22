@@ -195,48 +195,41 @@ export function deslopReportBody(args: { run: number; summary: string; items: { 
 
 // -- babysitter -------------------------------------------------------------
 
-export const BABYSIT_OUTCOMES = ["rerun", "merge_base", "fix", "waiting", "needs_human", "ok"] as const;
+export const BABYSIT_OUTCOMES = ["rerun", "merge_base", "fix", "waiting", "blocked", "needs_human", "ok"] as const;
 export type BabysitOutcome = (typeof BABYSIT_OUTCOMES)[number];
 
 export function babysitIntro(c: { owner: string; repo: string; number: number; title: string; worktree: string }): string {
   return [
     `You babysit CI for pull request #${c.number} of ${c.owner}/${c.repo}: "${c.title}" until it merges. Each message is one pass. Answer each pass with exactly one fenced block tagged ${BABYSIT_FENCE} containing JSON, and nothing after it.`,
     worktreeLine(c.worktree),
-    "Hard rules: never edit files, never commit, never push, never merge, never close, never comment on the PR or its threads. The only GitHub write you may make is re-running failed jobs (gh run rerun <run-id> --failed). Review Desk posts what you did on the PR.",
-    "You never change code yourself. On the author's own PR a failure its code causes goes to the author's agent (outcome fix); anything else that needs a code change or a decision goes back to the human: report needs_human and stop.",
+    "Hard rules: never edit files, never commit, never push, never merge, never close, never write on the PR's review threads. The GitHub writes you may make are re-running failed jobs (gh run rerun <run-id> --failed) and the CI commands the repository's guide names (for example a slash command posted as a PR comment that starts or re-runs CI). Review Desk posts what you did on the PR.",
+    "You never change code yourself. A failure that needs a code change, or the base branch merged in, is done by another agent when you report it (outcome fix or merge_base); you say which. A person is asked only when nothing else can move the PR.",
+    "Wait for what you start: do not end your turn while a command you started is still running in the background.",
   ].join("\n");
 }
 
-export function babysitPrompt(c: { owner: string; repo: string; number: number; headSha: string; baseRef: string; pass: number; maxPasses: number; failing: { name: string; url: string | null }[]; conflicting: boolean; canMergeBase: boolean; canFix: boolean }): string {
-  return [
-    `Pass ${c.pass} of at most ${c.maxPasses} at head ${c.headSha} of ${c.owner}/${c.repo}#${c.number}.`,
-    c.conflicting ? "GitHub reports merge conflicts with the base branch." : "",
-    c.failing.length === 0 ? "No failing checks are reported." : `Failing checks:\n${c.failing.map((f) => `  ${f.name}${f.url ? ` ${f.url}` : ""}`).join("\n")}`,
-    "",
-    "If you have a skill for watching a PR's CI, use it to diagnose; the rules you were given win over it. Otherwise read gh pr checks and gh run view --log-failed.",
-    "Decide for each failure what will make it pass:",
-    "- A flake, an infra failure, or a cancelled run: re-run the failed jobs (gh run rerun <run-id> --failed), once per pass.",
-    c.canMergeBase
-      ? `- A failure the branch would not have with the latest ${c.baseRef}: a fix that has landed on ${c.baseRef} since the merge base (check git log <merge-base>..origin/${c.baseRef} for it), or a test that only fails against an old base. Answer merge_base; the author's agent merges ${c.baseRef} into the branch and pushes. Do not merge yourself. Only when ${c.baseRef} actually has what fixes it: merging a base with the same failure does not help.`
-      : "",
-    c.canMergeBase ? `- Merge conflicts with ${c.baseRef}, failing checks or not: merge_base; the author's agent merges ${c.baseRef} in and resolves them. A conflict is never a reason for needs_human here.` : "",
-    c.canFix
-      ? "- A failure the PR's own code causes (a test it breaks, a type, build, or lint error in what it changed): fix. The author's agent fixes it on the branch and pushes. In detail name the check, the failing test or error, and the cause you found, with file:line; list the failing job URLs in jobs."
-      : "",
-    "- A check that only gates opt-in workflows (it fails because the PR lacks the label or approval that turns them on), or a summary job that fails only because another listed check failed: list its exact name in expected. Expected checks are not treated as failing at this head. When every failure is expected, answer ok.",
-    `- ${c.canFix ? "A failure nothing above fixes" : "A failure the PR causes, or one nothing above fixes"}: needs_human, saying what is wrong and what would fix it.`,
-    "",
-    `Reply with one fenced block tagged ${BABYSIT_FENCE}:`,
-    `{ "outcome": "rerun"${c.canMergeBase ? ' | "merge_base"' : ""}${c.canFix ? ' | "fix"' : ""} | "waiting" | "needs_human" | "ok", "detail": string, "jobs": string[], "expected": string[] }`,
-    "rerun: you re-ran failed jobs; list them in jobs. waiting: checks are still running and nothing needs doing. ok: nothing is failing, or only expected checks are. needs_human: as above.",
-    "detail: one or two sentences: which check, why it failed, and why your choice will fix it (or what the human must do).",
-  ].filter((l) => l !== "").join("\n");
+const babysitReplySchema = z.object({
+  outcome: z.enum(BABYSIT_OUTCOMES),
+  cause: z.string().default(""),
+  detail: z.string().default(""),
+  jobs: z.array(z.string()).default([]),
+  expected: z.array(z.string()).default([]),
+  fixedBy: z.array(z.union([z.string(), z.number()])).default([]),
+});
+
+/** The pull request numbers a babysit pass named as the fix, read from numbers, "#123", or PR URLs. */
+function prNumbers(values: (string | number)[]): number[] {
+  const out = new Set<number>();
+  for (const v of values) {
+    const n = typeof v === "number" ? v : Number(/(?:\/pull\/|#|^)(\d+)\b/.exec(v.trim())?.[1]);
+    if (Number.isInteger(n) && n > 0) out.add(n);
+  }
+  return [...out];
 }
 
-const babysitReplySchema = z.object({ outcome: z.enum(BABYSIT_OUTCOMES), detail: z.string().default(""), jobs: z.array(z.string()).default([]), expected: z.array(z.string()).default([]) });
-
-export function parseBabysitReply(text: string): { outcome: BabysitOutcome; detail: string; jobs: string[]; expected: string[] } {
-  return babysitReplySchema.parse(replyJson(text, BABYSIT_FENCE));
+export function parseBabysitReply(text: string): { outcome: BabysitOutcome; cause: string; detail: string; jobs: string[]; expected: string[]; fixedBy: number[] } {
+  const reply = babysitReplySchema.parse(replyJson(text, BABYSIT_FENCE));
+  return { ...reply, cause: reply.cause.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 200), fixedBy: prNumbers(reply.fixedBy) };
 }
 
 /** A short PR comment for one thing the factory did to keep CI green, its details folded. */
@@ -260,11 +253,13 @@ export const FIX_FENCE = "ai-fix";
 export const FIX_VERDICTS = ["FIX", "SKIP", "ASK"] as const;
 export type FixVerdict = (typeof FIX_VERDICTS)[number];
 
-export function fixerIntro(c: { owner: string; repo: string; number: number; title: string; headRef: string; worktree: string; remote: string }): string {
+export function fixerIntro(c: { owner: string; repo: string; number: number; title: string; headRef: string; worktree: string; remote: string; mine?: boolean }): string {
   return [
-    `You are the author's agent for pull request #${c.number} of ${c.owner}/${c.repo}: "${c.title}". The author wrote this PR; you act for them. Each message is one job; answer each with exactly one fenced block tagged ${FIX_FENCE} containing JSON, and nothing after it.`,
+    c.mine === false
+      ? `You keep CI green on pull request #${c.number} of ${c.owner}/${c.repo}: "${c.title}", for a maintainer of the repository. Someone else wrote this PR. Your jobs are only to merge the base branch in and to fix what makes CI fail; never change what the PR does, and never answer its review comments. Each message is one job; answer each with exactly one fenced block tagged ${FIX_FENCE} containing JSON, and nothing after it.`
+      : `You are the author's agent for pull request #${c.number} of ${c.owner}/${c.repo}: "${c.title}". The author wrote this PR; you act for them. Each message is one job; answer each with exactly one fenced block tagged ${FIX_FENCE} containing JSON, and nothing after it.`,
     `Your working directory is the PR branch's worktree, ${c.worktree}, on branch ${c.headRef}. Push with: git push ${c.remote} HEAD:${c.headRef}.`,
-    "Allowed: edit files in this worktree, commit (one logical change per commit, plain messages, no co-author or tool trailers), push to the PR branch when a job tells you to, reply on the PR's review threads, and resolve threads that the AI review opened.",
+    "Allowed: edit files in this worktree, commit (one logical change per commit, plain messages, no co-author or tool trailers), push to the PR branch when a job tells you to, reply on the PR's review threads, and resolve threads that the AI review or a bot opened.",
     "A fix job has two steps. First you commit without pushing; a separate check reads your commits. When it passes you are told to push and reply on the threads. Never push before you are told to.",
     `When the work needs it you may rebase onto or merge the base branch, resolve conflicts, and reword or squash the PR's own commits; push a rewritten branch with git push --force-with-lease ${c.remote} HEAD:${c.headRef}, never a plain --force. Say in your summary when you did.`,
     "Never: merge the PR itself, push to any branch but the PR's, close the PR, mark it ready, request reviewers, resolve threads a human reviewer opened, or touch files outside this worktree.",

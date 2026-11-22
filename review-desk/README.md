@@ -26,9 +26,9 @@ Nothing reaches the board on its own: you add a PR (paste its link, or `bb revie
 
 ```mermaid
 flowchart TD
-    A["You add the PR to the board"] --> R["REVIEW<br/>reads your skills from this machine and the repo's skills from its latest default branch<br/>whole PR on the first and last pass, new commits in between"]
+    A["You add the PR to the board"] --> R["REVIEW<br/>reads your skills from this machine and the repo's skills from its latest default branch<br/>whole PR on the first pass, new commits after; the last whole-PR pass runs on another model family"]
     R --> Q{"Diff touches a request path?"}
-    Q -- no --> POST["Every finding is posted, NITs included, each with a label"]
+    Q -- no --> POST["Every finding is posted as its own thread, NITs included, each with a label"]
     Q -- yes --> PF["PERF REVIEW<br/>the repo's perf skills and the AGENTS.md of the touched directories"]
     PF --> M{"Does the cost argument settle it?"}
     M -- yes --> POST
@@ -43,8 +43,10 @@ flowchart TD
     PUSH --> R
     N -- no --> G{"Reviewed head is the current head?"}
     G -- no --> R
-    G -- yes --> RDY["READY FOR YOU<br/>CI is babysat; you request reviewers"]
-    RDY -- "a reviewer comments" --> F
+    G -- yes --> BOT{"Bots have reviewed, and their threads<br/>and the AI NITs are answered?"}
+    BOT -- "threads open" --> F
+    BOT -- yes --> RDY["READY FOR YOU<br/>CI is babysat; you request reviewers"]
+    RDY -- "a reviewer or a bot comments" --> F
     RDY -- "someone pushes" --> R
     RDY -- "merged" --> L["LEARN<br/>human comments against AI findings: recall for the PR"]
     L --> W["Weekly automation<br/>cluster the misses, propose skill and prompt patches, replay them on frozen heads, report"]
@@ -54,14 +56,43 @@ The stages:
 
 | Stage | When | What it does | Prompt | Thread |
 |---|---|---|---|---|
-| REVIEW | every head, once it has sat still for `aiReviewSettleMinutes` (at once after the author's agent pushes) | Round 1 covers the whole PR. Later rounds cover what the PR changed since the last round and decide which earlier findings are fixed, open, or obsolete. Before the PR is first called ready, one more whole-PR pass runs on a new thread with fresh eyes, if commits landed since round 1. The server posts a COMMENT review per round: findings inline, labeled BLOCKER, BUG, PERF, TEST, DESIGN, QUESTION, or NIT; NITs and findings outside the diff in the body. Nothing is filtered or refuted before it is posted. | `prompts/review.md` | AI review |
+| REVIEW | every head, once it has sat still for `aiReviewSettleMinutes` (at once after the author's agent pushes) | Round 1 covers the whole PR. Later rounds cover what the PR changed since the last round and decide which earlier findings are fixed, open, or obsolete. Before the PR is first called ready, one more whole-PR pass runs on a new thread with fresh eyes, if commits landed since round 1. That pass runs on `finalPassProvider` / `finalPassModel` (GPT-6-Astra on Codex by default), with the same prompt and the same read-first list, so a second model family looks before you do. The server posts a COMMENT review per round: every finding as its own inline thread, labeled BLOCKER, BUG, PERF, TEST, DESIGN, QUESTION, or NIT; only findings outside the diff go in the body. Nothing is filtered or refuted before it is posted. | `prompts/review.md` | AI review |
 | PERF REVIEW | after a round's review, when the files that round covers touch a request path: a prefix listed under `perfPaths`, or a directory whose `AGENTS.md` has a `## Performance` section | The reviewer argues the cost per request, token, event, or connection against the base branch, at the repository's default limits. It measures only when the code does not settle it, and reports the finding either way. Posted as its own review. | `prompts/perf.md` | AI review (same thread) |
 | FIX | your own PRs: after a round with something to fix, after a reviewer's or your comments, and for a CI failure the PR causes | The author's agent pulls every comment fresh, judges each (FIX, SKIP, ASK), and commits fixes without pushing. When the rounds first converge it also deslops the diff once. | `prompts/fix.md` | Author's agent |
 | CHECK | before every push by the author's agent | A reviewer that has never seen the PR argues against each commit: does it fix what was asked, does it add work on a request path, does it add something unused, does its test fail without the fix, was the comment worth applying. A rejected commit goes back to the agent once; a second rejection comes to you and nothing is pushed. | `prompts/check.md` | Check (new each time) |
-| Babysit | once the PR is ready, or approved | Re-runs flaky CI, has the author's agent merge the base or fix a failure the PR causes, and hands the rest to you. | built in `factory-spec.ts` | CI babysit |
+| Babysit | once the PR is ready or approved, and on every waiting PR the factory may push to | Gets CI green by itself: see [CI babysitting](#ci-babysitting). | `prompts/babysit.md` plus the repository's guide in `ci/` | CI babysit |
 | LEARN | after a merge | Writes every human comment and every AI finding to telemetry, and matches them: found, demoted (seen and lost), or missed, with the cause of each miss. | `prompts/learn.md` | Learn |
 
 On someone else's PR there is no FIX: rounds run on each push until nothing above a NIT is open or a push changes nothing, then the PR comes to you in **Your review**. Your review moves it on: an approval to **Babysit**, anything else to **Changes requested** until the author pushes, which sends it through a round and back to you.
+
+### Before a PR is ready: bots and NITs
+
+On your own PR the loop does not call a PR ready while a bot's review thread is open. When the rounds converge it first waits until the head has been up for `botSettleMinutes` (bot reviewers such as CodeRabbit post a few minutes after a push; a bot check that is still running extends the wait). Then every unresolved thread a bot opened, and every AI review NIT, goes to the author's agent in one run: it reads the code the comment points at, fixes it or says why not, replies, and resolves the thread, and its commits pass CHECK like any other. A push sends the PR through a round and back to this gate. If a bot's thread is still open after the agent answered at that head, the PR comes to you in Needs you. Once a PR is Ready, a bot review that arrives later starts the same run.
+
+### CI babysitting
+
+The babysitter's job is to get CI green without asking. Each pass reads the failing checks with the repository's CI skills and its guide, and picks one outcome:
+
+```mermaid
+flowchart TD
+    X["CI not green"] --> C{"Conflict with the base?"}
+    C -- yes --> MB["Merge the base in, no ping<br/>the card stays in its column"]
+    C -- no --> FL{"Flake or infrastructure?"}
+    FL -- yes --> RR["Re-run the failed jobs"]
+    FL -- "run still going" --> WT["Wait; look again when it finishes"]
+    FL -- no --> MAIN{"Does the base branch fail the same way?"}
+    MAIN -- "yes, fix merged" --> MB
+    MAIN -- "yes, fix open" --> BL["Blocked: watch that PR, ping you once<br/>merge the base in when it lands"]
+    MAIN -- "yes, no fix" --> BQ["Blocked: shown on the card, no ping"]
+    MAIN -- no --> OWN{"The PR's own code"}
+    OWN -- "may push here" --> FX["An agent fixes it; CHECK reads the commit before the push"]
+    OWN -- "may not" --> YOU["Needs you"]
+```
+
+- **Per repository.** `factory-skills.json` gives each repository a `babysit` list (its CI skills) and a `ci` entry: `guide`, a file in `ci/` with that repository's rules, and `act`, whose PRs the factory may push to for CI: `mine` (your own) or `any` (every PR of that repository on the board). To add a repository, add its entry and a guide file.
+- **SGLang** (`ci/sgl-project__sglang.md`, `act: any`): only `lint` and the base tier must be green, plus tests the PR description names; extra tiers and opt-in gates are expected failures. The factory merges main in and makes small CI fixes on teammates' PRs, because you maintain the repository.
+- **Dynamo** (`ci/ai-dynamo__dynamo.md`, `act: mine`): a conflict is always merged in, in any column, without a ping.
+- **Pings.** You are told once per cause: when a fix exists on the base repository and is not merged, when only a person can decide, or when the pass budget runs out. The same cause is never pinged twice, and a head pings at most once in three hours. In Slack, babysit actions repaint one message in the PR's thread instead of adding replies.
 
 ### The board
 
@@ -78,7 +109,7 @@ A new push to a PR that is waiting, or a reviewer's comments on your own PR, sen
 ### Where prompts and skills live
 
 - **Prompts** are plain files in `prompts/`, one per stage, and hold process only: what the stage does, in what order, and what it must output. Sections inside a file start at a `<!-- @name -->` line. A prompt's version in telemetry is the hash of its file.
-- **The skills map** is `factory-skills.json`. For each stage it names the skills to read: `personal` (your own, by name) and, per repository, `review`, `perf`, `measure`, `fix`, and `check`, plus `perfPaths`. A fork says `sameAs` and reads its upstream's.
+- **The skills map** is `factory-skills.json`. For each stage it names the skills to read: `personal` (your own, by name) and, per repository, `review`, `perf`, `measure`, `fix`, `check`, and `babysit`, plus `perfPaths` and `ci`. A fork says `sameAs` and reads its upstream's.
 - **Your skills** are read from this machine as they are now (`~/.claude/skills/<name>/SKILL.md`).
 - **The repository's skills and `AGENTS.md` files** are read from its latest default branch, fetched before every job and exported to `~/.review-desk/skills/<owner>__<repo>/<sha>/`, so a job never reads a stale copy from the PR branch. A repository with `reviewByTopic` has topic skills instead of one review skill: the reviewer gets every skill's description and reads the ones that fit the diff.
 - Each prompt starts with a "Read first" list of those files, built by the server, and the reply names the ones that were read. Telemetry records the list with each file's digest.
@@ -99,7 +130,8 @@ A turn that ends without its reply block (the agent stopped to wait on a backgro
 - `app.tsx` — the **Reviews** nav panel; fixed tabs **Info** and **Chat**; the composer banner that receives pills.
 - `board-spec.ts` — the board's columns and their labels, shared by server and app.
 - `factory-spec.ts` — the PR factory's labels, reply parsing, thread intros, and the GitHub review body, shared by server and app.
-- `prompts/*.md` — the factory's stage prompts: `review`, `perf`, `fix` (with its revise, publish, deslop, and CI sections), `check`, `learn`.
+- `prompts/*.md` — the factory's stage prompts: `review`, `perf`, `fix` (with its revise, publish, deslop, and CI sections), `check`, `babysit`, `learn`.
+- `ci/*.md` — one CI guide per repository, shown to the babysitter.
 - `factory-skills.json` — which skills each stage reads, per repository, and the request paths that trigger a perf review.
 - `factory-prompts.ts` — loads the prompt files and the skills map, and builds each stage's prompt (server only).
 - `factory-skills-host.ts` — on the repository's machine: finds your skills, and exports the repository's skills and `AGENTS.md` files from its latest default branch.
@@ -150,19 +182,21 @@ bb review-desk slack <reviewId> [on|off|show]
 - `simpleEnglishSkill` (default empty): optional file appended to the rewrite prompt as vocabulary help, for example a `simple-english` SKILL.md. Empty uses a short built-in word list. A long rule set makes a fast model paraphrase instead of shorten, so the default is the short list.
 - `boardRefresh` (default `*/15 * * * *`): cron (5 fields, server-local time) for syncing the board's open PRs with GitHub in the background; empty turns it off.
 - `autoAiReview` (default true): adding a PR to the board starts the factory. Rounds post COMMENT reviews under your `gh` login. Nothing is added to the board for you.
-- `aiReviewProvider` / `aiReviewModel` (default `claude-code` / `claude-fable-5-1`): the AI reviewer.
+- `aiReviewProvider` / `aiReviewModel` (default `claude-code` / `claude-fable-5-2`): the AI reviewer. `factoryReasoning` (default `xhigh`): the reasoning level for the reviewer, the author's agent, and the check.
+- `finalPassProvider` / `finalPassModel` / `finalPassReasoning` (default `codex` / `gpt-6-astra` / empty): the whole-PR pass with fresh eyes before a PR is first called ready. Empty provider uses the reviewer's. If that provider cannot start, the pass runs on the reviewer's model.
+- `botSettleMinutes` (default 10): how long a head must have been up before your PR is called ready, so bot reviewers have posted; 0 turns the wait off.
 - `aiReviewMaxRounds` (default 6): safety cap on AI rounds in one loop (from a new head until the PR is ready again); the loop normally ends sooner, when a round leaves only nits or makes no progress.
 - `perfReview` (default true): run the perf review when a round's files touch a request path.
-- `checkCommits` (default true): check the author's agent's commits before they are pushed. `checkModel` (default `claude-fable-5-1`): the check's model; a different model than the agent's catches more.
-- `reviewBots` (default `coderabbitai,dynamo-review-agent,copilot-pull-request-reviewer,github-actions,codecov`): logins that are bots. A review from anyone else on your own PR goes to the author's agent; bots' comments are read on the next fix run.
+- `checkCommits` (default true): check the author's agent's commits before they are pushed. `checkModel` (default `claude-fable-5-2`): the check's model; a different model than the agent's catches more.
+- `reviewBots` (default `coderabbitai,dynamo-review-agent,copilot-pull-request-reviewer,github-actions,codecov`): logins that are bots. A review from anyone else on your own PR goes to the author's agent at once; a bot's threads are answered at the gate before the PR is ready.
 - `aiReviewConcurrency` (default 2): rounds running at once across the board.
 - `aiReviewSettleMinutes` (default 10): how long a new head must sit unchanged before the next round. Pushes are noticed on the `boardRefresh` cron.
 - `aiReviewSkills` (default empty): extra skills the reviewer must read on top of `factory-skills.json`; comma separated, `owner/repo=skill` for one repository.
 - `aiReviewEmpirical` (default false): let the reviewer run skills that build, launch servers, or run GPU or load tests. Off, it applies them by reading the code.
-- `authorPipeline` (default true): on your own PRs, run FIX and CHECK. `fixerProvider` / `fixerModel` (default `claude-code` / `claude-opus-5-5`): the author's agent, which fixes feedback and merges the base.
-- `deslopStage` (default true): deslop your PR once, when the rounds first converge; its commits are checked and reviewed like any fix. `deslopModel` (default `claude-fable-5-1`; empty uses `fixerModel`): the model for those turns, in the same thread.
-- `babysitProvider` / `babysitModel` (default `claude-code` / `claude-opus-5-5`): the CI babysitter.
-- `babysitMaxPasses` (default 3): babysit passes per head before CI failures are handed to you.
+- `authorPipeline` (default true): on your own PRs, run FIX and CHECK. `fixerProvider` / `fixerModel` (default `claude-code` / `claude-fable-5-2`): the author's agent, which fixes feedback and merges the base.
+- `deslopStage` (default true): deslop your PR once, when the rounds first converge; its commits are checked and reviewed like any fix. `deslopModel` (default empty, which uses `fixerModel`): the model for those turns, in the same thread.
+- `babysitProvider` / `babysitModel` / `babysitReasoning` (default `claude-code` / `claude-fable-5-2` / `high`): the CI babysitter.
+- `babysitMaxPasses` (default 10): babysit passes per head before CI failures are handed to you; re-runs and waits count.
 - `slackBotToken` / `slackAppToken` (secrets, default empty): the Slack bridge's bot token (`xoxb-…`) and app-level token (`xapp-…`, `connections:write`). Create the app from `slack-app-manifest.yaml`. The bridge's settings apply live: it connects when both tokens are set and reconnects when any of them change.
 - `slackChannel` (default empty): the channel id for the PR threads; invite the bot to it.
 - `slackUserId` (default empty): your Slack member id. Hand-offs mention you, and you can steer the agents.

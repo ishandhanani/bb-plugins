@@ -91,10 +91,12 @@ function cardStatus(card: ReviewSummary, stage: BoardStage): { label: string; to
     const whole = f.roundKind === "full";
     return { label: `Round ${f.round}${whole && f.round > 1 ? " · whole PR" : ""}`, tone: "strong", icon: "Clock", title: whole ? "A review of the whole PR" : "A review of what changed since the last round" };
   }
+  if (f?.holdUntil != null) return { label: "Waiting for bots", tone: "muted", icon: "Clock", title: "The loop is done at this head. It waits for bot reviewers (CodeRabbit and the like) to post, and their threads are answered before the PR is called ready" };
   if (f?.perf === "running") return { label: `Round ${f.round} · perf`, tone: "strong", icon: "Clock", title: "The diff touches a request path: a performance review with the repository's perf skills" };
   if (f?.reviewedHead != null && f.reviewedHead !== card.headSha && (stage === "babysit" || stage === "human_review")) return { label: "New commits", tone: "muted", icon: "Clock", title: "The head moved since the last review round; a round runs once it settles" };
   if (f?.roundStatus === "failed") return { label: "Round failed", tone: "bad", icon: "AlertTriangle", title: f.error ?? undefined };
   if (card.mergeable === "CONFLICTING") return { label: "Conflicts", tone: "bad", icon: "AlertTriangle" };
+  if (f?.babysit === "blocked" && f.ci) return { label: f.ci.fixedBy.length > 0 ? `CI waits on #${f.ci.fixedBy[0]}` : "CI blocked on base", tone: "muted", icon: "Clock", title: f.ci.note };
   if (card.checks.failed > 0) return { label: `CI ${card.checks.failed} failing`, tone: "bad", icon: "CircleX", title: card.failingChecks.map((c) => c.name).join("\n") };
   if (card.checks.pending > 0) return { label: "CI running", tone: "muted", icon: "Clock" };
   if (stage === "babysit" && card.checks.total > 0 && !card.isDraft) return { label: "Ready to merge", tone: "ok", icon: "CircleCheck" };
