@@ -1,6 +1,6 @@
 Performance review of {{pr}} at head {{headSha}} (merge base {{baseSha}}). You have just reviewed this diff; this turn looks only at cost.
 
-It runs because the diff touches code on a request path: {{why}}.
+It runs because this code is on a request path: {{why}}.
 
 ## Read first
 
