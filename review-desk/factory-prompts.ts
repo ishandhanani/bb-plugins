@@ -25,8 +25,6 @@ export interface RepoSkills {
   ci: { guide: string; act: "mine" | "any" };
   /** The repository has topic skills, not one review skill: the reviewer reads each whose description fits the diff. */
   reviewByTopic: boolean;
-  /** Path prefixes on a request path; a diff that touches one gets a perf review. Directories whose AGENTS.md has a Performance section count too. */
-  perfPaths: string[];
   /** The repository whose latest default branch the skills are read from (a fork reads its upstream's). */
   source: string;
 }
@@ -92,7 +90,7 @@ export function render(files: FactoryFiles, part: string, vars: Record<string, s
   });
 }
 
-const EMPTY: RepoSkills = { review: [], perf: [], measure: [], fix: [], check: [], babysit: [], ci: { guide: "", act: "mine" }, reviewByTopic: true, perfPaths: [], source: "" };
+const EMPTY: RepoSkills = { review: [], perf: [], measure: [], fix: [], check: [], babysit: [], ci: { guide: "", act: "mine" }, reviewByTopic: true, source: "" };
 
 /** The skills map for a repository; one it does not list gets topic picking from its own skills and no perf paths. */
 export function repoSkills(config: SkillsConfig, owner: string, repo: string): RepoSkills {
@@ -168,16 +166,21 @@ export function skillsBlock(files: SkillFile[], found: ResolvedSkills, map: Repo
   return lines.join("\n");
 }
 
-/** A diff gets a perf review when it touches a listed request path or a directory whose AGENTS.md has a Performance section. */
-export function perfReason(map: RepoSkills, found: ResolvedSkills, changedPaths: string[]): string | null {
-  const prefixes = [...map.perfPaths, ...found.perfDirs.map((d) => (d === "" ? "" : `${d}/`)).filter((d) => d !== "")];
+/**
+ * Why a round gets a perf turn, or null when it gets none. Two things can ask for one, and neither is a list kept here:
+ * the repository itself (a changed file sits under a directory whose AGENTS.md has a Performance section), and the
+ * reviewer, who has just read the diff and says whether it touches code that runs per request, token, event, or connection.
+ */
+export function perfReason(found: ResolvedSkills, changedPaths: string[], reviewer: { needed: boolean; why: string } | null): string | null {
+  const dirs = found.perfDirs.filter((d) => d !== "").map((d) => `${d}/`);
   const hits = new Map<string, number>();
   for (const p of changedPaths) {
-    const prefix = prefixes.filter((x) => p.startsWith(x)).sort((a, b) => b.length - a.length)[0];
-    if (prefix !== undefined) hits.set(prefix, (hits.get(prefix) ?? 0) + 1);
+    const dir = dirs.filter((x) => p.startsWith(x)).sort((a, b) => b.length - a.length)[0];
+    if (dir !== undefined) hits.set(dir, (hits.get(dir) ?? 0) + 1);
   }
-  if (hits.size === 0) return null;
-  return [...hits.entries()].slice(0, 8).map(([prefix, n]) => `${n} file${n === 1 ? "" : "s"} under ${prefix}`).join(", ");
+  const reasons = [...hits.entries()].slice(0, 8).map(([dir, n]) => `${n} file${n === 1 ? "" : "s"} under ${dir}, whose AGENTS.md has a Performance section`);
+  if (reviewer?.needed) reasons.push(`the reviewer's reading of the diff: ${reviewer.why.trim().replace(/\s+/g, " ").slice(0, 400) || "it touches a request path"}`);
+  return reasons.length === 0 ? null : reasons.join("; ");
 }
 
 // -- prompts -------------------------------------------------------------------
@@ -187,12 +190,14 @@ const REVIEW_OUTPUT = [
   "{",
   '  "summary": string,            // 2-4 sentences for the PR author: what the change does and the overall verdict',
   '  "read": string[],             // the names of the skill and AGENTS.md files you read',
+  '  "perf": { "needed": boolean, "why": string },   // does a performance review need to follow this round? See "Performance" below',
   `  "findings": [{ "path": string, "line": number, "endLine"?: number, "label": ${AI_LABELS.map((l) => `"${l}"`).join("|")}, "title": string, "body": string, "suggestion"?: string }],`,
   '  "previous": [{ "id": string, "status": "fixed"|"open"|"obsolete", "note": string }]   // one entry per earlier finding listed in this round; empty when none are listed',
   "}",
   "label: the one bucket that fits best. Map whatever scale your skills use onto these:",
   ...AI_LABELS.map((l) => `  ${l}: ${AI_LABEL_MEANING[l]}`),
   "path and line: a changed file and a line number at the head sha, on a line the diff adds or shows as context. endLine for a range. A finding in code the diff does not show still gets its real path and line; it is posted in the review's body.",
+  "perf: needed is true when the code this round covers adds or changes work that runs per request, per token, per event, per connection, or per worker: a new call on such a path, a lock, a clone or an allocation there, a scan over workers or sessions, work moved from startup or a timer onto a request, or unchanged code the diff now calls from such a path. It is false for docs, tests, build files, tooling, and code that runs once at startup. why names the path and what runs on it, in one sentence. When needed is true a separate performance review follows with the repository's perf skills, so leave cost findings to it and say only that it is needed.",
   "title: at most 12 words. body: GitHub Markdown written to the PR author: what is wrong, when it triggers, what it costs, and the fix. suggestion: replacement code for exactly those lines, only when the fix is obvious.",
 ].join("\n");
 

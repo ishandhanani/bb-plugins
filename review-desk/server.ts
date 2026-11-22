@@ -1219,6 +1219,9 @@ export default async function plugin(bb: BbPluginApi) {
     factoryReasoning, finalPassProvider, finalPassModel, finalPassReasoning, botSettleMinutes, babysitReasoning, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
   } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
+  /** Logins that are bots (the reviewBots setting, and any GitHub App): their reviews are not a person's. */
+  const bots = new Set(reviewBots.split(",").map((b) => b.trim().toLowerCase()).filter((b) => b !== ""));
+  const isBot = (login: string) => /\[bot\]$/.test(login) || bots.has(login.toLowerCase());
 
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
@@ -1483,17 +1486,26 @@ export default async function plugin(bb: BbPluginApi) {
     if (row.state !== "OPEN") return null;
     const decision = row.review_decision === "" ? null : row.review_decision;
     const reviewers = parseJson<Review["reviewers"]>(row.reviewers_json, []);
-    if (decision === "CHANGES_REQUESTED" || reviewers.some((r) => r.state === "CHANGES_REQUESTED")) return "changes_requested";
-    if (decision === "APPROVED" || reviewers.some((r) => r.state === "APPROVED")) return "babysit";
+    // A bot's review is not a person's: an approval from a review bot does not make a PR approved, and its request for changes is a thread to answer.
+    const people = reviewers.filter((r) => !isBot(r.login));
+    if (decision === "CHANGES_REQUESTED" || people.some((r) => r.state === "CHANGES_REQUESTED")) return "changes_requested";
+    if (decision === "APPROVED" || people.some((r) => r.state === "APPROVED")) return "babysit";
     return "unreviewed";
   }
 
-  /** An approval wins (Babysit); otherwise the factory's stage, when the PR is in the factory; otherwise GitHub's state. */
+  /**
+   * The column a card sits in. Your own PR follows the factory's stage, approved or not: it is still reviewed, fixed,
+   * and checked, and it is Ready only when the loop says so. Someone else's PR goes to Babysit once a person approves
+   * it; otherwise the factory's stage, when the PR is in the factory; otherwise GitHub's state.
+   */
   function autoStage(row: ReviewRow): BoardStage | null {
     const gh = githubStage(row);
-    if (gh === null || gh === "babysit") return gh;
+    if (gh === null) return gh;
     const p = q.pipeline.get(row.id);
-    return p !== undefined && isPipelineStage(p.stage) ? p.stage : gh;
+    const staged = p !== undefined && isPipelineStage(p.stage) ? p.stage : null;
+    if (staged !== null && isMine(row)) return staged;
+    if (gh === "babysit") return gh;
+    return staged ?? gh;
   }
 
   const CHECK_OK = new Set(["success", "skipped", "neutral"]);
@@ -3190,8 +3202,6 @@ export default async function plugin(bb: BbPluginApi) {
   const settleMs = Math.max(0, aiReviewSettleMinutes) * 60_000;
   const maxPasses = Math.max(1, Math.round(babysitMaxPasses));
   const extraSkills = aiReviewSkills.split(",").map((entry) => entry.trim()).filter((entry) => entry !== "");
-  const bots = new Set(reviewBots.split(",").map((b) => b.trim().toLowerCase()).filter((b) => b !== ""));
-  const isBot = (login: string) => /\[bot\]$/.test(login) || bots.has(login.toLowerCase());
   /** The extra skills for a repository: the bare ones, and the ones scoped to it. */
   const skillsFor = (row: ReviewRow) =>
     extraSkills.flatMap((entry) => {
@@ -3683,9 +3693,12 @@ export default async function plugin(bb: BbPluginApi) {
     if (row === undefined || r === undefined || r.status !== "running") return;
     let files: ChangedFile[] = [];
     let posted = false;
+    /** Whether the reviewer said this round's code touches a request path. */
+    let perfAsked: { needed: boolean; why: string } | null = null;
     try {
       if (error !== null || text === null) throw new Error(error ?? "the reviewer returned nothing");
       const reply = parseAiReply(text);
+      perfAsked = reply.perf ?? null;
       const now = Date.now();
       // What this round decided about the open findings.
       const open = new Map(q.findings.all(reviewId).filter((f) => f.status === "open" && isHighValue(f.severity)).map((f) => [f.id, f]));
@@ -3718,7 +3731,7 @@ export default async function plugin(bb: BbPluginApi) {
       recordJob({
         jobId: `${reviewId}:round:${round}`, stage: "ai_review", row, lane: usedLane(r), threadId: q.aiReviewer.get(reviewId)?.thread_id ?? null, startedAt: r.started_at,
         status: "ok", reply: text, round,
-        result: { kind: roundKind(r), findings: findings.length, high, counts, inline: inline.length, resolved: resolved.length, stillOpen: stillOpen.length, reviewUrl, read: reply.read },
+        result: { kind: roundKind(r), findings: findings.length, high, counts, inline: inline.length, resolved: resolved.length, stillOpen: stillOpen.length, reviewUrl, read: reply.read, perf: reply.perf ?? null },
       });
       emitOutcome(`${reviewId}:round:${round}`, "high_value_findings", high);
       await resolveFindingThreads(row, r.head_sha).catch((cause: unknown) => bb.log.warn(`resolving threads on ${prLabel(row)}: ${errorMessage(cause)}`));
@@ -3734,7 +3747,7 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         // A card you moved out of AI review stays where you put it; the round still counts as a review of this head.
         if (q.pipeline.get(reviewId)?.stage !== "ai_review") q.setReviewedHead.run(r.head_sha, reviewId);
-        else if (!(await startPerf(row, requireRound(reviewId, round), files))) await afterRound(row, round);
+        else if (!(await startPerf(row, requireRound(reviewId, round), files, perfAsked))) await afterRound(row, round);
       } catch (cause) {
         bb.log.warn(`after round ${round} of ${prLabel(row)}: ${errorMessage(cause)}`);
       } finally {
@@ -3751,20 +3764,21 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   /**
-   * The perf turn of a round: when the files this round covers touch a request
-   * path (a prefix the skills map lists, or a directory whose AGENTS.md has a
-   * Performance section), the reviewer thread, which has just read the diff,
-   * reviews cost with the repository's perf skills and measures when the code
-   * does not settle it. Returns false when no perf turn is due.
+   * The perf turn of a round. It runs when the repository says the code is on a
+   * request path (a changed file sits under a directory whose AGENTS.md has a
+   * Performance section) or when the reviewer, who has just read the diff, says
+   * so. No list of paths is kept here. The reviewer thread then reviews cost
+   * with the repository's perf skills and measures when the code does not
+   * settle it. Returns false when no perf turn is due.
    */
-  async function startPerf(row: ReviewRow, r: RoundRow, files: ChangedFile[]): Promise<boolean> {
+  async function startPerf(row: ReviewRow, r: RoundRow, files: ChangedFile[], asked: { needed: boolean; why: string } | null): Promise<boolean> {
     if (!perfReview || r.perf !== null) return false;
     const jobId = `${row.id}:perf:${r.round}`;
     try {
       const paths = await roundPaths(row, r, files);
       const map = repoSkills(factoryFiles.skills, row.owner, row.repo);
       const skills = await stageSkills(row, "perf", paths, jobId);
-      const why = perfReason(map, skills.found, paths);
+      const why = perfReason(skills.found, paths, asked);
       if (why === null) {
         jobSkills.delete(jobId);
         return false;

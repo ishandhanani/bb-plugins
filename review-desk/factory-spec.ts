@@ -55,6 +55,8 @@ export function reviewerIntro(c: { owner: string; repo: string; number: number; 
 const aiReplySchema = z.object({
   summary: z.string().default(""),
   read: z.array(z.string()).default([]),
+  /** The reviewer's own call on whether this round's code touches a request path, so a performance review should follow. */
+  perf: z.object({ needed: z.boolean().default(false), why: z.string().default("") }).nullable().optional(),
   findings: z
     .array(
       z.object({

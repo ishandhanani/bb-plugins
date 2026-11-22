@@ -32,10 +32,6 @@
       "fix": [],
       "check": [],
       "reviewByTopic": false,
-      "perfPaths": [
-        "lib/llm/",
-        "lib/runtime/"
-      ],
       "babysit": [
         "pr-monitor"
       ],
@@ -59,15 +55,6 @@
         "mechanical-refactor-verify"
       ],
       "reviewByTopic": true,
-      "perfPaths": [
-        "python/sglang/srt/managers/",
-        "python/sglang/srt/model_executor/",
-        "python/sglang/srt/layers/",
-        "python/sglang/srt/mem_cache/",
-        "python/sglang/srt/sampling/",
-        "rust/",
-        "sgl-model-gateway/"
-      ],
       "babysit": [
         "babysit-pr-to-pass-ci",
         "ci-workflow-guide",
