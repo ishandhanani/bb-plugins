@@ -4074,7 +4074,8 @@ export default async function plugin(bb: BbPluginApi) {
    * push to gets the base merged in, and a PR blocked on the base branch gets
    * it merged in once a pull request that fixes it has landed. Otherwise a
    * pass runs for failures no earlier pass at this head has seen, when jobs a
-   * pass was waiting on have finished, and every six hours while blocked.
+   * pass was waiting on have finished, and every six hours while blocked or
+   * handed to you.
    */
   async function babysitTick(row: ReviewRow, p: PipelineRow): Promise<void> {
     // Until your gh login is known, your PR looks like anyone's; wait rather than babysit it the wrong way.
@@ -4124,7 +4125,8 @@ export default async function plugin(bb: BbPluginApi) {
     const key = `${conflicting ? "conflict|" : ""}${failing.map((c) => c.name).sort().join("|")}#${failing.length}`;
     // The jobs a pass was waiting on have finished: look again, even though the failures read the same.
     const waited = outcome === "waiting" && card.checks.pending === 0;
-    const recheck = outcome === "blocked" && ci !== null && now - ci.passedAt >= 6 * 3_600_000;
+    // What stopped a PR may have changed since (a fix landed, a runner came back): a blocked or handed-over PR gets a fresh look every six hours. The same cause does not ping again.
+    const recheck = (outcome === "blocked" || outcome === "needs_human") && now - (ci?.passedAt ?? 0) >= 6 * 3_600_000;
     if (!fresh && key === p.babysit_key && !waited && !recheck) return;
     if (passes >= maxPasses) {
       if (outcome === "needs_human" || outcome === "blocked") return;
