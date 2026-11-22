@@ -775,12 +775,12 @@ const MIGRATIONS = [
   // waiting counts as reviewed at its current head and as handed over once, so only a later push sends it back to review.
   `UPDATE ai_rounds SET kind = CASE WHEN round = 1 THEN 'full' ELSE 'delta' END WHERE kind IS NULL`,
   `UPDATE pipeline SET was_ready = 1, reviewed_head = (SELECT head_sha FROM reviews WHERE reviews.id = pipeline.review_id) WHERE reviewed_head IS NULL AND stage IN ('human_review', 'changes_requested', 'babysit')`,
+  // After a merge: what human reviewers said against what the AI review found. status: running, done, failed.
+  `CREATE TABLE IF NOT EXISTS learn_jobs (review_id TEXT PRIMARY KEY, thread_id TEXT, status TEXT NOT NULL, result_json TEXT, error TEXT, started_at INTEGER NOT NULL, finished_at INTEGER)`,
   // CI babysitting: {"cause", "fixedBy": [pr numbers], "note", "pinged": [causes], "checkedAt"}. hold_until: the loop is done and waits for bot reviews before ready.
   `ALTER TABLE pipeline ADD COLUMN ci_json TEXT`,
   `ALTER TABLE pipeline ADD COLUMN hold_until INTEGER`,
   `ALTER TABLE pipeline ADD COLUMN hold_why TEXT`,
-  // After a merge: what human reviewers said against what the AI review found. status: running, done, failed.
-  `CREATE TABLE IF NOT EXISTS learn_jobs (review_id TEXT PRIMARY KEY, thread_id TEXT, status TEXT NOT NULL, result_json TEXT, error TEXT, started_at INTEGER NOT NULL, finished_at INTEGER)`,
 ];
 
 interface ReviewRow {
