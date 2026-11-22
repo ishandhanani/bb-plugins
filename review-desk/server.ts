@@ -4140,7 +4140,8 @@ export default async function plugin(bb: BbPluginApi) {
     q.setBabysit.run(row.head_sha, key, passes + 1, "running", now, row.id);
     publish(row.id, "board");
     try {
-      if (act) await ensureBranchWorktree(row).catch(() => undefined);
+      // Your own PR's threads share the branch's worktree. Someone else's gets a branch worktree only when a merge or a fix actually starts.
+      if (isMine(row)) await ensureBranchWorktree(row).catch(() => undefined);
       const jobId = `${row.id}:babysit:${row.head_sha}:${passes + 1}`;
       const map = repoSkills(factoryFiles.skills, row.owner, row.repo);
       const skills = await stageSkills(row, "babysit", [], jobId);
