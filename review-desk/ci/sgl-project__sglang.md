@@ -1,0 +1,12 @@
+The goal is narrow: `lint` and the base tier (`pr-test.yml`: the `base-a`, `base-b`, `base-c` stages and `pr-test-finish`) green on the PR's latest head, plus any test the PR description names.
+
+- **What does not count.** The extra tiers (`pr-test-extra.yml`), the AMD and other hardware tiers, and every gate that only fails because the PR lacks an opt-in label (`run-ci-nv-extra`, `run-ci-amd-extra`, `run-ci-mlu`, and the like), with the summary jobs that fail only because of them. List them in `expected`. Do not add opt-in labels.
+- **Starting CI.** Base CI needs the `run-ci` label. When it is missing, or runs failed only because it was missing, use the repository's slash commands as a PR comment (`/tag-run-ci-label`, `/tag-and-rerun-ci`, `/rerun-failed-ci`). The repository's CI skills and contribution guide say what each does and who may use it.
+- **Tests the description names.** When the PR description says which tests cover the change (a test file, class, or method that base CI does not run), run them with `/rerun-test` as the repository's `rerun-test` skill describes, and treat them as required.
+- **CI rarely passes on the first try.** A runner with no usable GPU, shards cancelled by fail-fast after another shard failed, a server that did not start in time in a test the diff does not touch: these are infrastructure. Re-run the failed jobs (`gh run rerun <run-id> --failed`, or `/rerun-failed-ci`), up to ten times per workflow and head. When the run is still in progress and GitHub refuses the re-run, answer `waiting`; you are asked again when it finishes.
+- **A failure you do not expect from the diff.** Look at main before anything else: the latest scheduled `pr-test.yml` run on main (`gh run list --repo sgl-project/sglang --branch main --workflow pr-test.yml`), and the same job on other recent PRs. If main fails the same way, the PR is not at fault:
+  - Search open and recently merged PRs for the fix (`gh pr list --repo sgl-project/sglang --state all --search "<test name or error text>"`, and the file that fails).
+  - A fix that has merged since this PR's merge base: `merge_base`.
+  - A fix that is open and not merged: `blocked`, with its PR in `fixedBy`. It is watched for you, and main is merged in when it lands.
+  - No fix anywhere: `blocked` with an empty `fixedBy`.
+- **A failure the PR's own code causes.** Answer `fix` only when the fix is clean, not tricky, and at most 100 changed lines. Anything larger, or a change to what the PR does, is `needs_human`.

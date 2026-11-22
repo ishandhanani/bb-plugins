@@ -43,7 +43,9 @@ export function nowLine(card: ReviewSummary): string {
   if (f?.fix?.status === "running") return `${f.fix.kind === "deslop" ? "deslopping" : f.fix.kind === "sync" ? "merging the base" : "fixing"}${f.fix.phase === "check" ? ": commits being checked" : f.fix.phase === "revise" ? ": revising what the check rejected" : f.fix.phase === "publish" ? ": pushing" : ""}`;
   if (f?.roundStatus === "running" || f?.roundStatus === "queued") return `AI round ${f.round} ${f.roundStatus}`;
   if (f?.perf === "running") return `AI round ${f.round}: perf review`;
+  if (f?.holdUntil != null) return "waiting for bot reviews before ready";
   if (card.mergeable === "CONFLICTING") return "merge conflicts";
+  if (f?.babysit === "blocked" && f.ci) return `CI ${f.ci.note}`;
   return "";
 }
 

@@ -5,9 +5,9 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AI_LABELS, AI_LABEL_MEANING, AI_REVIEW_FENCE, CHECK_FENCE, FIX_FENCE, type PriorFinding } from "./factory-spec";
+import { AI_LABELS, AI_LABEL_MEANING, AI_REVIEW_FENCE, FIX_FENCE, type PriorFinding } from "./factory-spec";
 
-export type SkillStage = "review" | "perf" | "fix" | "check";
+export type SkillStage = "review" | "perf" | "fix" | "check" | "babysit";
 
 export interface RepoSkills {
   review: string[];
@@ -16,6 +16,13 @@ export interface RepoSkills {
   measure: string[];
   fix: string[];
   check: string[];
+  /** Skills for the CI babysitter: how this repository's CI is started, read, and re-run. */
+  babysit: string[];
+  /**
+   * How CI is babysat here. guide: a file in the plugin with this repository's CI rules, shown in the babysit prompt.
+   * act: whose PRs the factory may push to for CI (merge the base in, small fixes): "mine" (your own) or "any" (every PR on the board).
+   */
+  ci: { guide: string; act: "mine" | "any" };
   /** The repository has topic skills, not one review skill: the reviewer reads each whose description fits the diff. */
   reviewByTopic: boolean;
   /** Path prefixes on a request path; a diff that touches one gets a perf review. Directories whose AGENTS.md has a Performance section count too. */
@@ -85,7 +92,7 @@ export function render(files: FactoryFiles, part: string, vars: Record<string, s
   });
 }
 
-const EMPTY: RepoSkills = { review: [], perf: [], measure: [], fix: [], check: [], reviewByTopic: true, perfPaths: [], source: "" };
+const EMPTY: RepoSkills = { review: [], perf: [], measure: [], fix: [], check: [], babysit: [], ci: { guide: "", act: "mine" }, reviewByTopic: true, perfPaths: [], source: "" };
 
 /** The skills map for a repository; one it does not list gets topic picking from its own skills and no perf paths. */
 export function repoSkills(config: SkillsConfig, owner: string, repo: string): RepoSkills {
@@ -307,4 +314,44 @@ export function learnPrompt(files: FactoryFiles, c: { pr: string; humans: unknow
   return render(files, "learn", { pr: c.pr, humans: json(c.humans), findings: json(c.findings), fixItems: json(c.fixItems), rounds: json(c.rounds) });
 }
 
-export { CHECK_FENCE };
+export interface BabysitContext {
+  owner: string;
+  repo: string;
+  number: number;
+  headSha: string;
+  baseRef: string;
+  pass: number;
+  maxPasses: number;
+  failing: { name: string; url: string | null }[];
+  conflicting: boolean;
+  /** The factory may push to this PR for CI: merge the base in, and fix what the PR's own code breaks. */
+  canAct: boolean;
+  /** It is your own PR, so a fix of any size goes to the author's agent. */
+  mine: boolean;
+  skills: string;
+  /** The repository's CI guide file, relative to the plugin's folder; empty when it has none. */
+  guide: string;
+}
+
+export function babysitPrompt(files: FactoryFiles, c: BabysitContext): string {
+  const header = [
+    `Pass ${c.pass} of at most ${c.maxPasses} at head ${c.headSha} of ${c.owner}/${c.repo}#${c.number}.`,
+    c.conflicting ? "GitHub reports merge conflicts with the base branch." : "",
+    c.failing.length === 0 ? "No failing checks are reported." : `Failing checks:\n${c.failing.map((f) => `  ${f.name}${f.url ? ` ${f.url}` : ""}`).join("\n")}`,
+  ].filter((l) => l !== "").join("\n");
+  let guide = "(this repository has no CI guide; go by its skills and its contribution guide)";
+  if (c.guide !== "") {
+    const path = join(files.dir, c.guide);
+    if (existsSync(path)) guide = readFileSync(path, "utf8").trim();
+  }
+  const actions = c.canAct
+    ? [
+        `- \`merge_base\`: the branch conflicts with ${c.baseRef}, or a fix has landed on ${c.baseRef} since the merge base (check git log <merge-base>..origin/${c.baseRef}), or a test fails only against an old base. The base is merged into the branch and pushed for you; do not merge yourself. A conflict is never a reason for needs_human.`,
+        c.mine
+          ? "- `fix`: the PR's own code causes the failure (a test it breaks, a type, build, or lint error in what it changed). The author's agent fixes it on the branch; its commit is checked before it is pushed. In detail name the check, the failing test or error, and the cause you found, with file:line; list the failing job URLs in `jobs`."
+          : "- `fix`: the PR's own code causes the failure, and the fix is small and clean (the repository's guide above says how small). An agent fixes it on the PR's branch for the maintainer; its commit is checked before it is pushed. In detail name the check, the failing test or error, and the cause you found, with file:line; list the failing job URLs in `jobs`.",
+      ].join("\n")
+    : "- A failure the PR's own code causes, or one that needs the base merged in: needs_human; this PR is not one the factory pushes to.";
+  const outcomes = ['"rerun"', '"waiting"', ...(c.canAct ? ['"merge_base"', '"fix"'] : []), '"blocked"', '"ok"', '"needs_human"'].join(" | ");
+  return render(files, "babysit", { header, skills: c.skills, guide, actions, outcomes });
+}

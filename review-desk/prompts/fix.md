@@ -6,10 +6,12 @@ Job: triage and fix the feedback on {{pr}} after {{source}}{{reviewUrl}}. The PR
 
 ## Steps
 
-1. Pull every review comment fresh: AI review threads, the NITs and off-diff findings listed in the AI review's body, human reviewers, and bots. Take unresolved threads and conversation comments since the last push.
+1. Pull every review comment fresh: AI review threads (NITs included; each finding is its own thread), findings listed in an AI review's body because they are outside the diff, human reviewers, and bots such as CodeRabbit. Take every unresolved thread, and conversation comments since the last push.
 2. Judge each one on the code at the head, not on the comment's confidence:
    - FIX: it is right and worth changing in this PR. A comment from a human reviewer is FIX unless you can show it is wrong.
    - SKIP: it is wrong, already handled, or out of scope. Say why in one sentence. "Not worth the churn" is not a reason to skip a cost on a request path.
+
+   A bot's comment gets the same judgment as anyone's: read the code it points at, decide whether it is right and relevant, and fix it when it is. The PR is not ready while a bot's thread is open, so every one needs a verdict.
    - ASK: only the author can decide (design intent, product behavior, a trade-off). Say what they need to decide.
 3. Fix every FIX item with the smallest change that resolves it, one commit per item (or per group of items that are one change). Before you apply a suggestion from a bot, check that it is right: do not add tests that cannot fail, API with no caller, or work on a request path to satisfy a comment.
 4. After each fix, sweep what describes the changed behavior: docs, doc comments, AGENTS.md, test names. A test you add must fail with your fix reverted; check it.
@@ -33,8 +35,12 @@ For each rejected commit: change it so the problem is gone, or drop it and chang
 {{checkLine}}
 
 1. Push once: {{push}}.
-2. Reply on each thread you judged: "Fixed in <short sha>: <what changed>" for FIX, the reason for SKIP, and the question for ASK. Resolve the AI review's threads you fixed; leave human reviewers' threads for them to resolve.
-3. Do not request reviewers and do not mark the PR ready; the author does that.
+2. Reply on each thread you judged: "Fixed in <short sha>: <what changed>" for FIX, the reason for SKIP, and the question for ASK.
+3. Resolve threads so the PR shows what is still open:
+   - a bot's thread, and an AI review NIT: resolve it once you have replied, whether you fixed it or said why not;
+   - any other AI review thread: resolve it only when you fixed it; a skipped one stays open for the next round to judge;
+   - a human reviewer's thread: never; it is theirs to resolve.
+4. Do not request reviewers and do not mark the PR ready; the author does that.
 
 {{output}}
 
