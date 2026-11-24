@@ -179,6 +179,8 @@ const reviewSummarySchema = z.object({
       ci: z.object({ cause: z.string(), fixedBy: z.array(z.number()), note: z.string() }).nullable(),
       /** The loop is done at this head and waits until this time for bot reviews (CodeRabbit and the like) before the PR is called ready. */
       holdUntil: z.number().nullable(),
+      /** You have the PR: the factory does nothing on it until it is handed back. by: "you" (you said so) or "worktree" (the factory found work in the worktree that it did not do). */
+      taken: z.object({ at: z.number(), by: z.string(), note: z.string() }).nullable(),
       /** A newly added PR's first job starts at this time unless you move the card first. */
       startsAt: z.number().nullable(),
       /** The latest round: full (the whole PR) or delta (what changed since the last round), and its perf review, when one ran. */
@@ -376,6 +378,8 @@ export const rpcContract = defineRpcContract({
   fix_start: { input: z.object({ reviewId: z.string(), kind: z.enum(["fix", "deslop"]) }), output: z.object({ review: reviewSummarySchema }) },
   /** Take a PR out of the factory; the card follows GitHub's state again. */
   factory_stop: { input: reviewIdSchema, output: z.object({ review: reviewSummarySchema }) },
+  /** Take a PR over (the factory stops and stays off it) or hand it back. */
+  factory_hold: { input: z.object({ reviewId: z.string(), on: z.boolean() }), output: z.object({ review: reviewSummarySchema, note: z.string() }) },
   /** Sync every PR that is not done with GitHub. A PR whose head moved gets the full sync; the others skip the git fetch. */
   board_refresh: {
     input: z.null(),
@@ -781,6 +785,10 @@ const MIGRATIONS = [
   `ALTER TABLE pipeline ADD COLUMN ci_json TEXT`,
   `ALTER TABLE pipeline ADD COLUMN hold_until INTEGER`,
   `ALTER TABLE pipeline ADD COLUMN hold_why TEXT`,
+  // Takeover: you have the PR and the factory stays off it. taken_by: "you" (explicit) or "thread:<id>" (a thread of yours became active in its worktree).
+  `ALTER TABLE pipeline ADD COLUMN taken_at INTEGER`,
+  `ALTER TABLE pipeline ADD COLUMN taken_by TEXT`,
+  `ALTER TABLE pipeline ADD COLUMN taken_note TEXT`,
 ];
 
 interface ReviewRow {
@@ -814,6 +822,7 @@ interface PipelineRow {
   surfaced_thread: string | null;
   reviewed_head: string | null; loop_rounds: number; want_full: number; was_ready: number;
   ci_json: string | null; hold_until: number | null; hold_why: string | null;
+  taken_at: number | null; taken_by: string | null; taken_note: string | null;
 }
 interface RoundRow {
   review_id: string; round: number; base_sha: string; head_sha: string; status: string; summary: string | null; high_value: number | null;
@@ -994,6 +1003,8 @@ function createStore(db: Database.Database) {
     setWasReady: db.prepare<[string]>(`UPDATE pipeline SET was_ready = 1, loop_rounds = 0 WHERE review_id = ?`),
     setCi: db.prepare<[string | null, string]>(`UPDATE pipeline SET ci_json = ? WHERE review_id = ?`),
     setHold: db.prepare<[number | null, string | null, string]>(`UPDATE pipeline SET hold_until = ?, hold_why = ? WHERE review_id = ?`),
+    setTaken: db.prepare<[number | null, string | null, string | null, string]>(`UPDATE pipeline SET taken_at = ?, taken_by = ?, taken_note = ? WHERE review_id = ?`),
+    takenPipelines: db.prepare<[], PipelineRow>(`SELECT * FROM pipeline WHERE taken_at IS NOT NULL`),
     setFixRunPhase: db.prepare<[string, string, number]>(`UPDATE fix_runs SET phase = ? WHERE review_id = ? AND run = ?`),
     setFixRunWork: db.prepare<[string | null, string, string, string, number]>(`UPDATE fix_runs SET head_after = ?, summary = ?, items_json = ? WHERE review_id = ? AND run = ?`),
     setFixRunCheck: db.prepare<[string, string, number]>(`UPDATE fix_runs SET checks = checks + 1, check_json = ? WHERE review_id = ? AND run = ?`),
@@ -1180,6 +1191,7 @@ export default async function plugin(bb: BbPluginApi) {
     finalPassProvider: { type: "string", label: "PR factory: provider for the whole-PR pass with fresh eyes before a PR is first called ready; a different model family than the reviewer's sees different things. Empty uses the reviewer's provider and model", default: "codex" },
     finalPassModel: { type: "string", label: "PR factory: model for that pass", default: "gpt-6-astra" },
     finalPassReasoning: { type: "string", label: "PR factory: reasoning level for that pass; empty uses the provider's default", default: "" },
+    takeoverIdleMinutes: { type: "number", label: "PR factory: when the factory finds your work in a PR's worktree it stops on that PR; it hands the PR back once the worktree has had nothing uncommitted and nothing unpushed for this many minutes", default: 5 },
     botSettleMinutes: { type: "number", label: "PR factory: minutes a head must have been up before your PR is called ready, so bot reviewers (CodeRabbit and the like) have posted; their open threads go to the author's agent first. 0 turns the wait off", default: 10 },
     aiReviewMaxRounds: { type: "number", label: "PR factory: safety cap on AI review rounds in one loop (from a new head until the PR is ready again); the loop ends sooner once a round leaves only nits or makes no progress", default: 6 },
     aiReviewConcurrency: { type: "number", label: "PR factory: AI review rounds running at once across the board", default: 2 },
@@ -1216,7 +1228,7 @@ export default async function plugin(bb: BbPluginApi) {
   const {
     defaultProvider, hideSeatThreads, autoMap, helperModel, simpleEnglishMode, simpleEnglishProvider, simpleEnglishModel, simpleEnglishSkill, boardRefresh, worktreesDir, threadSection,
     startDelaySeconds, autoAiReview, aiReviewProvider, aiReviewModel, aiReviewMaxRounds, aiReviewConcurrency, aiReviewSettleMinutes, aiReviewSkills, aiReviewEmpirical, babysitProvider, babysitModel, babysitMaxPasses, authorPipeline, fixerProvider, fixerModel, deslopModel, deslopStage, checkCommits, checkModel, perfReview, reviewBots,
-    factoryReasoning, finalPassProvider, finalPassModel, finalPassReasoning, botSettleMinutes, babysitReasoning, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
+    factoryReasoning, finalPassProvider, finalPassModel, finalPassReasoning, botSettleMinutes, takeoverIdleMinutes, babysitReasoning, slackWebhookUrl, slackMention, eventWebhookUrl, eventWebhookSecret,
   } = await settings.get();
   const simpleMode: SimpleMode = simpleEnglishMode === "eager" || simpleEnglishMode === "off" ? simpleEnglishMode : "lazy";
   /** Logins that are bots (the reviewBots setting, and any GitHub App): their reviews are not a person's. */
@@ -1230,6 +1242,17 @@ export default async function plugin(bb: BbPluginApi) {
   q.resetSimpleWriting.run();
   q.resetSimplifierJobs.run();
   const host = bb.hosts.experimental_client({ contract: hostContract });
+
+  /** The error of a run that was stopped because you took the PR over; such a run starts again at the hand-back. */
+  const TAKEN_STOP = "stopped: you picked the PR up";
+  /** When each taken PR's worktree was first seen clean and pushed; the hand-back waits out the idle time from then. */
+  const cleanSince = new Map<string, number>();
+  /** The worktree state a PR was handed back at (kept across reloads): the same state is not read as you picking it up again. */
+  const handedBackAt = {
+    get: (reviewId: string) => q.slackKv.get(`factory:handed-back:${reviewId}`)?.value,
+    set: (reviewId: string, signature: string) => { q.setSlackKv.run(`factory:handed-back:${reviewId}`, signature); },
+  };
+
 
   /** Reviews whose map waits for the helper: one thread per review, one job at a time. */
   const mapWanted = new Set<string>();
@@ -2149,6 +2172,8 @@ export default async function plugin(bb: BbPluginApi) {
      * shared environment (one folder per project) instead of the PR worktree's.
      */
     shared?: boolean;
+    /** The lane's threads write to the PR's branch or read its unpushed commits; nothing is sent to them while you have the PR. */
+    writes?: boolean;
     /** Visible from the start (it does work you may want to watch), regardless of hideSeatThreads. */
     visible?: boolean | ((row: ReviewRow) => boolean);
     /** A workspace of its own (the author's agent works in the PR branch's worktree); null falls back to the PR worktree. */
@@ -2257,6 +2282,8 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function laneSend(lane: Lane, row: ReviewRow, job: string, text: string): Promise<void> {
+    // You took the PR over while this job was being prepared: the agent gets no further turn.
+    if (lane.writes && q.pipeline.get(row.id)?.taken_at != null) throw new Error(TAKEN_STOP);
     const existing = lane.get(row.id);
     const projectId = await chatProjectId(row);
     const ownWorkspace = lane.workspace?.(row) ?? null;
@@ -3291,6 +3318,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** Let you know: the thread shows in the sidebar, unread, under a title that says why, and Slack pings you. */
   async function letYouKnow(row: ReviewRow, threadId: string | undefined, event: FactoryEvent, why: string): Promise<void> {
+    // You have the PR and are looking at it; the card says what the factory would have told you.
+    if (q.pipeline.get(row.id)?.taken_at != null) return;
     await ping(row, event, why);
     void slackReply(row.id, handoffReply(EVENT_HEADLINE[event], why, sc.me || null));
     if (threadId === undefined) return;
@@ -3355,6 +3384,7 @@ export default async function plugin(bb: BbPluginApi) {
         return ci === null || !ci.note ? null : { cause: ci.cause ?? "", fixedBy: ci.fixedBy ?? [], note: ci.note };
       })(),
       holdUntil: p.stage === "ai_review" ? p.hold_until : null,
+      taken: p.taken_at === null ? null : { at: p.taken_at, by: p.taken_by === "you" ? "you" : "worktree", note: p.taken_note ?? "" },
       startsAt: pendingStarts.get(row.id) ?? null,
       roundKind: last === undefined ? null : roundKind(last),
       perf: last?.perf ?? null,
@@ -3425,6 +3455,7 @@ export default async function plugin(bb: BbPluginApi) {
     const keeps = run?.kind === "sync" || run?.trigger.startsWith("ci:") ? to !== "unreviewed" : to === "fixing";
     if (run?.status === "running" && !keeps) {
       q.setFixRunFailed.run(`stopped: you moved the card to ${BOARD_STAGE_LABEL[to]}`, Date.now(), row.id, run.run);
+      void notYours(row);
       for (const lane of [{ row: q.fixer.get(row.id), clear: q.setFixerJob }, { row: q.checker.get(row.id), clear: q.setCheckerJob }]) {
         if (lane.row === undefined || lane.row.job === null) continue;
         lane.clear.run(null, row.id);
@@ -3449,6 +3480,8 @@ export default async function plugin(bb: BbPluginApi) {
       const row = q.review.get(reviewId);
       let p = q.pipeline.get(reviewId);
       if (row === undefined || p === undefined || row.state !== "OPEN") return;
+      // You have this PR: the factory does nothing on it. A takeover a thread started ends by itself when you are done.
+      if (p.taken_at !== null) return;
       const mine = isMine(row);
       const approved = githubStage(row) === "babysit";
       // Your own PR, once it is ready (or waiting on you): what a person wrote on it since the author's agent last read the comments goes to that agent.
@@ -3538,7 +3571,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const r of q.roundsByStatus.all("queued")) {
       if (running >= roundConcurrency) return;
       const row = q.review.get(r.review_id);
-      if (row === undefined || (q.aiReviewer.get(r.review_id)?.job ?? null) !== null) continue;
+      if (row === undefined || (q.aiReviewer.get(r.review_id)?.job ?? null) !== null || q.pipeline.get(r.review_id)?.taken_at != null) continue;
       q.setRoundRunning.run(Date.now(), r.review_id, r.round);
       running++;
       publish(r.review_id, "board");
@@ -3745,8 +3778,10 @@ export default async function plugin(bb: BbPluginApi) {
     if (posted) {
       settlingRounds.add(reviewId);
       try {
+        // You took the PR over while the round ran: it is posted, and what follows it (a perf turn, a fix) waits until you hand the PR back.
+        if (q.pipeline.get(reviewId)?.taken_at != null) bb.log.info(`round ${round} of ${prLabel(row)} is posted; its next step waits for the hand-back`);
         // A card you moved out of AI review stays where you put it; the round still counts as a review of this head.
-        if (q.pipeline.get(reviewId)?.stage !== "ai_review") q.setReviewedHead.run(r.head_sha, reviewId);
+        else if (q.pipeline.get(reviewId)?.stage !== "ai_review") q.setReviewedHead.run(r.head_sha, reviewId);
         else if (!(await startPerf(row, requireRound(reviewId, round), files, perfAsked))) await afterRound(row, round);
       } catch (cause) {
         bb.log.warn(`after round ${round} of ${prLabel(row)}: ${errorMessage(cause)}`);
@@ -3828,7 +3863,9 @@ export default async function plugin(bb: BbPluginApi) {
     publish(reviewId, "board");
     settlingRounds.add(reviewId);
     try {
-      if (q.pipeline.get(reviewId)?.stage === "ai_review") await afterRound(row, round);
+      // While you have the PR the round's next step waits; the catch-up runs it after the hand-back.
+      if (q.pipeline.get(reviewId)?.taken_at != null) bb.log.info(`perf review of ${prLabel(row)} is posted; its next step waits for the hand-back`);
+      else if (q.pipeline.get(reviewId)?.stage === "ai_review") await afterRound(row, round);
       else q.setReviewedHead.run(r.head_sha, reviewId);
     } catch (cause) {
       bb.log.warn(`after round ${round} of ${prLabel(row)}: ${errorMessage(cause)}`);
@@ -4075,7 +4112,7 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function ciPing(row: ReviewRow, key: string, why: string): Promise<void> {
     const p = q.pipeline.get(row.id);
-    if (p === undefined) return;
+    if (p === undefined || p.taken_at !== null) return;
     const now = Date.now();
     const ci = ciState(p) ?? { head: row.head_sha, cause: "", fixedBy: [], note: "", pinged: [], pingedAt: 0, checkedAt: 0, passedAt: 0 };
     if (ci.pinged.some((k) => sameCause(k, key)) || (ci.head === row.head_sha && now - ci.pingedAt < 3 * 3_600_000)) return;
@@ -4225,7 +4262,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const now = Date.now();
     // Another run started while this pass was thinking (a reviewer commented): its merge or fix cannot start now, so the failures get a new pass afterwards.
-    const busy = runsNow.at(-1)?.status === "running" && (outcome === "merge_base" || outcome === "fix");
+    const busy = (runsNow.at(-1)?.status === "running" || p.taken_at !== null) && (outcome === "merge_base" || outcome === "fix");
     q.setBabysit.run(p.babysit_head, busy ? null : p.babysit_key, p.babysit_passes, busy ? null : outcome, now, reviewId);
     const sitJob = `${reviewId}:babysit:${p.babysit_head}:${p.babysit_passes}`;
     recordJob({ jobId: sitJob, stage: "babysit", row, lane: babysitterLane, threadId: q.babysitter.get(reviewId)?.thread_id ?? null, status: error === null ? "ok" : "failed", error, reply: text, result: { outcome, cause, detail, fixedBy } });
@@ -4409,6 +4446,7 @@ export default async function plugin(bb: BbPluginApi) {
     providerId: fixerProvider.trim(),
     model: fixerModel,
     ...reasoning(factoryReasoning),
+    writes: true,
     // Its rules are in the intro; a changed rule replaces the thread so it takes effect.
     replaceOnIntroChange: true,
     visible: false,
@@ -4428,6 +4466,7 @@ export default async function plugin(bb: BbPluginApi) {
     intro: (row) => checkerIntro({ owner: row.owner, repo: row.repo, number: row.number, title: row.title, worktree: fixerTargets.get(row.id)?.worktree ?? row.worktree }),
     providerId: aiReviewProvider.trim(),
     model: checkModel,
+    writes: true,
     ...reasoning(factoryReasoning),
     replaceOnIntroChange: false,
     visible: false,
@@ -4563,7 +4602,14 @@ export default async function plugin(bb: BbPluginApi) {
    * the trigger then says why). A sync leaves the PR in Babysit.
    */
   async function startFixRun(row: ReviewRow, kind: "fix" | "deslop" | "sync", trigger: string): Promise<void> {
+    // You have the PR: nothing writes to its branch until you hand it back.
+    if (q.pipeline.get(row.id)?.taken_at != null) return;
     if (q.fixRuns.all(row.id).at(-1)?.status === "running") return;
+    // Look before writing: work in your worktree that the factory did not do means you picked the PR up.
+    const where = await ensureBranchWorktree(row).catch(() => undefined);
+    if (where !== undefined && !where.worktree.endsWith("__branch") && (await worktreeTick(row))) return;
+    // The look took a moment: someone may have taken the PR, or another run may have started, meanwhile.
+    if (q.pipeline.get(row.id)?.taken_at != null || q.fixRuns.all(row.id).at(-1)?.status === "running") return;
     const run = (q.fixRuns.all(row.id).at(-1)?.run ?? 0) + 1;
     // A sync pushes its merge itself; every other run commits first and pushes after the check.
     q.insertFixRun.run(row.id, run, kind, trigger, row.head_sha, Date.now(), kind === "sync" ? null : "work");
@@ -4624,6 +4670,13 @@ export default async function plugin(bb: BbPluginApi) {
     slackFixRun(row, run);
     const failed = q.fixRun.get(row.id, run);
     recordJob({ jobId: `${row.id}:fix:${run}`, stage: fixStage(failed), row, lane: fixRunLane(failed?.kind), threadId: q.fixer.get(row.id)?.thread_id ?? null, startedAt: failed?.started_at, status: "failed", error: message, run });
+    // What a failed run left in the worktree is the factory's doing, not you picking the PR up.
+    void notYours(row);
+    // Stopped because you took the PR over: nothing to tell you, and the run starts again at the hand-back.
+    if (message === TAKEN_STOP) {
+      publish(row.id, "board");
+      return;
+    }
     const why = `the agent stopped: ${message.slice(0, 300)}`;
     // A failed merge of the base or CI fix leaves the card in its column; the rest of the loop cannot go on without you.
     if (failed?.kind === "sync" || failed?.trigger.startsWith("ci:")) {
@@ -4760,7 +4813,7 @@ export default async function plugin(bb: BbPluginApi) {
     const run = r.run;
     // The publish step may answer with only what it pushed; the verdicts are the ones from the work step.
     const items = reply.items.length > 0 ? reply.items : parseJson<FixRun["items"]>(r.items_json, []);
-    q.setFixRunDone.run(reply.head || null, reply.summary || r.summary || "", JSON.stringify(items), Date.now(), reviewId, run);
+    q.setFixRunDone.run(reply.head || r.head_after || null, reply.summary || r.summary || "", JSON.stringify(items), Date.now(), reviewId, run);
     slackFixRun(row, run);
     const count = (v: string) => items.filter((i) => i.verdict === v).length;
     const fixJob = `${reviewId}:fix:${run}`;
@@ -5044,6 +5097,231 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Once after a load: every PR in the factory gets tidied.
   setTimeout(() => { for (const r of q.reviews.all()) if (q.pipeline.get(r.id) !== undefined) tidySoon(r.id); }, 15_000);
+
+  // -- takeover: you have the PR ---------------------------------------------------
+  //
+  // The factory and you must not write to one branch at the same time, and
+  // your sessions work in the same worktree the factory's agents use. So a PR
+  // has one holder. It becomes yours when you say so (the card, `bb review-desk
+  // hold`, "hold" in the PR's Slack thread; your agent sessions should run the
+  // command when they pick a PR up), or when the factory finds work in the
+  // worktree that it did not do: uncommitted changes, or commits it did not
+  // make. While it is yours the agent that was writing to the branch is
+  // stopped, and nothing starts on the PR (no round, fix, check, merge of the
+  // base, or CI pass). A round or CI pass that was already running finishes
+  // and posts, and what would follow it waits. A takeover the factory noticed
+  // ends by itself once the worktree has had nothing uncommitted and nothing
+  // unpushed for takeoverIdleMinutes: finished means your work is on GitHub.
+  // One you asked for lasts until you hand the PR back.
+
+  interface WorktreeNow { gone: boolean; text: string; clean: boolean; dirty: boolean; unpushed: number; yours: boolean; signature: string }
+  /**
+   * The branch worktree as it stands, and whether it holds work the factory did
+   * not do. Null when the PR has no branch worktree yet or the read failed.
+   * `gone` when the folder is no longer there or has another branch checked out
+   * (the path is then forgotten and found again on the next job).
+   */
+  async function worktreeNow(row: ReviewRow): Promise<WorktreeNow | null> {
+    const target = fixerTargets.get(row.id);
+    if (target === undefined) return null;
+    try {
+      const state = await host.call("worktree_state", { worktree: target.worktree, pushed: row.head_sha }, hostOptions(row));
+      if (!state.exists || (state.branch !== row.head_ref && !state.branch.endsWith(`/${row.head_ref}`))) {
+        fixerTargets.delete(row.id);
+        return { gone: true, text: `${target.worktree} is gone or on another branch`, clean: true, dirty: false, unpushed: 0, yours: false, signature: "" };
+      }
+      // Commits the factory's own agent left there (a run the check rejected, or one that was stopped) are not yours.
+      const factoryHeads = q.fixRuns.all(row.id).map((r) => r.head_after).filter((h): h is string => h !== null && h.length >= 7);
+      const ownCommits = state.unpushed > 0 && factoryHeads.some((h) => state.head.startsWith(h) || h.startsWith(state.head));
+      const signature = `${state.head}:${state.status}`;
+      // A state the factory itself left (a failed or stopped run), or one you handed back, is not you picking the PR up.
+      const known = handedBackAt.get(row.id) === signature;
+      const parts = [state.unpushed > 0 ? `${state.unpushed} unpushed commit${state.unpushed === 1 ? "" : "s"}${ownCommits ? " the factory's agent left" : ""}` : "", state.dirty ? "uncommitted changes" : ""].filter((x) => x !== "");
+      const clean = !state.dirty && state.unpushed === 0;
+      return {
+        gone: false,
+        text: clean ? `${target.worktree} is clean at ${state.head.slice(0, 10)}` : `${target.worktree} has ${parts.join(" and ")}`,
+        clean, dirty: state.dirty, unpushed: state.unpushed,
+        yours: !known && (state.dirty || (state.unpushed > 0 && !ownCommits)),
+        signature,
+      };
+    } catch (cause) {
+      bb.log.warn(`worktree of ${prLabel(row)}: ${errorMessage(cause)}`);
+      return null;
+    }
+  }
+
+  /** Record the worktree's state as the factory's own doing (after a run of its agent failed or was stopped), so it is not read as your work. */
+  async function notYours(row: ReviewRow): Promise<void> {
+    const target = fixerTargets.get(row.id);
+    if (target === undefined) return;
+    try {
+      const state = await host.call("worktree_state", { worktree: target.worktree, pushed: row.head_sha }, hostOptions(row));
+      if (state.exists) handedBackAt.set(row.id, `${state.head}:${state.status}`);
+    } catch {
+      // The next look decides.
+    }
+  }
+
+  /** The PR is yours from now. Stops the agent that is writing to its branch; returns what you find there. */
+  async function takeOver(row: ReviewRow, by: string, note: string): Promise<string> {
+    const p = q.pipeline.get(row.id);
+    if (p === undefined) throw new Error(`${prLabel(row)} is not in the factory`);
+    if (p.taken_at !== null) {
+      // Saying so yourself outranks a takeover the factory noticed: it then lasts until you hand the PR back.
+      if (by === "you" && p.taken_by !== "you") q.setTaken.run(p.taken_at, "you", note, row.id);
+      publish(row.id, "board");
+      return `you already have ${prLabel(row)}`;
+    }
+    q.setTaken.run(Date.now(), by, note, row.id);
+    pendingStarts.delete(row.id);
+    cleanSince.delete(row.id);
+    const run = q.fixRuns.all(row.id).at(-1);
+    const stopped = run?.status === "running";
+    if (run !== undefined && stopped) {
+      q.setFixRunFailed.run(TAKEN_STOP, Date.now(), row.id, run.run);
+      for (const lane of [{ row: q.fixer.get(row.id), clear: q.setFixerJob }, { row: q.checker.get(row.id), clear: q.setCheckerJob }]) {
+        if (lane.row === undefined || lane.row.job === null) continue;
+        lane.clear.run(null, row.id);
+        await bb.sdk.threads.stop({ threadId: lane.row.thread_id }).catch(() => undefined);
+      }
+      slackFixRun(row, run.run);
+    }
+    // What the stopped agent left is not your work; the worktree as it is now is where you start from.
+    if (stopped) await notYours(row);
+    const left = (await worktreeNow(row)) ?? { text: "" };
+    emitTelemetry({ type: "takeover", reviewId: row.id, pr: prLabel(row), by, stage: p.stage, stoppedRun: stopped ? `${run?.kind}:${run?.trigger}:${run?.phase ?? ""}` : null });
+    publish(row.id, "board");
+    return [`The factory is off ${prLabel(row)} until it is handed back.`, stopped ? `It stopped its ${run?.kind === "sync" ? "merge of the base" : "agent"} mid-run (${run?.phase ?? "working"}).` : "", left.text === "" ? "" : `${left.text}.`].filter((x) => x !== "").join(" ");
+  }
+
+  /** The factory has the PR again and carries on from the head you left. */
+  async function handBack(row: ReviewRow, why: string): Promise<string> {
+    const p = q.pipeline.get(row.id);
+    if (p === undefined || p.taken_at === null) return `the factory already has ${prLabel(row)}`;
+    // What is in the worktree now is what you chose to hand back; only a later change reads as you picking the PR up again.
+    const state = await worktreeNow(row);
+    if (state !== null && !state.gone) handedBackAt.set(row.id, state.signature);
+    q.setTaken.run(null, null, null, row.id);
+    cleanSince.delete(row.id);
+    emitTelemetry({ type: "handback", reviewId: row.id, pr: prLabel(row), by: p.taken_by ?? "you", why, heldMs: Date.now() - p.taken_at });
+    await syncReview(row.id).catch((cause: unknown) => bb.log.warn(`sync of ${prLabel(row)} on hand-back: ${errorMessage(cause)}`));
+    const fresh = requireReview(row.id);
+    const lastRun = q.fixRuns.all(row.id).at(-1);
+    const interrupted = lastRun !== undefined && lastRun.status === "failed" && lastRun.error === TAKEN_STOP;
+    const last = q.lastRound.get(row.id);
+    const moved = last !== undefined && last.head_sha !== fresh.head_sha;
+    const looping = p.stage === "ai_review" || p.stage === "fixing";
+    let next: string;
+    if (looping && moved) {
+      // You pushed: that head is reviewed now, with no settling; you said you are done.
+      setStage(fresh, "ai_review");
+      void advanceFactory(row.id, true).catch(() => undefined);
+      next = "a review round starts on the head you left";
+    } else if (interrupted && !moved) {
+      // Same head, and an agent was stopped mid-run (a fix, a deslop, a merge of the base, a CI fix): it starts that job again.
+      await startFixRun(fresh, lastRun.kind === "deslop" ? "deslop" : lastRun.kind === "sync" ? "sync" : "fix", lastRun.trigger);
+      next = "the agent starts its interrupted job again";
+    } else if (looping) {
+      setStage(fresh, "ai_review");
+      const now = q.pipeline.get(row.id);
+      const picked = last !== undefined && q.fixRuns.all(row.id).some((r) => r.trigger === `round:${last.round}`);
+      const posted = last !== undefined && last.status === "posted" && last.perf !== "running";
+      const warn = (cause: unknown) => bb.log.warn(`resuming ${prLabel(fresh)}: ${errorMessage(cause)}`);
+      if (now?.hold_until != null || !posted) {
+        // Waiting for bot reviews, or a round still queued or running: the next look carries on.
+        void advanceFactory(row.id).catch(() => undefined);
+      } else if (!picked && last !== undefined) {
+        // A round posted at this head whose findings no agent picked up gets its next step. If that step already ran once (its fix could not start), the round is not counted twice.
+        if (now !== undefined && now.reviewed_head === last.head_sha) q.setLoopRounds.run(Math.max(0, now.loop_rounds - 1), row.id);
+        await afterRound(fresh, last.round).catch(warn);
+      } else {
+        // The round's findings were worked through and nothing is running: the loop was about to decide whether the PR is ready.
+        await converged(fresh, "the loop carried on after you handed the PR back").catch(warn);
+      }
+      next = "the loop carries on from where it stopped";
+    } else {
+      // Ready, or waiting on you: a head you pushed goes to review once it has settled, and CI is watched again.
+      void advanceFactory(row.id).catch(() => undefined);
+      next = moved ? "the head you left is reviewed once it has settled" : "CI is watched again";
+    }
+    publish(row.id, "board");
+    return `The factory has ${prLabel(row)} again: ${next}.`;
+  }
+
+  /**
+   * Look at a PR's branch worktree. Work in it that the factory did not do
+   * means you picked the PR up: it becomes yours. A PR the factory took that
+   * way is handed back once the worktree has been clean and pushed for the
+   * idle time. Returns true while the PR is yours. Not run while an agent of
+   * the factory is working there, since what it sees then is that agent's.
+   */
+  async function worktreeTick(row: ReviewRow): Promise<boolean> {
+    const taken = () => q.pipeline.get(row.id)?.taken_at != null;
+    const p = q.pipeline.get(row.id);
+    if (p === undefined || row.state !== "OPEN") return false;
+    if (p.taken_at !== null && p.taken_by === "you") return true;
+    // An agent of the factory is at work in the worktree (a run, a round, a check, a CI pass): what is there now may be its doing.
+    const busy = q.fixRuns.all(row.id).at(-1)?.status === "running" || [q.aiReviewer.get(row.id), q.checker.get(row.id), q.babysitter.get(row.id)].some((lane) => (lane?.job ?? null) !== null);
+    if (busy) return taken();
+    let state = await worktreeNow(row);
+    if (state === null) return taken();
+    if (p.taken_at === null) {
+      if (!state.yours) return taken();
+      // Unpushed commits alone may be a push the board has not read yet: read the PR's head before deciding.
+      if (!state.dirty) {
+        await syncReview(row.id).catch(() => undefined);
+        state = await worktreeNow(requireReview(row.id));
+        if (state === null || !state.yours) return taken();
+      }
+      if (taken() || q.fixRuns.all(row.id).at(-1)?.status === "running") return taken();
+      bb.log.info(await takeOver(row, "worktree", `there is work in its worktree the factory did not do: ${state.text}`));
+      return true;
+    }
+    // Yours, by what the worktree held. Done means your work is on GitHub: read the PR's head again before judging.
+    if (!state.gone && state.unpushed > 0) {
+      await syncReview(row.id).catch(() => undefined);
+      state = (await worktreeNow(requireReview(row.id))) ?? state;
+    }
+    if (!taken()) return false;
+    if (state.gone) {
+      bb.log.info(await handBack(row, "its worktree is gone or on another branch"));
+      return false;
+    }
+    if (state.yours) {
+      cleanSince.delete(row.id);
+      const note = `${state.text}; it is handed back once that is pushed`;
+      if (q.pipeline.get(row.id)?.taken_note !== note) {
+        q.setTaken.run(p.taken_at, p.taken_by, note, row.id);
+        publish(row.id, "board");
+      }
+      return true;
+    }
+    const since = cleanSince.get(row.id) ?? Date.now();
+    cleanSince.set(row.id, since);
+    if (Date.now() - since < Math.max(0, takeoverIdleMinutes) * 60_000) return true;
+    bb.log.info(await handBack(row, `nothing of yours has been left unpushed in its worktree for ${takeoverIdleMinutes} minutes`));
+    return false;
+  }
+
+  // Your own worktrees are looked at every two minutes: that is how soon the factory notices you picked a PR up or finished.
+  // A worktree the factory made for itself is nobody else's, so it is not watched.
+  const watchTimer = setInterval(() => {
+    void (async () => {
+      // After a reload the worktree of a taken PR may not be known yet; find it, so the takeover can end.
+      for (const p of q.takenPipelines.all()) {
+        const row = q.review.get(p.review_id);
+        if (row !== undefined && row.state === "OPEN" && p.taken_by !== "you" && !fixerTargets.has(row.id)) await ensureBranchWorktree(row).catch(() => undefined);
+      }
+      for (const [reviewId, target] of [...fixerTargets]) {
+        if (target.worktree.endsWith("__branch")) continue;
+        const row = q.review.get(reviewId);
+        if (row === undefined || row.state !== "OPEN" || q.pipeline.get(reviewId) === undefined) continue;
+        await worktreeTick(row).catch((cause: unknown) => bb.log.warn(`watching the worktree of ${prLabel(row)}: ${errorMessage(cause)}`));
+      }
+    })();
+  }, 2 * 60_000);
+  bb.onDispose(() => clearInterval(watchTimer));
 
   // -- learn: after a merge ------------------------------------------------------
   //
@@ -5509,6 +5787,8 @@ export default async function plugin(bb: BbPluginApi) {
       startFactory(row, true);
       return "AI round queued";
     }
+    if (verb === "hold") return takeOver(row, "you", "you took it over from Slack");
+    if (verb === "release") return handBack(row, "you handed it back from Slack");
     if ((verb === "fix" || verb === "deslop") && isMine(row)) {
       await startFixRun(row, verb, "manual");
       return verb === "fix" ? "the author's agent is fixing" : "the author's agent is deslopping";
@@ -5577,7 +5857,7 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     if (map?.muted && !mentioned) return;
-    if (map?.reviewId !== undefined && ["babysit", "fix", "deslop", "review"].includes(word)) {
+    if (map?.reviewId !== undefined && ["babysit", "fix", "deslop", "review", "hold", "release"].includes(word)) {
       const done = await slackPrAction(map.reviewId, word).catch((cause: unknown) => errorMessage(cause));
       await slack("chat.postMessage", { channel: ev.channel, thread_ts: threadTs, text: done }).catch(() => undefined);
       return;
@@ -5710,6 +5990,11 @@ export default async function plugin(bb: BbPluginApi) {
       if (q.pipeline.get(row.id) === undefined) setStage(row, "fixing");
       await startFixRun(row, kind, "manual");
       return { review: summarize(requireReview(reviewId)) };
+    },
+    factory_hold: async ({ reviewId, on }) => {
+      const row = requireReview(reviewId);
+      const note = on ? await takeOver(row, "you", "you took it over") : await handBack(row, "you handed it back");
+      return { review: summarize(requireReview(reviewId)), note };
     },
     factory_stop: ({ reviewId }) => {
       requireReview(reviewId);
@@ -5953,6 +6238,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "board", summary: "Print the board: every tracked PR under its column", usage: "bb review-desk board [--json]" },
       { name: "move", summary: "Drag a card to a column, or back to the column GitHub's state gives it", usage: "bb review-desk move <reviewId> <unreviewed|ai_review|human_review|changes_requested|babysit|auto> [--json]" },
       { name: "refresh", summary: "Sync every open PR with GitHub", usage: "bb review-desk refresh [--json]" },
+      { name: "hold", summary: "Take a PR over: the factory stops and stays off it until you release it. Run it before you (or an agent of yours) start work on a PR's branch", usage: "bb review-desk hold <reviewId | owner/repo#N | PR URL | PR number | an absolute path inside the PR's worktree> [--json]" },
+      { name: "release", summary: "Hand a PR back to the factory: it carries on from the head you left", usage: "bb review-desk release <reviewId | owner/repo#N | PR URL | PR number | an absolute path inside the PR's worktree> [--json]" },
       { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show|ping|resolve|fix|deslop|report> <reviewId> [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "map", summary: "Write or print the PR's diffmap spec", usage: "bb review-desk map <reviewId> [--rewrite] [--json]" },
@@ -6004,6 +6291,30 @@ export default async function plugin(bb: BbPluginApi) {
             for (const c of closed) lines.push(`  ${c.id}  ${c.owner}/${c.repo}#${c.number}  ${c.title}  [${c.state.toLowerCase()}]`);
             return ok(cards, cards.length === 0 ? "No PRs on the board." : lines.join("\n"));
           }
+          case "hold":
+          case "release": {
+            const ref = rest.join(" ").trim();
+            if (ref === "") return { exitCode: 1, stderr: `usage: bb review-desk ${command} <reviewId | owner/repo#N | PR URL | PR number | an absolute path inside the PR's worktree>` };
+            const pr = parsePrRef(ref);
+            const number = /^#?\d+$/.test(ref) ? Number(ref.replace("#", "")) : null;
+            const open = q.reviews.all().filter((r) => r.state === "OPEN" && q.pipeline.get(r.id) !== undefined);
+            const matches = open.filter((r) =>
+              r.id === ref
+              || (pr !== null && r.owner.toLowerCase() === pr.owner.toLowerCase() && r.repo.toLowerCase() === pr.repo.toLowerCase() && r.number === pr.number)
+              || (number !== null && r.number === number)
+              || (ref.startsWith("/") && [fixerTargets.get(r.id)?.worktree, r.worktree].some((w) => w !== undefined && (ref === w || ref.startsWith(`${w}/`)))),
+            );
+            if (matches.length === 0 && ref.startsWith("/")) {
+              // The worktrees are found lazily; after a reload, look them up before saying no.
+              for (const r of open) if (!fixerTargets.has(r.id) && isMine(r)) await ensureBranchWorktree(r).catch(() => undefined);
+              matches.push(...open.filter((r) => [fixerTargets.get(r.id)?.worktree].some((w) => w !== undefined && (ref === w || ref.startsWith(`${w}/`)))));
+            }
+            if (matches.length === 0 && !ref.startsWith("/") && (ref.startsWith(".") || ref.includes("/")) && pr === null) return { exitCode: 1, stderr: `give an absolute path (for example "$(pwd)"), a PR number, or owner/repo#N; got ${ref}` };
+            if (matches.length !== 1) return { exitCode: 1, stderr: matches.length === 0 ? `no open PR in the factory matches ${ref}` : `${ref} matches ${matches.length} PRs: ${matches.map((r) => prLabel(r)).join(", ")}` };
+            const row = matches[0];
+            const note = command === "hold" ? await takeOver(row, "you", "you took it over") : await handBack(row, "you handed it back");
+            return ok({ note, card: summarize(requireReview(row.id)) }, note);
+          }
           case "move": {
             const [reviewId, stage] = rest;
             if (!reviewId || !stage || (stage !== "auto" && !isBoardStage(stage))) return { exitCode: 1, stderr: `usage: bb review-desk move <reviewId> <${BOARD_STAGES.join("|")}|auto>` };
@@ -6027,6 +6338,10 @@ export default async function plugin(bb: BbPluginApi) {
               if (last === undefined) return { exitCode: 1, stderr: "no finished deslop run on this PR" };
               const url = await postDeslopReport(row, last.run);
               return ok({ url }, `Posted the report of deslop run ${last.run}: ${url}`);
+            }
+            if (action === "hold" || action === "release") {
+              const note = action === "hold" ? await takeOver(row, "you", "you took it over") : await handBack(row, "you handed it back");
+              return ok({ note, card: summarize(requireReview(row.id)) }, note);
             }
             if (action === "learn") {
               const started = await startLearn(row, args.includes("--force"));
@@ -6052,12 +6367,12 @@ export default async function plugin(bb: BbPluginApi) {
             else if (action === "stop") {
               q.deletePipeline.run(row.id);
               publish(row.id, "board");
-            } else if (action !== "show") return { exitCode: 1, stderr: "usage: bb review-desk factory <start|stop|show|ping|resolve|fix|deslop|report|learn|prompt> <reviewId> [--head <sha>] [--base <sha>] [--force]" };
+            } else if (action !== "show") return { exitCode: 1, stderr: "usage: bb review-desk factory <start|stop|show|hold|release|ping|resolve|fix|deslop|report|learn|prompt> <reviewId> [--head <sha>] [--base <sha>] [--force]" };
             const card = summarize(requireReview(row.id));
             const rounds = q.rounds.all(row.id);
             const findings = q.findings.all(row.id);
             const text = [
-              `${card.owner}/${card.repo}#${card.number} is in ${card.stage === null ? "merged or closed" : BOARD_STAGE_LABEL[card.stage]}${card.factory?.needsYou ? `; needs you: ${card.factory.needsYou}` : ""}`,
+              `${card.owner}/${card.repo}#${card.number} is in ${card.stage === null ? "merged or closed" : BOARD_STAGE_LABEL[card.stage]}${card.factory?.needsYou ? `; needs you: ${card.factory.needsYou}` : ""}${card.factory?.taken ? `; you have it since ${new Date(card.factory.taken.at).toISOString()} (${card.factory.taken.note})` : ""}`,
               ...rounds.map((r) => `  round ${r.round} (${roundKind(r)}${r.perf === null ? "" : `, perf ${r.perf}`}) ${r.status} at ${r.head_sha.slice(0, 10)}${r.high_value === null ? "" : `, ${r.high_value} above nit`}${r.review_url ? ` ${r.review_url}` : ""}${r.error ? ` (${r.error})` : ""}`),
               ...findings.map((f) => `    [${f.status}] r${f.round} ${f.severity} ${f.path}:${f.line} ${f.title}`),
               ...q.fixRuns.all(row.id).map((r) => `  ${r.kind} run ${r.run} (${r.trigger}) ${r.status}${r.status === "running" && r.phase ? ` [${r.phase}]` : ""}${r.checks > 0 ? `, checked ${r.checks}x` : ""}${r.head_after ? ` -> ${r.head_after.slice(0, 10)}` : ""}${r.error ? `: ${r.error}` : ""}${r.summary ? `\n    ${r.summary}` : ""}`),

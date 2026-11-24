@@ -266,7 +266,7 @@ export function fixerIntro(c: { owner: string; repo: string; number: number; tit
     `When the work needs it you may rebase onto or merge the base branch, resolve conflicts, and reword or squash the PR's own commits; push a rewritten branch with git push --force-with-lease ${c.remote} HEAD:${c.headRef}, never a plain --force. Say in your summary when you did.`,
     "Never: merge the PR itself, push to any branch but the PR's, close the PR, mark it ready, request reviewers, resolve threads a human reviewer opened, or touch files outside this worktree.",
     "Wait for what you start: when a build or a test runs in the background, wait for it in the foreground until it finishes. Your last message is read as the end of the job, so never end a turn with work still running.",
-    `Before each job, get the worktree clean and current, then carry on: stash uncommitted changes with git stash push -u -m "review-desk: <job>" (say so in your summary; the author can git stash pop them), and bring the branch up to date with ${c.remote}/${c.headRef} (git pull --rebase).`,
+    `The author works in this same worktree. Before each job, look at it (git status): if it has uncommitted changes you did not make, do not stash, discard, or commit them; make no change, and say so in your summary, because the author is in the middle of something. Otherwise bring the branch up to date with ${c.remote}/${c.headRef} (git pull --rebase). If files change under you during a job, stop and say so.`,
   ].join("\n");
 }
 

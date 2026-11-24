@@ -85,6 +85,7 @@ function fixLabel(fix: NonNullable<NonNullable<ReviewSummary["factory"]>["fix"]>
 /** The one thing worth knowing about a card: what needs you, what is running, or what CI says. Null when nothing does. */
 function cardStatus(card: ReviewSummary, stage: BoardStage): { label: string; tone: ChipTone; icon: IconName; title?: string } | null {
   const f = card.factory;
+  if (f?.taken) return { label: "You have it", tone: "strong", icon: "CircleCheck", title: `The factory is off this PR until it is handed back. ${f.taken.by === "you" ? "You took it over; hand it back when you are done." : "The factory found work in its worktree that it did not do; it is handed back once that is committed and pushed."}${f.taken.note ? ` (${f.taken.note})` : ""}` };
   if (f?.needsYou) return { label: "Needs you", tone: "bad", icon: "BellDot", title: f.needsYou };
   if (f?.fix?.status === "running") return { label: fixLabel(f.fix), tone: "strong", icon: "Clock", title: "The author's agent commits, a fresh-context check reads each commit, and only then is anything pushed" };
   if (f?.roundStatus === "running" || f?.roundStatus === "queued") {
@@ -103,7 +104,7 @@ function cardStatus(card: ReviewSummary, stage: BoardStage): { label: string; to
   return null;
 }
 
-function PrCard({ card, stage, onOpen, onRemove }: { card: ReviewSummary; stage: BoardStage; onOpen: () => void; onRemove: () => void }) {
+function PrCard({ card, stage, onOpen, onRemove, onHold }: { card: ReviewSummary; stage: BoardStage; onOpen: () => void; onRemove: () => void; onHold: (on: boolean) => void }) {
   const [confirm, setConfirm] = useState(false);
   const status = cardStatus(card, stage);
   const onDragStart = (e: DragEvent<HTMLDivElement>) => {
@@ -124,6 +125,16 @@ function PrCard({ card, stage, onOpen, onRemove }: { card: ReviewSummary; stage:
     >
       <div className="flex items-center gap-1.5">
         <span className="min-w-0 flex-1 truncate text-sm font-medium">{card.title}</span>
+        {card.factory ? (
+          <button
+            type="button"
+            title={card.factory.taken ? "Hand the PR back to the factory: it carries on from the head you left" : "Take the PR over: the factory stops and stays off it until you hand it back"}
+            onClick={(e) => { e.stopPropagation(); onHold(!card.factory?.taken); }}
+            className={cn("shrink-0 rounded px-1 py-0.5 text-[11px] text-muted-foreground transition-opacity hover:bg-state-hover hover:text-foreground focus:opacity-100", card.factory.taken ? "opacity-100" : "opacity-0 group-hover:opacity-100")}
+          >
+            {card.factory.taken ? "Hand back" : "Take over"}
+          </button>
+        ) : null}
         <button
           type="button"
           aria-label="Remove from the board"
@@ -291,6 +302,16 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
     }
   };
 
+  const hold = async (card: ReviewSummary, on: boolean) => {
+    try {
+      const { note } = await rpc.call("factory_hold", { reviewId: card.id, on });
+      toast.success(note);
+      refetch();
+    } catch (cause) {
+      toast.error(describeError(cause));
+    }
+  };
+
   const remove = async (card: ReviewSummary, quiet = false) => {
     try {
       await rpc.call("reviews_remove", { reviewId: card.id });
@@ -367,7 +388,7 @@ export function BoardPage({ onOpen }: { onOpen: (reviewId: string) => void }) {
                           }}
                         >
                           {cards[stage].map((card) => (
-                            <PrCard key={card.id} card={card} stage={stage} onOpen={() => onOpen(card.id)} onRemove={() => void remove(card)} />
+                            <PrCard key={card.id} card={card} stage={stage} onOpen={() => onOpen(card.id)} onRemove={() => void remove(card)} onHold={(on) => void hold(card, on)} />
                           ))}
                         </BoardColumn>
                       );
