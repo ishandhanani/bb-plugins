@@ -94,6 +94,16 @@ flowchart TD
 - **Dynamo** (`ci/ai-dynamo__dynamo.md`, `act: mine`): a conflict is always merged in, in any column, without a ping.
 - **Pings.** You are told once per cause: when a fix exists on the base repository and is not merged, when only a person can decide, or when the pass budget runs out. The same cause is never pinged twice, and a head pings at most once in three hours. In Slack, babysit actions repaint one message in the PR's thread instead of adding replies.
 
+### Taking a PR over
+
+The factory's agents and your own sessions work in the same branch worktree, so a PR has one holder at a time: the factory, or you.
+
+- **Picking it up.** Say so: `bb review-desk hold <PR | path inside the worktree>`, **Take over** on the card, or `hold` in the PR's Slack thread. Your agent sessions should run the command before they touch a PR's branch (one line in your agent instructions does it). As a safety net the factory also looks at each of your worktrees every two minutes, and before it starts any job that writes: uncommitted changes to tracked files, or commits it did not make, mean you picked the PR up.
+- **What stops.** The agent that was writing to the branch (a fix, a deslop, a merge of the base, a CI fix) is stopped at once, and you are told what it left in the worktree. Nothing new starts on the PR: no round, fix, check, merge, or CI pass, and no pings. A review round or CI pass that was already running finishes and posts; what would follow it waits. The author's agent no longer stashes changes it finds.
+- **Handing it back.** `bb review-desk release <PR | path>`, **Hand back** on the card, or `release` in Slack. A takeover the factory noticed by itself also ends by itself, once the worktree has had nothing uncommitted and nothing unpushed for `takeoverIdleMinutes`: finished means your work is on GitHub. Until then the card says what is still local.
+- **What happens next.** The factory reads the head you left. If you pushed, that head is reviewed (at once, when the loop was mid-flight; after the usual settling when the PR was Ready). If the head is the same, an agent that was interrupted starts its job again, and a round that finished meanwhile gets its next step.
+- **The gap.** If the factory's agent is already mid-job when you start editing without saying so, the factory cannot tell your edits from its own until that job ends. The explicit `hold` closes that gap, which is why your sessions should run it.
+
 ### The board
 
 | Column | My PRs | Reviewing |
@@ -164,7 +174,9 @@ bb review-desk list
 bb review-desk board
 bb review-desk move <reviewId> <unreviewed|ai_review|fixing|human_review|changes_requested|babysit|auto>
 bb review-desk refresh
-bb review-desk factory <start|stop|show|ping|resolve|fix|deslop|report|learn|prompt> <reviewId>
+bb review-desk hold <reviewId | owner/repo#N | PR URL | PR number | absolute path in the worktree>
+bb review-desk release <same>
+bb review-desk factory <start|stop|show|hold|release|ping|resolve|fix|deslop|report|learn|prompt> <reviewId>
 bb review-desk ask <reviewId> <text...> [--provider <id>]
 bb review-desk map <reviewId> [--rewrite]
 bb review-desk slack <reviewId> [on|off|show]
@@ -184,6 +196,7 @@ bb review-desk slack <reviewId> [on|off|show]
 - `autoAiReview` (default true): adding a PR to the board starts the factory. Rounds post COMMENT reviews under your `gh` login. Nothing is added to the board for you.
 - `aiReviewProvider` / `aiReviewModel` (default `claude-code` / `claude-fable-5-2`): the AI reviewer. `factoryReasoning` (default `xhigh`): the reasoning level for the reviewer, the author's agent, and the check.
 - `finalPassProvider` / `finalPassModel` / `finalPassReasoning` (default `codex` / `gpt-6-astra` / empty): the whole-PR pass with fresh eyes before a PR is first called ready. Empty provider uses the reviewer's. If that provider cannot start, the pass runs on the reviewer's model.
+- `takeoverIdleMinutes` (default 5): how long a worktree must have had nothing uncommitted and nothing unpushed before a takeover the factory noticed is handed back.
 - `botSettleMinutes` (default 10): how long a head must have been up before your PR is called ready, so bot reviewers have posted; 0 turns the wait off.
 - `aiReviewMaxRounds` (default 6): safety cap on AI rounds in one loop (from a new head until the PR is ready again); the loop normally ends sooner, when a round leaves only nits or makes no progress.
 - `perfReview` (default true): run the perf review when a round's files touch a request path.

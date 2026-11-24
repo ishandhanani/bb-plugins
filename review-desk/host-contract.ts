@@ -210,6 +210,11 @@ export const hostContract = defineRpcContract({
       perfDirs: z.array(z.string()),
     }),
   },
+  /** A worktree as it stands: whether it is still there, the branch it is on, its HEAD, whether tracked files have uncommitted changes (status is a hash of those changes), and how many commits it has that `pushed` (the PR's head on GitHub) does not. */
+  worktree_state: {
+    input: z.object({ worktree: z.string(), pushed: z.string() }),
+    output: z.object({ exists: z.boolean(), branch: z.string(), head: z.string(), dirty: z.boolean(), unpushed: z.number(), status: z.string() }),
+  },
   /** The commits in a range, oldest first, as the author's agent left them locally. */
   git_range: {
     input: z.object({ worktree: z.string(), from: z.string(), to: z.string() }),

@@ -39,6 +39,7 @@ export function ciLine(card: ReviewSummary): string {
 /** What is happening or needed now, in a few words. */
 export function nowLine(card: ReviewSummary): string {
   const f = card.factory;
+  if (f?.taken) return `you have it; the factory is off this PR until it is handed back${f.taken.note ? ` (${f.taken.note})` : ""}`;
   if (f?.needsYou) return `needs you: ${f.needsYou}`;
   if (f?.fix?.status === "running") return `${f.fix.kind === "deslop" ? "deslopping" : f.fix.kind === "sync" ? "merging the base" : "fixing"}${f.fix.phase === "check" ? ": commits being checked" : f.fix.phase === "revise" ? ": revising what the check rejected" : f.fix.phase === "publish" ? ": pushing" : ""}`;
   if (f?.roundStatus === "running" || f?.roundStatus === "queued") return `AI round ${f.round} ${f.roundStatus}`;
