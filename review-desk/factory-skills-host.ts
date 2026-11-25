@@ -51,7 +51,7 @@ function personalRoots(): string[] {
   ];
 }
 
-export interface FactorySkillsInput { repoPath: string; remote: string | null; owner: string; repo: string; personal: string[]; changedPaths: string[] }
+export interface FactorySkillsInput { repoPath: string; remote: string | null; owner: string; repo: string; personal: string[]; changedPaths: string[]; sha?: string | null }
 export interface FactorySkillsOutput {
   ref: string | null;
   sha: string | null;
@@ -70,20 +70,28 @@ export async function factorySkills(input: FactorySkillsInput): Promise<FactoryS
   }
   const none: FactorySkillsOutput = { ref: null, sha: null, root: null, personal, repo: [], agents: [], perfDirs: [] };
   const remote = input.remote ?? "origin";
-  // The default branch, as the remote names it; main, then master, when the checkout never recorded it.
-  const head = (await git(input.repoPath, ["symbolic-ref", "--short", `refs/remotes/${remote}/HEAD`])).stdout.trim().replace(`${remote}/`, "");
   let branch: string | null = null;
-  for (const candidate of [head, "main", "master"].filter((b) => b !== "")) {
-    // Latest means fetched now; a failed fetch (offline) falls back to what the checkout already has.
-    await git(input.repoPath, ["fetch", "--quiet", remote, `+refs/heads/${candidate}:refs/remotes/${remote}/${candidate}`]);
-    if ((await git(input.repoPath, ["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${candidate}`])).ok) {
-      branch = candidate;
-      break;
+  let sha = "";
+  if (input.sha) {
+    // A frozen commit (a replay): the skills as they were then, with nothing fetched.
+    sha = (await git(input.repoPath, ["rev-parse", "--verify", "--quiet", `${input.sha}^{commit}`])).stdout.trim();
+    if (sha === "") return none;
+    branch = `commit ${sha.slice(0, 10)}`;
+  } else {
+    // The default branch, as the remote names it; main, then master, when the checkout never recorded it.
+    const head = (await git(input.repoPath, ["symbolic-ref", "--short", `refs/remotes/${remote}/HEAD`])).stdout.trim().replace(`${remote}/`, "");
+    for (const candidate of [head, "main", "master"].filter((b) => b !== "")) {
+      // Latest means fetched now; a failed fetch (offline) falls back to what the checkout already has.
+      await git(input.repoPath, ["fetch", "--quiet", remote, `+refs/heads/${candidate}:refs/remotes/${remote}/${candidate}`]);
+      if ((await git(input.repoPath, ["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${candidate}`])).ok) {
+        branch = candidate;
+        break;
+      }
     }
+    if (branch === null) return none;
+    sha = (await git(input.repoPath, ["rev-parse", `refs/remotes/${remote}/${branch}`])).stdout.trim();
+    if (sha === "") return none;
   }
-  if (branch === null) return none;
-  const sha = (await git(input.repoPath, ["rev-parse", `refs/remotes/${remote}/${branch}`])).stdout.trim();
-  if (sha === "") return none;
 
   const base = path.join(homedir(), ".review-desk", "skills", `${input.owner}__${input.repo}`);
   const root = path.join(base, sha.slice(0, 12));
@@ -140,5 +148,5 @@ export async function factorySkills(input: FactorySkillsInput): Promise<FactoryS
     }
   }
   const agents = [...wanted].sort((a, b) => b.length - a.length).slice(0, 40).map((f) => ({ dir: dirOf(f), path: path.join(root, f), performance: withPerf.has(f), digest: digest(path.join(root, f)) }));
-  return { ref: `${remote}/${branch}`, sha, root, personal, repo, agents, perfDirs: [...withPerf].map(dirOf).filter((d) => d !== "") };
+  return { ref: input.sha ? branch : `${remote}/${branch}`, sha, root, personal, repo, agents, perfDirs: [...withPerf].map(dirOf).filter((d) => d !== "") };
 }

@@ -200,7 +200,8 @@ export const hostContract = defineRpcContract({
    * latest default branch of owner/repo (fetched now), not from the PR branch.
    */
   factory_skills: {
-    input: z.object({ repoPath: z.string(), owner: z.string(), repo: z.string(), personal: z.array(z.string()), changedPaths: z.array(z.string()) }),
+    /** sha: read the repository's skills at that commit instead of its latest default branch (a replay on a frozen head must not see rules written after it). */
+    input: z.object({ repoPath: z.string(), owner: z.string(), repo: z.string(), personal: z.array(z.string()), changedPaths: z.array(z.string()), sha: z.string().nullable().optional() }),
     output: z.object({
       ref: z.string().nullable(),
       sha: z.string().nullable(),
@@ -220,6 +221,11 @@ export const hostContract = defineRpcContract({
   worktree_state: {
     input: z.object({ worktree: z.string(), pushed: z.string(), base: z.string() }),
     output: z.object({ exists: z.boolean(), branch: z.string(), head: z.string(), dirty: z.boolean(), unpushed: z.number(), rebased: z.boolean(), status: z.string() }),
+  },
+  /** The commit each inline review comment and each review was made on, by its URL: what tells whether a reviewer was looking at a head the AI had reviewed. */
+  gh_comment_commits: {
+    input: z.object({ owner: z.string(), repo: z.string(), number: z.number() }),
+    output: z.object({ commits: z.array(z.object({ url: z.string(), commitId: z.string() })) }),
   },
   /** The commits in a range, oldest first, as the author's agent left them locally. */
   git_range: {

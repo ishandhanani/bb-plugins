@@ -344,12 +344,17 @@ const learnReplySchema = z.object({
   items: z
     .array(z.object({ url: z.string().default(""), author: z.string().default(""), category: z.string().default(""), match: z.string(), finding: z.string().default(""), cause: z.string().default(""), home: z.string().default(""), rule: z.string().default("") }))
     .default([]),
+  findings: z.array(z.object({ id: z.string(), outcome: z.string(), note: z.string().default("") })).default([]),
 });
 export type LearnItem = Omit<z.infer<typeof learnReplySchema>["items"][number], "match"> & { match: LearnMatch };
 
-export function parseLearnReply(text: string): { summary: string; items: LearnItem[] } {
+export const LEARN_OUTCOMES = ["addressed", "declined", "ignored"] as const;
+export type LearnOutcome = (typeof LEARN_OUTCOMES)[number];
+
+export function parseLearnReply(text: string): { summary: string; items: LearnItem[]; findings: { id: string; outcome: LearnOutcome; note: string }[] } {
   const reply = learnReplySchema.parse(replyJson(text, LEARN_FENCE));
   return {
+    findings: reply.findings.map((f) => ({ id: f.id.trim(), note: f.note, outcome: (LEARN_OUTCOMES as readonly string[]).includes(f.outcome.toLowerCase()) ? (f.outcome.toLowerCase() as LearnOutcome) : "ignored" })),
     summary: reply.summary,
     items: reply.items.map((i) => ({ ...i, match: (LEARN_MATCHES as readonly string[]).includes(i.match.toLowerCase()) ? (i.match.toLowerCase() as LearnMatch) : "missed" })),
   };
