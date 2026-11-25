@@ -40,7 +40,8 @@ For each rejected commit: change it so the problem is gone, or drop it and chang
    - a bot's thread, and an AI review NIT: resolve it once you have replied, whether you fixed it or said why not;
    - any other AI review thread: resolve it only when you fixed it; a skipped one stays open for the next round to judge;
    - a human reviewer's thread: never; it is theirs to resolve.
-4. Do not request reviewers and do not mark the PR ready; the author does that.
+4. Read the PR description against the pushed head (gh pr view --json body). Where a commit you pushed, or a merge from the base branch, made a sentence in it false (a renamed test, a count, an "only X changes" claim, a list of conditions), correct that sentence with gh pr edit and change nothing else in it. (ai-dynamo/dynamo#19038, #19039, #18804, #18443)
+5. Do not request reviewers and do not mark the PR ready; the author does that.
 
 {{output}}
 
