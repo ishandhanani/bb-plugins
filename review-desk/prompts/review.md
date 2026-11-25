@@ -44,7 +44,7 @@ Open findings from earlier rounds:
 {{prior}}
 
 Tasks:
-1. For every open finding above, decide fixed, open, or obsolete (the code is gone, or the author's reply in a thread shows it is not a problem; say why in note). Check the code at the new head, not the author's claim.
+1. For every open finding above, NITs included, decide fixed, open, or obsolete (the code is gone, or the author's reply in a thread shows it is not a problem; say why in note). Check the code at the new head, not the author's claim. Each one you mark fixed or obsolete gets a reply with your note and its thread is closed, so the note should say what changed in one sentence.
 2. Review what changed since the previous round, with the whole PR as context: bugs the fixes introduce, regressions, and new code. New commits are often fixes for review comments: check that each one fixes what was asked, adds no work on a request path, adds nothing unused, and leaves no doc or test describing the old behavior. Do not raise again what is listed above, and do not raise new findings on code the new commits did not touch unless they make it wrong.
 
 <!-- @empirical-on -->
