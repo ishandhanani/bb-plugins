@@ -155,7 +155,8 @@ export const hostContract = defineRpcContract({
       owner: z.string(),
       repo: z.string(),
       number: z.number(),
-      commitId: z.string(),
+      /** The commit the review is of; null posts it against the PR's latest commit. */
+      commitId: z.string().nullable(),
       event: z.enum(["COMMENT", "APPROVE", "REQUEST_CHANGES"]),
       body: z.string(),
       comments: z.array(
