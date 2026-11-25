@@ -5125,24 +5125,29 @@ export default async function plugin(bb: BbPluginApi) {
     const target = fixerTargets.get(row.id);
     if (target === undefined) return null;
     try {
-      const state = await host.call("worktree_state", { worktree: target.worktree, pushed: row.head_sha }, hostOptions(row));
+      const state = await host.call("worktree_state", { worktree: target.worktree, pushed: row.head_sha, base: `${target.baseRemote}/${row.base_ref}` }, hostOptions(row));
       if (!state.exists || (state.branch !== row.head_ref && !state.branch.endsWith(`/${row.head_ref}`))) {
         fixerTargets.delete(row.id);
         return { gone: true, text: `${target.worktree} is gone or on another branch`, clean: true, dirty: false, unpushed: 0, yours: false, signature: "" };
       }
       // Commits the factory's own agent left there (a run the check rejected, or one that was stopped) are not yours.
       const factoryHeads = q.fixRuns.all(row.id).map((r) => r.head_after).filter((h): h is string => h !== null && h.length >= 7);
-      const ownCommits = state.unpushed > 0 && factoryHeads.some((h) => state.head.startsWith(h) || h.startsWith(state.head));
+      const ahead = state.unpushed > 0 || state.rebased;
+      const ownCommits = ahead && factoryHeads.some((h) => state.head.startsWith(h) || h.startsWith(state.head));
       const signature = `${state.head}:${state.status}`;
       // A state the factory itself left (a failed or stopped run), or one you handed back, is not you picking the PR up.
       const known = handedBackAt.get(row.id) === signature;
-      const parts = [state.unpushed > 0 ? `${state.unpushed} unpushed commit${state.unpushed === 1 ? "" : "s"}${ownCommits ? " the factory's agent left" : ""}` : "", state.dirty ? "uncommitted changes" : ""].filter((x) => x !== "");
-      const clean = !state.dirty && state.unpushed === 0;
+      const parts = [
+        state.unpushed > 0 ? `${state.unpushed} unpushed commit${state.unpushed === 1 ? "" : "s"}${ownCommits ? " the factory's agent left" : ""}` : "",
+        state.rebased ? `a rebase that is not pushed${ownCommits && state.unpushed === 0 ? ", by the factory's agent" : ""}` : "",
+        state.dirty ? "uncommitted changes" : "",
+      ].filter((x) => x !== "");
+      const clean = !state.dirty && !ahead;
       return {
         gone: false,
         text: clean ? `${target.worktree} is clean at ${state.head.slice(0, 10)}` : `${target.worktree} has ${parts.join(" and ")}`,
         clean, dirty: state.dirty, unpushed: state.unpushed,
-        yours: !known && (state.dirty || (state.unpushed > 0 && !ownCommits)),
+        yours: !known && (state.dirty || (ahead && !ownCommits)),
         signature,
       };
     } catch (cause) {
@@ -5156,7 +5161,7 @@ export default async function plugin(bb: BbPluginApi) {
     const target = fixerTargets.get(row.id);
     if (target === undefined) return;
     try {
-      const state = await host.call("worktree_state", { worktree: target.worktree, pushed: row.head_sha }, hostOptions(row));
+      const state = await host.call("worktree_state", { worktree: target.worktree, pushed: row.head_sha, base: `${target.baseRemote}/${row.base_ref}` }, hostOptions(row));
       if (state.exists) handedBackAt.set(row.id, `${state.head}:${state.status}`);
     } catch {
       // The next look decides.
@@ -5279,7 +5284,7 @@ export default async function plugin(bb: BbPluginApi) {
       return true;
     }
     // Yours, by what the worktree held. Done means your work is on GitHub: read the PR's head again before judging.
-    if (!state.gone && state.unpushed > 0) {
+    if (!state.gone && !state.clean && !state.dirty) {
       await syncReview(row.id).catch(() => undefined);
       state = (await worktreeNow(requireReview(row.id))) ?? state;
     }
