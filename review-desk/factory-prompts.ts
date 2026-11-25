@@ -229,6 +229,15 @@ export interface ReviewContext {
   changedPaths: string[];
   skills: string;
   empirical: boolean;
+  /**
+   * A replay on a frozen head, for the evals: the reviewer must not read the pull request on GitHub (the answers are
+   * there), and gets the description as it was recorded at that head, when it was.
+   */
+  replay?: { description: string | null };
+  /** Parts left out, to measure what each one earns: "procedures" (the things to do outside the diff). */
+  omit?: string[];
+  /** bare: the smallest prompt that still names the task and the output, the baseline every other part is measured against. */
+  variant?: "full" | "bare";
 }
 
 const priorLines = (prior: PriorFinding[]) =>
@@ -239,15 +248,19 @@ export function reviewPrompt(files: FactoryFiles, c: ReviewContext): string {
     `AI review of ${c.owner}/${c.repo}#${c.number} "${c.title}"${c.author ? ` by ${c.author}` : ""}.`,
     `Merge base with ${c.baseRef}: ${c.baseSha}. Head: ${c.headSha}.`,
     `Changed files (${c.changedPaths.length}): ${c.changedPaths.slice(0, 120).join(", ")}${c.changedPaths.length > 120 ? ", ..." : ""}`,
-    `PR description and conversation: gh pr view ${c.number} --repo ${c.owner}/${c.repo} --comments`,
+    c.replay === undefined
+      ? `PR description and conversation: gh pr view ${c.number} --repo ${c.owner}/${c.repo} --comments`
+      : `This is a replay on a frozen head. Do not read the pull request on GitHub (no gh pr view, no comments, no reviews) and do not look at commits after ${c.headSha.slice(0, 10)}: review only the code at the shas above. The PR description at this head: ${c.replay.description === null || c.replay.description.trim() === "" ? "was not recorded." : `\n${c.replay.description.trim().slice(0, 6_000)}`}`,
     ...(c.threads.length === 0 ? [] : ["", "Unresolved GitHub review threads (do not repeat what they already say):", ...c.threads.map((t) => `  ${t}`)]),
   ].join("\n");
   const vars = { round: c.round, baseSha: c.baseSha, headSha: c.headSha, baseRef: c.baseRef, prevBase: c.prev?.baseSha ?? "", prevHead: c.prev?.headSha ?? "", prior: priorLines(c.prior) };
   const scope = render(files, c.prev === null ? "review@scope-first" : c.kind === "delta" ? "review@scope-delta" : "review@scope-full", vars);
+  if (c.variant === "bare") return render(files, "review@bare", { header, skills: c.skills, scope, output: REVIEW_OUTPUT });
   return render(files, "review", {
     header,
     skills: c.skills,
     scope,
+    procedures: (c.omit ?? []).includes("procedures") ? "" : render(files, "review@procedures", {}),
     empirical: render(files, c.empirical ? "review@empirical-on" : "review@empirical-off", {}),
     output: REVIEW_OUTPUT,
   });
@@ -314,9 +327,9 @@ export function publishPrompt(files: FactoryFiles, c: { checkLine: string; push:
   return render(files, "fix@publish", { checkLine: c.checkLine, push: c.push, output: FIX_OUTPUT });
 }
 
-export function learnPrompt(files: FactoryFiles, c: { pr: string; humans: unknown; findings: unknown; fixItems: unknown; rounds: unknown }): string {
+export function learnPrompt(files: FactoryFiles, c: { pr: string; humans: unknown; findings: unknown; fixItems: unknown; rounds: unknown; open: unknown; mergedSha: string }): string {
   const json = (v: unknown) => JSON.stringify(v, null, 1).slice(0, 120_000);
-  return render(files, "learn", { pr: c.pr, humans: json(c.humans), findings: json(c.findings), fixItems: json(c.fixItems), rounds: json(c.rounds) });
+  return render(files, "learn", { pr: c.pr, humans: json(c.humans), findings: json(c.findings), fixItems: json(c.fixItems), rounds: json(c.rounds), open: json(c.open), mergedSha: c.mergedSha });
 }
 
 export interface BabysitContext {

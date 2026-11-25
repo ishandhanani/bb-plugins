@@ -789,6 +789,9 @@ const MIGRATIONS = [
   `ALTER TABLE pipeline ADD COLUMN taken_at INTEGER`,
   `ALTER TABLE pipeline ADD COLUMN taken_by TEXT`,
   `ALTER TABLE pipeline ADD COLUMN taken_note TEXT`,
+  // Evals: which turn raised a finding (review or perf), and which provider and model a round ran on, so outcomes can be compared by source.
+  `ALTER TABLE ai_findings ADD COLUMN source TEXT`,
+  `ALTER TABLE ai_rounds ADD COLUMN model TEXT`,
 ];
 
 interface ReviewRow {
@@ -829,10 +832,14 @@ interface RoundRow {
   review_url: string | null; raw: string | null; error: string | null; started_at: number; finished_at: number | null;
   /** kind: full or delta. perf: null, running, posted, failed. */
   kind: string | null; perf: string | null; perf_url: string | null; skills_json: string | null;
+  /** provider:model the round ran on. */
+  model: string | null;
 }
 interface FindingRow {
   id: string; review_id: string; round: number; path: string; line: number; start_line: number | null; severity: string; title: string; body: string;
   suggestion: string | null; status: string; note: string | null; inline: number; updated_at: number;
+  /** review or perf: the turn of the round that raised it; null on findings from before this was recorded. */
+  source: string | null;
 }
 
 function newId(): string {
@@ -1020,9 +1027,10 @@ function createStore(db: Database.Database) {
     ),
     deleteRounds: db.prepare<[string]>(`DELETE FROM ai_rounds WHERE review_id = ?`),
     findings: db.prepare<[string], FindingRow>(`SELECT * FROM ai_findings WHERE review_id = ? ORDER BY round ASC, rowid ASC`),
-    insertFinding: db.prepare<[string, string, number, string, number, number | null, string, string, string, string | null, number, number]>(
-      `INSERT INTO ai_findings (id, review_id, round, path, line, start_line, severity, title, body, suggestion, status, inline, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+    insertFinding: db.prepare<[string, string, number, string, number, number | null, string, string, string, string | null, number, number, string]>(
+      `INSERT INTO ai_findings (id, review_id, round, path, line, start_line, severity, title, body, suggestion, status, inline, updated_at, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)`,
     ),
+    setRoundModel: db.prepare<[string, string, number]>(`UPDATE ai_rounds SET model = ? WHERE review_id = ? AND round = ?`),
     setFindingStatus: db.prepare<[string, string, number, string]>(`UPDATE ai_findings SET status = ?, note = ?, updated_at = ? WHERE id = ?`),
     deleteFindings: db.prepare<[string]>(`DELETE FROM ai_findings WHERE review_id = ?`),
     aiReviewer: db.prepare<[string], HelperRow>(`SELECT * FROM ai_reviewers WHERE review_id = ?`),
@@ -1198,7 +1206,7 @@ export default async function plugin(bb: BbPluginApi) {
     aiReviewSettleMinutes: { type: "number", label: "PR factory: minutes a new head must sit unchanged before the next AI round starts", default: 10 },
     aiReviewSkills: { type: "string", label: "PR factory: extra skills the reviewer must read, on top of factory-skills.json (your own from this machine, the repository's from its latest default branch); comma separated, owner/repo=skill for one repository", default: "" },
     perfReview: { type: "boolean", label: "PR factory: when a diff touches a request path, the reviewer also runs a performance review with the repository's perf skills, and measures when the code does not settle the cost", default: true },
-    reviewBots: { type: "string", label: "PR factory: logins that are bots, comma separated. A review from anyone else on your own PR goes to the author's agent at once; a bot's threads are answered before the PR is called ready", default: "coderabbitai,dynamo-review-agent,copilot-pull-request-reviewer,github-actions,codecov" },
+    reviewBots: { type: "string", label: "PR factory: logins that are bots, comma separated. A review from anyone else on your own PR goes to the author's agent at once; a bot's threads are answered before the PR is called ready", default: "coderabbitai,dynamo-review-agent,dynamo-ops,devin-ai-integration,claude,copilot-pull-request-reviewer,github-actions,codecov" },
     aiReviewEmpirical: { type: "boolean", label: "PR factory: let the AI reviewer run empirical review skills (builds, servers, GPU or load tests)", default: false },
     babysitProvider: { type: "string", label: "PR factory: provider id for the CI babysitter", default: "claude-code" },
     babysitModel: { type: "string", label: "PR factory: model for the CI babysitter", default: "claude-fable-5-2" },
@@ -3238,14 +3246,14 @@ export default async function plugin(bb: BbPluginApi) {
     });
 
   /** The files a stage must read for this PR, and the "Read first" list its prompt shows. The repository's skills are fetched now, from its default branch. */
-  async function stageSkills(row: ReviewRow, stage: SkillStage, changedPaths: string[], jobId: string): Promise<{ block: string; found: ResolvedSkills; files: SkillFile[] }> {
+  async function stageSkills(row: ReviewRow, stage: SkillStage, changedPaths: string[], jobId: string, sha: string | null = null): Promise<{ block: string; found: ResolvedSkills; files: SkillFile[] }> {
     const map = repoSkills(factoryFiles.skills, row.owner, row.repo);
     const [owner, repo] = map.source.split("/");
     let found: ResolvedSkills = { ref: null, sha: null, root: null, personal: [], repo: [], agents: [], perfDirs: [] };
     try {
       found = await host.call(
         "factory_skills",
-        { repoPath: row.repo_path, owner: owner || row.owner, repo: repo || row.repo, personal: [...new Set(Object.values(factoryFiles.skills.personal).flat())], changedPaths },
+        { repoPath: row.repo_path, owner: owner || row.owner, repo: repo || row.repo, personal: [...new Set(Object.values(factoryFiles.skills.personal).flat())], changedPaths, sha },
         { ...hostOptions(row), timeoutMs: 3 * 60_000 },
       );
     } catch (cause) {
@@ -3782,13 +3790,14 @@ export default async function plugin(bb: BbPluginApi) {
       const { url: reviewUrl, inline } = await submitFindings(row, r.base_sha, r.head_sha, files, findings, round, (offDiff) =>
         reviewBody({ round, read: reply.read, summary: reply.summary, counts, resolved, stillOpen, nits: [], offDiff, handoff: !mine && high === 0, ...(next === undefined ? {} : { next }) }),
       );
-      for (const f of findings) q.insertFinding.run(newId(), reviewId, round, f.path, f.line, f.startLine, f.severity, f.title, f.body, f.suggestion, inline.includes(f) ? 1 : 0, now);
+      for (const f of findings) q.insertFinding.run(newId(), reviewId, round, f.path, f.line, f.startLine, f.severity, f.title, f.body, f.suggestion, inline.includes(f) ? 1 : 0, now, "review");
+      q.setRoundModel.run(`${usedLane(r).providerId || defaultProvider}:${usedLane(r).model.trim()}`, reviewId, round);
       q.setRoundPosted.run(reply.summary, high, reviewUrl, text.slice(0, 200_000), Date.now(), reviewId, round);
       void slackReply(reviewId, roundReply({ round, counts, findings, reviewUrl }));
       recordJob({
         jobId: `${reviewId}:round:${round}`, stage: "ai_review", row, lane: usedLane(r), threadId: q.aiReviewer.get(reviewId)?.thread_id ?? null, startedAt: r.started_at,
         status: "ok", reply: text, round,
-        result: { kind: roundKind(r), findings: findings.length, high, counts, inline: inline.length, resolved: resolved.length, stillOpen: stillOpen.length, reviewUrl, read: reply.read, perf: reply.perf ?? null },
+        result: { kind: roundKind(r), findings: findings.length, high, counts, inline: inline.length, resolved: resolved.length, stillOpen: stillOpen.length, reviewUrl, read: reply.read, perf: reply.perf ?? null, prBody: clipText(row.body, 6_000) },
       });
       emitOutcome(`${reviewId}:round:${round}`, "high_value_findings", high);
       await resolveFindingThreads(row, r.head_sha).catch((cause: unknown) => bb.log.warn(`resolving threads on ${prLabel(row)}: ${errorMessage(cause)}`));
@@ -3875,7 +3884,7 @@ export default async function plugin(bb: BbPluginApi) {
         true,
       );
       const now = Date.now();
-      for (const f of findings) q.insertFinding.run(newId(), reviewId, round, f.path, f.line, f.startLine, f.severity, f.title, f.body, f.suggestion, inline.includes(f) ? 1 : 0, now);
+      for (const f of findings) q.insertFinding.run(newId(), reviewId, round, f.path, f.line, f.startLine, f.severity, f.title, f.body, f.suggestion, inline.includes(f) ? 1 : 0, now, "perf");
       q.setRoundPerf.run("posted", url, reviewId, round);
       recordJob({ jobId, stage: "perf_review", row, lane: usedLane(r), threadId, status: "ok", reply: text, round, result: { findings: findings.length, counts, inline: inline.length, reviewUrl: url, read: reply.read } });
       emitOutcome(jobId, "perf_findings", findings.length);
@@ -5392,8 +5401,26 @@ export default async function plugin(bb: BbPluginApi) {
     const login = await viewerLogin(row);
     const threads = await refreshThreads(row).catch(() => cachedThreads(row));
     const conversation = await host.call("gh_conversation", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row));
-    const factoryPosted = (body: string) => body.includes(FACTORY_MARKER) || FACTORY_THREAD.test(body.split("\n")[0] ?? "");
+    // The factory's own posts are not reviewer comments, whatever era they are from.
+    const factoryPosted = (body: string) => body.includes(FACTORY_MARKER) || FACTORY_THREAD.test(body.split("\n")[0] ?? "") || /\(AI final check\)/.test(body.split("\n")[0] ?? "");
     const clip = (text: string, n: number) => (text.length <= n ? text : `${text.slice(0, n)}...`);
+    // The commit each comment was made on. With the rounds' heads and times it says, without a model, whether the
+    // reviewer was looking at code the AI had already reviewed: only those comments measure the review.
+    const commitOf = new Map<string, string>();
+    try {
+      for (const c of (await host.call("gh_comment_commits", { owner: row.owner, repo: row.repo, number: row.number }, hostOptions(row))).commits) commitOf.set(c.url, c.commitId);
+    } catch (cause) {
+      bb.log.warn(`comment commits of ${prLabel(row)}: ${errorMessage(cause)}`);
+    }
+    const timing = (url: string | null, at: string | null): { commit: string | null; timing: "reviewed" | "unreviewed_head" | "before_review" } => {
+      const commit = url === null ? null : commitOf.get(url) ?? null;
+      const when = at === null ? Date.now() : Date.parse(at);
+      const before = rounds.filter((r) => (r.finished_at ?? Infinity) <= when);
+      if (before.length === 0) return { commit, timing: "before_review" };
+      // With no commit recorded (a conversation comment), the newest round before it stands for what the reviewer saw.
+      const seen = commit === null ? true : before.some((r) => r.head_sha === commit);
+      return { commit, timing: seen ? "reviewed" : "unreviewed_head" };
+    };
     // What people said: the first comment of each thread a person opened, and review bodies and conversation comments with text.
     // The author's agent replies under your login, but only inside threads, so its replies are never a thread's first comment.
     const humans: Record<string, unknown>[] = [];
@@ -5401,38 +5428,67 @@ export default async function plugin(bb: BbPluginApi) {
       const first = t.comments[0];
       if (first === undefined || factoryPosted(first.body) || isBot(first.author)) continue;
       humans.push({
-        url: first.url, author: first.author, path: t.path, line: t.line ?? t.originalLine, createdAt: first.createdAt, resolved: t.isResolved, body: clip(first.body, 4_000),
+        url: first.url, author: first.author, path: t.path, line: t.line ?? t.originalLine, createdAt: first.createdAt, ...timing(first.url, first.createdAt), resolved: t.isResolved, body: clip(first.body, 4_000),
         replies: t.comments.slice(1, 6).map((c) => ({ author: c.author, body: clip(c.body, 500) })),
       });
     }
     for (const r of conversation.reviews) {
       if (r.body.trim() === "" || factoryPosted(r.body) || isBot(r.author) || (r.author === login && isMine(row))) continue;
-      humans.push({ url: r.url, author: r.author, path: null, line: null, createdAt: r.submittedAt, state: r.state, body: clip(r.body, 4_000) });
+      humans.push({ url: r.url, author: r.author, path: null, line: null, createdAt: r.submittedAt, ...timing(r.url, r.submittedAt), state: r.state, body: clip(r.body, 4_000) });
     }
     for (const c of conversation.comments) {
       if (factoryPosted(c.body) || isBot(c.author) || (c.author === login && isMine(row))) continue;
-      humans.push({ url: c.url, author: c.author, path: null, line: null, createdAt: c.createdAt, body: clip(c.body, 4_000) });
+      humans.push({ url: c.url, author: c.author, path: null, line: null, createdAt: c.createdAt, ...timing(c.url, c.createdAt), body: clip(c.body, 4_000) });
     }
-    const findings = q.findings.all(row.id).map((f) => ({ id: f.id, round: f.round, label: f.severity, path: f.path, line: f.line, title: f.title, body: clip(f.body, 800), status: f.status, note: f.note, inline: f.inline === 1 }));
-    const roundRows = rounds.map((r) => ({ round: r.round, kind: roundKind(r), headSha: r.head_sha, startedAt: new Date(r.started_at).toISOString(), finishedAt: r.finished_at === null ? null : new Date(r.finished_at).toISOString(), perf: r.perf, reviewUrl: r.review_url, jobId: `${row.id}:round:${r.round}` }));
+    const all = q.findings.all(row.id);
+    const modelOf = new Map(rounds.map((r) => [r.round, r.model]));
+    const findings = all.map((f) => ({
+      id: f.id, round: f.round, label: f.severity, source: f.source ?? "review", model: modelOf.get(f.round) ?? null, path: f.path, line: f.line, title: f.title, body: clip(f.body, 800),
+      status: f.status, note: f.note, inline: f.inline === 1,
+    }));
+    // Findings no round closed: what became of them is judged once, on the merged code.
+    const open = findings.filter((f) => f.status === "open");
+    const roundRows = rounds.map((r) => ({
+      round: r.round, kind: roundKind(r), model: r.model, headSha: r.head_sha, startedAt: new Date(r.started_at).toISOString(), finishedAt: r.finished_at === null ? null : new Date(r.finished_at).toISOString(),
+      perf: r.perf, reviewUrl: r.review_url, jobId: `${row.id}:round:${r.round}`,
+    }));
     const fixItems = q.fixRuns.all(row.id).map((r) => ({ run: r.run, kind: r.kind, trigger: r.trigger, status: r.status, headBefore: r.head_before, headAfter: r.head_after, items: toFixRun(r).items, check: toFixRun(r).check }));
-    emitTelemetry({ type: "pr_closed", reviewId: row.id, pr: prLabel(row), url: row.url, mine: isMine(row), state: row.state, headSha: row.head_sha, baseRef: row.base_ref, humans, findings, rounds: roundRows, fixRuns: fixItems });
+    emitTelemetry({ type: "pr_closed", reviewId: row.id, pr: prLabel(row), url: row.url, mine: isMine(row), state: row.state, headSha: row.head_sha, baseRef: row.base_ref, prBody: clip(row.body, 6_000), humans, findings, rounds: roundRows, fixRuns: fixItems });
     const now = Date.now();
-    if (humans.length === 0) {
-      q.saveLearnJob.run({ review_id: row.id, thread_id: null, status: "done", result_json: JSON.stringify({ total: 0, found: 0, demoted: 0, missed: 0, items: [] }), error: null, started_at: now, finished_at: now });
-      emitTelemetry({ type: "recall", reviewId: row.id, pr: prLabel(row), mine: isMine(row), total: 0, found: 0, demoted: 0, missed: 0, items: [], roundJob: roundRows.at(-1)?.jobId ?? null });
-      return "no human comments; nothing to match";
+    if (humans.length === 0 && open.length === 0) {
+      const result = { total: 0, found: 0, demoted: 0, missed: 0, items: [], reviewedFirst: { total: 0, found: 0, demoted: 0, missed: 0 }, addressed: addressedRate(findings, []) };
+      q.saveLearnJob.run({ review_id: row.id, thread_id: null, status: "done", result_json: JSON.stringify(result), error: null, started_at: now, finished_at: now });
+      emitTelemetry({ type: "recall", reviewId: row.id, pr: prLabel(row), mine: isMine(row), ...result, roundJob: roundRows.at(-1)?.jobId ?? null });
+      return "no human comments and no open findings; nothing to judge";
     }
-    q.saveLearnJob.run({ review_id: row.id, thread_id: null, status: "running", result_json: null, error: null, started_at: now, finished_at: null });
+    q.saveLearnJob.run({ review_id: row.id, thread_id: null, status: "running", result_json: JSON.stringify({ humans: humans.map((h) => ({ url: h.url, timing: h.timing })), findings }), error: null, started_at: now, finished_at: null });
     try {
-      const prompt = learnPrompt(factoryFiles, { pr: prLabel(row), humans, findings, fixItems, rounds: roundRows });
+      const prompt = learnPrompt(factoryFiles, { pr: prLabel(row), humans, findings, fixItems, rounds: roundRows, open, mergedSha: row.head_sha });
       noteJobPrompt(`${row.id}:learn`, prompt, learnLane.intro(row));
       await laneSend(learnLane, row, "learn", prompt);
-      return `matching ${humans.length} human comment${humans.length === 1 ? "" : "s"} against ${findings.length} AI finding${findings.length === 1 ? "" : "s"}`;
+      return `matching ${humans.length} human comment${humans.length === 1 ? "" : "s"} against ${findings.length} AI finding${findings.length === 1 ? "" : "s"}, and judging ${open.length} that no round closed`;
     } catch (cause) {
       q.saveLearnJob.run({ review_id: row.id, thread_id: null, status: "failed", result_json: null, error: errorMessage(cause), started_at: now, finished_at: Date.now() });
       throw cause;
     }
+  }
+
+  /**
+   * The addressed rate of a merged PR: of the AI findings posted, how many led to a change. A finding a round marked
+   * fixed counts, and so does one the after-merge look judged addressed. Obsolete and declined are answers without a
+   * change; ignored is no answer. Broken down by label, by the turn that raised it, and by the model the round ran on.
+   */
+  type FindingOutcome = { id: string; label: string; source: string; model: string | null; status: string };
+  function addressedRate(findings: FindingOutcome[], judged: { id: string; outcome: string }[]) {
+    const verdict = new Map(judged.map((j) => [j.id, j.outcome]));
+    const outcome = (f: FindingOutcome) => (f.status === "fixed" ? "addressed" : f.status === "obsolete" ? "declined" : verdict.get(f.id) ?? "unjudged");
+    const tally = (rows: FindingOutcome[]) => {
+      const t = { posted: rows.length, addressed: 0, declined: 0, ignored: 0, unjudged: 0 };
+      for (const f of rows) t[outcome(f) as "addressed" | "declined" | "ignored" | "unjudged"]++;
+      return t;
+    };
+    const by = (key: (f: FindingOutcome) => string) => Object.fromEntries([...new Set(findings.map(key))].map((k) => [k, tally(findings.filter((f) => key(f) === k))]));
+    return { ...tally(findings), byLabel: by((f) => f.label), bySource: by((f) => f.source), byModel: by((f) => f.model ?? "unknown") };
   }
 
   async function completeLearn(reviewId: string, text: string | null, error: string | null): Promise<void> {
@@ -5443,13 +5499,19 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       if (error !== null || text === null) throw new Error(error ?? "the learn thread returned nothing");
       const reply = parseLearnReply(text);
-      const count = (m: string) => reply.items.filter((i) => i.match === m).length;
-      const result = { total: reply.items.length, found: count("found"), demoted: count("demoted"), missed: count("missed"), summary: reply.summary, items: reply.items };
+      const captured = parseJson<{ humans?: { url: string; timing: string }[]; findings?: FindingOutcome[] }>(job.result_json, {});
+      const timingOf = new Map((captured.humans ?? []).map((h) => [h.url, h.timing]));
+      const items = reply.items.map((i) => ({ ...i, timing: timingOf.get(i.url) ?? "unknown" }));
+      const tally = (rows: typeof items) => ({ total: rows.length, found: rows.filter((i) => i.match === "found").length, demoted: rows.filter((i) => i.match === "demoted").length, missed: rows.filter((i) => i.match === "missed").length });
+      // The number that measures the review: comments made on a commit an AI round had already reviewed.
+      const reviewedFirst = tally(items.filter((i) => i.timing === "reviewed"));
+      const result = { ...tally(items), reviewedFirst, addressed: addressedRate(captured.findings ?? [], reply.findings), summary: reply.summary, items };
       q.saveLearnJob.run({ ...job, status: "done", result_json: JSON.stringify(result), finished_at: Date.now() });
       const roundJob = `${reviewId}:round:${q.rounds.all(reviewId).filter((r) => r.status === "posted").at(-1)?.round ?? 0}`;
       emitTelemetry({ type: "recall", reviewId, pr: prLabel(row), mine: isMine(row), ...result, roundJob });
-      recordJob({ jobId, stage: "learn", row, lane: learnLane, threadId: job.thread_id, startedAt: job.started_at, status: "ok", reply: text, result: { total: result.total, found: result.found, demoted: result.demoted, missed: result.missed } });
-      if (result.total > 0) emitOutcome(roundJob, "human_recall", result.found / result.total, `${result.found} found, ${result.demoted} demoted, ${result.missed} missed of ${result.total} human comments`);
+      recordJob({ jobId, stage: "learn", row, lane: learnLane, threadId: job.thread_id, startedAt: job.started_at, status: "ok", reply: text, result: { total: result.total, found: result.found, demoted: result.demoted, missed: result.missed, reviewedFirst, addressed: result.addressed } });
+      if (reviewedFirst.total > 0) emitOutcome(roundJob, "human_recall", reviewedFirst.found / reviewedFirst.total, `${reviewedFirst.found} found, ${reviewedFirst.demoted} demoted, ${reviewedFirst.missed} missed of ${reviewedFirst.total} comments made on a reviewed head`);
+      if (result.addressed.posted > 0) emitOutcome(roundJob, "addressed_rate", result.addressed.addressed / result.addressed.posted, `${result.addressed.addressed} of ${result.addressed.posted} AI findings led to a change`);
     } catch (cause) {
       q.saveLearnJob.run({ ...job, status: "failed", error: errorMessage(cause).slice(0, 2_000), finished_at: Date.now() });
       recordJob({ jobId, stage: "learn", row, lane: learnLane, threadId: job.thread_id, startedAt: job.started_at, status: "failed", error: errorMessage(cause), reply: text });
@@ -6270,7 +6332,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "refresh", summary: "Sync every open PR with GitHub", usage: "bb review-desk refresh [--json]" },
       { name: "hold", summary: "Take a PR over: the factory stops and stays off it until you release it. Run it before you (or an agent of yours) start work on a PR's branch", usage: "bb review-desk hold <reviewId | owner/repo#N | PR URL | PR number | an absolute path inside the PR's worktree> [--json]" },
       { name: "release", summary: "Hand a PR back to the factory: it carries on from the head you left", usage: "bb review-desk release <reviewId | owner/repo#N | PR URL | PR number | an absolute path inside the PR's worktree> [--json]" },
-      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, show its rounds and findings, print the review prompt for a head (prompt), or match a merged PR's human comments against the AI findings (learn)", usage: "bb review-desk factory <start|stop|show|hold|release|ping|resolve|fix|deslop|report|learn|prompt> <reviewId> [--head <sha>] [--base <sha>] [--force] [--json]" },
+      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, show its rounds and findings, print the review prompt for a head (prompt), or match a merged PR's human comments against the AI findings (learn)", usage: "bb review-desk factory <start|stop|show|hold|release|ping|resolve|fix|deslop|report|learn|prompt> <reviewId> [--head <sha>] [--base <sha>] [--replay] [--skills-sha <sha>] [--description <file>] [--variant bare] [--omit procedures,personal,repo,agents,topic] [--force] [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "map", summary: "Write or print the PR's diffmap spec", usage: "bb review-desk map <reviewId> [--rewrite] [--json]" },
       { name: "simple", summary: "Queue Simple English rewrites of all the comments, redo them all, or request one comment by key", usage: "bb review-desk simple <reviewId> [--redo | --key <t:...|c:...|r:...>] [--json]" },
@@ -6378,17 +6440,34 @@ export default async function plugin(bb: BbPluginApi) {
               return ok({ started, job: q.learnJob.get(row.id) ?? null }, `Learn on ${row.owner}/${row.repo}#${row.number}: ${started}`);
             }
             if (action === "prompt") {
-              // The round-1 review prompt as the reviewer would get it at a head, with nothing started and nothing posted (for replays).
+              // The round-1 review prompt as the reviewer would get it at a head, with nothing started and nothing posted.
+              // For replays: --replay keeps the reviewer off GitHub, --skills-sha freezes the repository's skills at a commit
+              // (the PR's merge base), --description gives the description as it was, --variant bare and --omit measure parts.
               const head = flag("head") ?? row.head_sha;
               const base = flag("base") ?? row.base_sha;
+              const variant = flag("variant") === "bare" ? "bare" : "full";
+              const omit = (flag("omit") ?? "").split(",").map((x) => x.trim()).filter((x) => x !== "");
               const files = await host.call("git_files", { worktree: row.worktree, baseSha: base, headSha: head }, hostOptions(row));
-              const skills = await stageSkills(row, "review", files.files.map((f) => f.path), `${row.id}:prompt`);
+              const resolved = await stageSkills(row, "review", files.files.map((f) => f.path), `${row.id}:prompt`, flag("skills-sha") ?? null);
               jobSkills.delete(`${row.id}:prompt`);
+              // bare keeps only the repository's own skills; --omit drops a source: personal, repo, agents, topic.
+              const kept = resolved.files.filter((f) => (variant === "bare" ? f.source === "repo" || f.source === "topic" : !omit.includes(f.source)));
+              const block = skillsBlock(kept, resolved.found, repoSkills(factoryFiles.skills, row.owner, row.repo));
+              const describe = flag("description");
+              let description: string | null = null;
+              if (describe !== undefined) {
+                try {
+                  description = readFileSync(describe, "utf8");
+                } catch {
+                  return { exitCode: 1, stderr: `cannot read the description file ${describe}` };
+                }
+              }
               const prompt = reviewPrompt(factoryFiles, {
                 owner: row.owner, repo: row.repo, number: row.number, title: row.title, author: row.author, baseRef: row.base_ref, baseSha: base, headSha: head,
-                round: 1, kind: "full", prev: null, prior: [], threads: [], changedPaths: files.files.map((f) => f.path), skills: skills.block, empirical: false,
+                round: 1, kind: "full", prev: null, prior: [], threads: [], changedPaths: files.files.map((f) => f.path), skills: block, empirical: false,
+                variant, omit, ...(args.includes("--replay") || describe !== undefined ? { replay: { description } } : {}),
               });
-              return ok({ prompt, intro: reviewerIntro(row), version: factoryFiles.versions.review, skills: skills.files.map((f) => ({ name: f.name, source: f.source, path: f.path, digest: f.digest })) }, prompt);
+              return ok({ prompt, intro: reviewerIntro(row), version: factoryFiles.versions.review, variant, omit, skillsSha: resolved.found.sha, skills: kept.map((f) => ({ name: f.name, source: f.source, path: f.path, digest: f.digest })) }, prompt);
             }
             if (action === "fix" || action === "deslop") {
               if (q.pipeline.get(row.id) === undefined) setStage(row, "fixing");

@@ -14,12 +14,7 @@ Read every file in this list before you read the diff. They are the review rules
 
 - Report every finding the code supports. Do not drop a finding because it is small, hard to measure, or a matter of taste: give it the label NIT. Nothing is filtered after you; every finding is posted to the pull request.
 - Where the skills above set a higher bar for what is worth reporting, ignore that bar and keep their checks. Use the labels below for how much a finding matters.
-- A diff does not show everything. Do these four things on every round:
-  1. Follow new callers into old code. For each call the diff adds into code it does not change, open the callee. Ask what it costs at production scale, and how the existing callers configure it: thread counts, pool sizes, limits, timeouts. Unchanged code that a new path makes load-bearing is in scope.
-  2. Compare with the sibling path. When the diff adds a second path that does what an existing one does (another engine, transport, protocol, binding, or entry point), list what the existing path sets and handles, and check each item on the new path: config knobs, limits, status codes, keepalives, cancellation, metrics.
-  3. Check the claims. Docs, doc comments, AGENTS.md, test names, and the PR description must describe the code at this head. A new test must fail without the change it covers; when you cannot tell from reading, say so in the finding.
-     A claim that says every, all, always, or only, or that promises a callback, a wake, or a re-ask on an event, covers more than the diff: list the callers or the paths that deliver it, open each one, and report the claim when one behaves differently, including with optional features off. (ai-dynamo/dynamo#18443, #19038, #18804)
-  4. Follow a move. When the diff moves, deletes, or merges a file, a constant, or a helper: search the whole repository, not only the touched crate, for other copies and for the old path in code owners, AGENTS.md, and docs, and say which remain; list the open pull requests that touch the old path (gh pr list --search <path>) and say where their changes must land. (ai-dynamo/dynamo#19038, #19039, #19251)
+{{procedures}}
 {{empirical}}
 
 ## Output
@@ -52,3 +47,26 @@ Tasks:
 
 <!-- @empirical-off -->
 - Skills that build the project, launch servers, or run GPU or load tests: apply their criteria by reading the code; do not run heavy workloads in a review turn. When a finding can only be settled by running something, say what in its body.
+
+<!-- @procedures -->
+- A diff does not show everything. Do these four things on every round:
+  1. Follow new callers into old code. For each call the diff adds into code it does not change, open the callee. Ask what it costs at production scale, and how the existing callers configure it: thread counts, pool sizes, limits, timeouts. Unchanged code that a new path makes load-bearing is in scope.
+  2. Compare with the sibling path. When the diff adds a second path that does what an existing one does (another engine, transport, protocol, binding, or entry point), list what the existing path sets and handles, and check each item on the new path: config knobs, limits, status codes, keepalives, cancellation, metrics.
+  3. Check the claims. Docs, doc comments, AGENTS.md, test names, and the PR description must describe the code at this head. A new test must fail without the change it covers; when you cannot tell from reading, say so in the finding.
+     A claim that says every, all, always, or only, or that promises a callback, a wake, or a re-ask on an event, covers more than the diff: list the callers or the paths that deliver it, open each one, and report the claim when one behaves differently, including with optional features off. (ai-dynamo/dynamo#18443, #19038, #18804)
+  4. Follow a move. When the diff moves, deletes, or merges a file, a constant, or a helper: search the whole repository, not only the touched crate, for other copies and for the old path in code owners, AGENTS.md, and docs, and say which remain; list the open pull requests that touch the old path (gh pr list --search <path>) and say where their changes must land. (ai-dynamo/dynamo#19038, #19039, #19251)
+
+<!-- @bare -->
+{{header}}
+
+{{skills}}
+
+## Scope
+
+{{scope}}
+
+Review this pull request and report every finding the code supports, each with a label.
+
+## Output
+
+{{output}}

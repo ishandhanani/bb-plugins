@@ -1,0 +1,42 @@
+[
+  {
+    "id": "perf-lock-scope-and-scale",
+    "file": "prompts/perf.md",
+    "anchor": "Look for these three by name",
+    "added": "2026-11-25",
+    "status": "candidate",
+    "reviewBy": "2026-12-23",
+    "source": "learn 2026-11-25, proposal 03",
+    "evidence": "replay on ai-dynamo/dynamo#18443 perf comments: 5 of 8 to 8 of 8, control head unchanged; one run per variant"
+  },
+  {
+    "id": "review-follow-a-move",
+    "file": "prompts/review.md",
+    "anchor": "4. Follow a move.",
+    "added": "2026-11-25",
+    "status": "candidate",
+    "reviewBy": "2026-12-23",
+    "source": "learn 2026-11-25, proposal 01",
+    "evidence": "replay on ai-dynamo/dynamo#19038: 2 of 10 to 4 of 10; #19039: 5 of 6 to 4 of 6; one run per variant; not replayed together with review-universal-claims"
+  },
+  {
+    "id": "review-universal-claims",
+    "file": "prompts/review.md",
+    "anchor": "A claim that says every, all, always, or only",
+    "added": "2026-11-25",
+    "status": "candidate",
+    "reviewBy": "2026-12-23",
+    "source": "learn 2026-11-25, proposal 02",
+    "evidence": "replay on ai-dynamo/dynamo#19038: 2 of 10 to 4 of 10, one of the two gains attributable; one run per variant"
+  },
+  {
+    "id": "fix-publish-pr-description",
+    "file": "prompts/fix.md",
+    "anchor": "4. Read the PR description against the pushed head",
+    "added": "2026-11-25",
+    "status": "candidate",
+    "reviewBy": "2026-12-23",
+    "source": "learn 2026-11-25, proposal 04",
+    "evidence": "not replayed (fix stage); 4 reviewer comments across 4 PRs"
+  }
+]

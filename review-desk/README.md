@@ -128,7 +128,18 @@ Where a lesson goes: a rule for one repository belongs in that repository's `AGE
 
 ### Learning
 
-Every job goes to `~/.review-desk/telemetry/events.jsonl` with its prompt, prompt version, skills, and trajectory. After a merge, a `pr_closed` record holds the humans' comments and the AI findings, and a `recall` record holds the match. The weekly automation follows `skills/factory-learn/SKILL.md`: it clusters the misses, writes proposed changes as patch files, replays each on frozen PR heads (`~/.review-desk/learn/replay-set.json`), and reports to `~/.review-desk/learn/<date>/report.md`. It lands nothing; you approve.
+Every job goes to `~/.review-desk/telemetry/events.jsonl` with its prompt, prompt version, skills, model, and trajectory. That file is the record.
+
+After a merge, one hidden thread looks at the PR once and writes two records:
+
+- `pr_closed`: every human comment with the commit it was made on and its `timing` (`reviewed`: an AI round had already reviewed that commit; `unreviewed_head`; `before_review`), every AI finding with the turn and model that raised it, the rounds, and the agent's runs.
+- `recall`: each human comment matched against the AI findings (found, demoted, missed, with a cause for a miss), the same counts over comments on a reviewed head only (`reviewedFirst`), and the **addressed rate**: of the AI findings posted, how many led to a change, by label, by turn (review or perf), and by model. A finding a round marked fixed counts; findings no round closed are judged on the merged code.
+
+Two numbers come out of that: recall on a reviewed head measures what the review misses, and the addressed rate measures how much of what it posts is worth posting.
+
+The weekly automation follows `skills/factory-learn/SKILL.md`. It keeps a replay set of frozen PR heads (`~/.review-desk/learn/replay-set.json`: the human comments on that head, the AI findings that were acted on, and heads where a reviewer asked for nothing), replays the review prompt on them three times per variant, and compares the full prompt with a bare baseline and with one part left out. Rules it adds to a prompt are entries in `prompts/rules.json`: a candidate is kept only when it beats the noise floor on held-out heads, and is otherwise proposed for deletion. It lands nothing; you approve.
+
+`bb review-desk factory prompt <reviewId> --replay --skills-sha <sha> --description <file> [--variant bare] [--omit procedures,personal,repo,agents,topic]` prints the review prompt for a frozen head: off GitHub, with the repository's skills as they were at that commit.
 
 A turn that ends without its reply block (the agent stopped to wait on a background build or test) no longer fails the job: the job stays open, the thread is told to wait in the foreground if it is still idle a few minutes later, and only two such turns in a row fail it.
 
@@ -152,7 +163,8 @@ A turn that ends without its reply block (the agent stopped to wait on a backgro
 - `lib/format.ts` — `timeAgo` and `describeError`, shared by the review page and the board.
 - `mention-ref.ts` — pill identity shared by server and app (what a pill points at, how its id is encoded, its label).
 - `skills/review-desk/SKILL.md` — instructions the analyst threads receive.
-- `skills/factory-learn/SKILL.md` — the weekly procedure that turns recall records into proposed skill and prompt changes.
+- `skills/factory-learn/SKILL.md` — the weekly evaluation: recall, addressed rate, the replay set, the bare baseline, and adding and retiring prompt rules.
+- `prompts/rules.json` — every rule the weekly evaluation added to a prompt, with its status and review date.
 
 ## Develop
 
