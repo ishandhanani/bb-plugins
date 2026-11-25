@@ -3679,28 +3679,48 @@ export default async function plugin(bb: BbPluginApi) {
       return true;
     };
     let inline = findings.filter((f) => anchors(f));
-    const submit = (onDiff: PostedFinding[]) =>
+    const post = (onDiff: PostedFinding[], commitId: string | null, note = "") =>
       host.call(
         "gh_submit_review",
         {
           owner: row.owner,
           repo: row.repo,
           number: row.number,
-          commitId: headSha,
+          commitId,
           event: "COMMENT",
-          body: body(findings.filter((f) => !onDiff.includes(f))),
+          body: body(findings.filter((f) => !onDiff.includes(f))) + note,
           comments: onDiff.map((f) => ({ path: f.path, line: f.line, side: "RIGHT" as const, startLine: f.startLine, body: findingComment(f, round, perf) })),
         },
         hostOptions(row),
       );
+    /** GitHub or the network hiccuped (a 5xx, a timeout, a rate limit): the same request is worth sending again. A 4xx is an answer, not a hiccup. */
+    const submit = async (onDiff: PostedFinding[], commitId: string | null, note = "") => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await post(onDiff, commitId, note);
+        } catch (cause) {
+          const transient = /HTTP 5\d\d|timed? ?out|ETIMEDOUT|ECONNRESET|EAI_AGAIN|rate limit|secondary rate/i.test(errorMessage(cause));
+          if (!transient || attempt >= 2) throw cause;
+          await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 5_000 : 30_000));
+        }
+      }
+    };
+    // Findings are never lost to a refused post. Inline at the reviewed commit; then all of them in the body at that
+    // commit (GitHub refuses the whole review when one comment does not anchor); then in the body against the PR's
+    // latest commit, for a branch that was rebased while the round ran, so the reviewed commit is no longer in the PR.
     try {
-      return { url: (await submit(inline)).url, inline };
+      return { url: (await submit(inline, headSha)).url, inline };
     } catch (cause) {
-      if (inline.length === 0) throw cause;
-      bb.log.warn(`round ${round} of ${prLabel(row)}: inline comments refused (${errorMessage(cause)}); posting them in the review body`);
-      inline = [];
-      return { url: (await submit(inline)).url, inline };
+      bb.log.warn(`round ${round} of ${prLabel(row)}: the review with inline comments was refused (${errorMessage(cause)}); posting the findings in its body`);
     }
+    inline = [];
+    try {
+      return { url: (await submit(inline, headSha)).url, inline };
+    } catch (cause) {
+      bb.log.warn(`round ${round} of ${prLabel(row)}: the review at ${headSha.slice(0, 10)} was refused (${errorMessage(cause)}); posting it against the PR's latest commit`);
+    }
+    const note = `\n\n_This round reviewed \`${headSha.slice(0, 10)}\`, which is no longer in this pull request (the branch was rebased or force-pushed while the round ran). Paths and lines refer to that commit; the next round reviews the new head._`;
+    return { url: (await submit(inline, null, note)).url, inline };
   }
 
   /** Head-side line numbers each file's diff shows (added or context): the lines GitHub accepts an inline comment on. */
