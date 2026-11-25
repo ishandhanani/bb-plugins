@@ -128,7 +128,7 @@ Where a lesson goes: a rule for one repository belongs in that repository's `AGE
 
 ### Learning
 
-Every job goes to `~/.review-desk/telemetry/events.jsonl` (and from there to MLflow) with its prompt, prompt version, skills, and trajectory. After a merge, a `pr_closed` record holds the humans' comments and the AI findings, and a `recall` record holds the match. The weekly automation follows `skills/factory-learn/SKILL.md`: it clusters the misses, writes proposed changes as patch files, replays each on frozen PR heads (`~/.review-desk/learn/replay-set.json`), and reports to `~/.review-desk/learn/<date>/report.md`. It lands nothing; you approve.
+Every job goes to `~/.review-desk/telemetry/events.jsonl` with its prompt, prompt version, skills, and trajectory. After a merge, a `pr_closed` record holds the humans' comments and the AI findings, and a `recall` record holds the match. The weekly automation follows `skills/factory-learn/SKILL.md`: it clusters the misses, writes proposed changes as patch files, replays each on frozen PR heads (`~/.review-desk/learn/replay-set.json`), and reports to `~/.review-desk/learn/<date>/report.md`. It lands nothing; you approve.
 
 A turn that ends without its reply block (the agent stopped to wait on a background build or test) no longer fails the job: the job stays open, the thread is told to wait in the foreground if it is still idle a few minutes later, and only two such turns in a row fail it.
 

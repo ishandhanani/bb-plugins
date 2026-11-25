@@ -3054,11 +3054,12 @@ export default async function plugin(bb: BbPluginApi) {
   //
   // Each finished job (an AI round, a fix or deslop run, a map, a babysit pass)
   // is appended to ~/.review-desk/telemetry/events.jsonl with its prompt, the
-  // prompt's version, and the turn's trajectory from the thread's event log;
-  // outcomes that arrive later (a finding fixed, the author's agent skipping
-  // it, diffmap rejecting a map) are appended against the job's id. A separate
-  // ingester turns the file into MLflow traces with feedback. Writing the file
-  // never blocks or fails a job.
+  // prompt's version, the skills it was told to read, and the turn's
+  // trajectory from the thread's event log; outcomes that arrive later (a
+  // finding fixed, the author's agent skipping it, diffmap rejecting a map)
+  // are appended against the job's id. That file is the record: the weekly
+  // learn run and any analysis read it directly. Writing it never blocks or
+  // fails a job.
 
   const TELEMETRY_FILE = join(homedir(), ".review-desk", "telemetry", "events.jsonl");
   /** The stage prompts and the skills map, read once from the plugin's folder (prompts/*.md, factory-skills.json). */
