@@ -6245,7 +6245,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "refresh", summary: "Sync every open PR with GitHub", usage: "bb review-desk refresh [--json]" },
       { name: "hold", summary: "Take a PR over: the factory stops and stays off it until you release it. Run it before you (or an agent of yours) start work on a PR's branch", usage: "bb review-desk hold <reviewId | owner/repo#N | PR URL | PR number | an absolute path inside the PR's worktree> [--json]" },
       { name: "release", summary: "Hand a PR back to the factory: it carries on from the head you left", usage: "bb review-desk release <reviewId | owner/repo#N | PR URL | PR number | an absolute path inside the PR's worktree> [--json]" },
-      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, or show its rounds and findings", usage: "bb review-desk factory <start|stop|show|ping|resolve|fix|deslop|report> <reviewId> [--json]" },
+      { name: "factory", summary: "PR factory: start the next AI review round, take a PR out, show its rounds and findings, print the review prompt for a head (prompt), or match a merged PR's human comments against the AI findings (learn)", usage: "bb review-desk factory <start|stop|show|hold|release|ping|resolve|fix|deslop|report|learn|prompt> <reviewId> [--head <sha>] [--base <sha>] [--force] [--json]" },
       { name: "ask", summary: "Send a message to the PR analyst", usage: "bb review-desk ask <reviewId> <text...> [--provider <id>]" },
       { name: "map", summary: "Write or print the PR's diffmap spec", usage: "bb review-desk map <reviewId> [--rewrite] [--json]" },
       { name: "simple", summary: "Queue Simple English rewrites of all the comments, redo them all, or request one comment by key", usage: "bb review-desk simple <reviewId> [--redo | --key <t:...|c:...|r:...>] [--json]" },
@@ -6420,7 +6420,7 @@ export default async function plugin(bb: BbPluginApi) {
             return ok(state, state.on ? `On Slack${state.url ? `: ${state.url}` : ""}` : "Not on Slack");
           }
           default:
-            return { exitCode: 1, stderr: "usage: bb review-desk open|list|board|move|refresh|factory|ask|map|simple|slack" };
+            return { exitCode: 1, stderr: "usage: bb review-desk open|list|board|move|refresh|hold|release|factory|ask|map|simple|slack" };
         }
       } catch (cause) {
         return { exitCode: 1, stderr: errorMessage(cause) };
