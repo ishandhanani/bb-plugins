@@ -3600,7 +3600,9 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const files = await host.call("git_files", { worktree: row.worktree, baseSha: r.base_sha, headSha: r.head_sha }, hostOptions(row));
       const prev = q.rounds.all(row.id).filter((x) => x.status === "posted" && x.round < r.round).at(-1);
-      const prior = q.findings.all(row.id).filter((f) => f.status === "open" && isHighValue(f.severity));
+      // Every open finding is judged again, NITs too, so each thread gets its answer and is closed; findings above a NIT come first.
+      const stillOpenAll = q.findings.all(row.id).filter((f) => f.status === "open");
+      const prior = [...stillOpenAll.filter((f) => isHighValue(f.severity)), ...stillOpenAll.filter((f) => !isHighValue(f.severity))].slice(0, 80);
       const kind = roundKind(r);
       if (isMine(row)) await ensureBranchWorktree(row);
       const jobId = `${row.id}:round:${r.round}`;
@@ -3754,7 +3756,7 @@ export default async function plugin(bb: BbPluginApi) {
       perfAsked = reply.perf ?? null;
       const now = Date.now();
       // What this round decided about the open findings.
-      const open = new Map(q.findings.all(reviewId).filter((f) => f.status === "open" && isHighValue(f.severity)).map((f) => [f.id, f]));
+      const open = new Map(q.findings.all(reviewId).filter((f) => f.status === "open").map((f) => [f.id, f]));
       const resolved: { title: string; status: "fixed" | "obsolete"; note: string }[] = [];
       for (const prev of reply.previous) {
         const f = open.get(prev.id);
@@ -3765,7 +3767,8 @@ export default async function plugin(bb: BbPluginApi) {
         open.delete(f.id);
         resolved.push({ title: f.title, status: prev.status, note: prev.note });
       }
-      const stillOpen = [...open.values()].map((f) => ({ title: f.title, severity: f.severity }));
+      // NITs are judged and closed like the rest, but only findings above a NIT keep a PR in review.
+      const stillOpen = [...open.values()].filter((f) => isHighValue(f.severity)).map((f) => ({ title: f.title, severity: f.severity }));
       // New findings, anchored to the diff this round reviewed.
       files = (await host.call("git_files", { worktree: row.worktree, baseSha: r.base_sha, headSha: r.head_sha }, hostOptions(row))).files;
       const findings = toPosted(files, reply.findings);
@@ -4009,8 +4012,9 @@ export default async function plugin(bb: BbPluginApi) {
     const threads = await refreshThreads(row);
     let resolved = 0;
     for (const f of closed) {
-      const header = findingHeader(f.severity, f.title, f.round);
-      const thread = threads.find((t) => !t.isResolved && t.path === f.path && (t.comments[0]?.body ?? "").startsWith(header));
+      // The finding may have come from the round's review or from its perf turn; their threads start with different headers.
+      const headers = [findingHeader(f.severity, f.title, f.round), findingHeader(f.severity, f.title, f.round, true)];
+      const thread = threads.find((t) => !t.isResolved && t.path === f.path && headers.some((h) => (t.comments[0]?.body ?? "").startsWith(h)));
       const first = thread?.comments[0];
       if (thread === undefined || first === undefined) continue;
       const note = (f.note ?? "").trim();
