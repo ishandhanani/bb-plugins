@@ -44,7 +44,7 @@ export function isPipelineStage(value: unknown): value is PipelineStage {
 }
 
 /**
- * The board's two rows. Your own PRs run the whole loop and end in Ready (or
+ * The board's two rows. Your own PRs run the whole loop and end in Babysit (or
  * in Needs you, when only you can unblock them); everyone else's are reviewed
  * and handed to you.
  */
@@ -57,7 +57,6 @@ export type BoardLane = (typeof BOARD_LANES)[number]["id"];
 /** Column names that read differently in a lane. */
 export function stageLabel(stage: BoardStage, lane: BoardLane): string {
   if (lane === "mine" && stage === "human_review") return "Needs you";
-  if (lane === "mine" && stage === "babysit") return "Ready";
   return BOARD_STAGE_LABEL[stage];
 }
 

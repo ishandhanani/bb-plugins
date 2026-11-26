@@ -50,7 +50,7 @@ export function nowLine(card: ReviewSummary): string {
   return "";
 }
 
-/** The PR's path through its lane, the current stage in bold: Review › *Fix and check* › Needs you › Ready. */
+/** The PR's path through its lane, the current stage in bold: Review › *Fix and check* › Needs you › Babysit. */
 export function stagePath(card: ReviewSummary): string {
   if (card.stage === null) return `*${prStage(card)}*`;
   const lane = BOARD_LANES.find((l) => l.id === (card.mine ? "mine" : "reviewing"));
