@@ -1526,7 +1526,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   /**
    * The column a card sits in. Your own PR follows the factory's stage, approved or not: it is still reviewed, fixed,
-   * and checked, and it is Ready only when the loop says so. Someone else's PR goes to Babysit once a person approves
+   * and checked, and it is in Babysit only when the loop says so. Someone else's PR goes to Babysit once a person approves
    * it; otherwise the factory's stage, when the PR is in the factory; otherwise GitHub's state.
    */
   function autoStage(row: ReviewRow): BoardStage | null {
@@ -3500,7 +3500,7 @@ export default async function plugin(bb: BbPluginApi) {
         setStage(row, "ai_review");
         p = q.pipeline.get(reviewId) ?? p;
       }
-      // Ready at a reviewed head: a bot's review that arrived since goes to the author's agent once the bot has been quiet a while.
+      // Babysit at a reviewed head: a bot's review that arrived since goes to the author's agent once the bot has been quiet a while.
       if (mine && p.stage === "babysit" && p.reviewed_head === row.head_sha && (await botThreadsTick(row))) return;
       if (p.stage === "ai_review" && (mine || !approved)) {
         if (p.hold_until !== null) {
@@ -3984,7 +3984,7 @@ export default async function plugin(bb: BbPluginApi) {
   /**
    * Ready for you: the reviewed head is the current head. The factory stops
    * here; it never marks the PR ready on GitHub and never requests reviewers.
-   * Your own PR waits in Ready with its CI babysat (or in Needs you, when the
+   * Your own PR waits in Babysit with its CI babysat (or in Needs you, when the
    * author's agent left questions); someone else's waits in Your review.
    */
   async function ready(row: ReviewRow, why: string): Promise<void> {
@@ -5016,7 +5016,7 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  /** Ready, and a bot has since opened a thread: once the bot has been quiet for the settle time, the author's agent answers its threads (once per head). */
+  /** In Babysit, and a bot has since opened a thread: once the bot has been quiet for the settle time, the author's agent answers its threads (once per head). */
   async function botThreadsTick(row: ReviewRow): Promise<boolean> {
     const runs = q.fixRuns.all(row.id);
     if (runs.at(-1)?.status === "running") return false;
@@ -5280,7 +5280,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       next = "the loop carries on from where it stopped";
     } else {
-      // Ready, or waiting on you: a head you pushed goes to review once it has settled, and CI is watched again.
+      // In Babysit, or waiting on you: a head you pushed goes to review once it has settled, and CI is watched again.
       void advanceFactory(row.id).catch(() => undefined);
       next = moved ? "the head you left is reviewed once it has settled" : "CI is watched again";
     }
